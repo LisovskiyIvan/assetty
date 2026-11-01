@@ -681,6 +681,12 @@ test "dedup: duplicate-heavy fixture" {
     // and the deduped result is byte-stable through the writer
     const out2 = try write_mod.serialize(aa, parsed, out);
     try std.testing.expectEqualSlices(u8, out, out2);
+
+    // a second pass over the deduped asset finds nothing left to collapse
+    const again = try run(aa, parsed, out, .{});
+    try std.testing.expectEqual(@as(u32, 0), again.removed_accessors);
+    try std.testing.expectEqual(@as(u32, 0), again.removed_meshes);
+    try std.testing.expectEqual(@as(u32, 0), again.removed_materials);
 }
 
 test "dedup: clean asset has nothing to remove" {

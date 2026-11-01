@@ -113,20 +113,13 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     notify(opts, "write", 1.0);
 
     // ---- 4. after stats ---------------------------------------------------
-    // Model-level fields come from the processed model (spec-correct), while
-    // byte counts come from the file we just wrote (what actually ships).
-    var after = try stats.compute(a, asset);
-    try dupImageNames(a, &after);
-
+    // The written file is the truth: writer GC + cdata-level ops determine
+    // what actually ships, so `after` is computed from a fresh load of it.
     var out_loaded = try parse.loadFile(io, a, opts.out_path);
     defer out_loaded.deinit();
 
-    var scratch = std.heap.ArenaAllocator.init(a);
-    defer scratch.deinit();
-    const out_st = try stats.compute(scratch.allocator(), out_loaded.asset);
-    after.disk_json = out_st.disk_json;
-    after.disk_bin = out_st.disk_bin;
-    after.disk_total = out_st.disk_total;
+    var after = try stats.compute(a, out_loaded.asset);
+    try dupImageNames(a, &after);
 
     return .{ .steps = steps, .before = before, .after = after };
 }
