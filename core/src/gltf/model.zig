@@ -209,6 +209,8 @@ pub const Animation = struct {
     channels: u32 = 0,
     samplers: u32 = 0,
     duration: ?f32 = null,
+    /// node indices targeted by channels (for reachability/prune)
+    targets: []const u32 = &.{},
 };
 
 pub const Skin = struct {

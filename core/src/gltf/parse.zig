@@ -422,6 +422,12 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
             .samplers = @intCast(an.samplers_count),
             .duration = duration,
         };
+        var targets: std.ArrayList(u32) = .empty;
+        for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+            const tn = ch.target_node orelse continue;
+            if (maps.nodes.get(tn)) |ti| try targets.append(a, ti);
+        }
+        anims[i].targets = try targets.toOwnedSlice(a);
     }
     out.animations = anims;
 
