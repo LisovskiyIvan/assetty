@@ -13,8 +13,7 @@ pub const Report = struct {
     steps: []const StepStatus,
     before: stats.Stats,
     after: stats.Stats,
-    /// arena-owned, no deinit needed
-};
+}; // arena-owned, no deinit needed
 
 pub const ProgressFn = *const fn (ctx: ?*anyopaque, step: []const u8, pct: f32) void;
 
