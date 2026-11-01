@@ -1,4 +1,5 @@
 // OWNED BY: subagent O1 (dedup). Replace this file entirely. Do not change the public API below.
+const std = @import("std");
 const c = @import("cgltf");
 
 pub const Options = struct {
