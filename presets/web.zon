@@ -1,0 +1,33 @@
+// Web pipeline: ETC1S/Basis KTX2 with rate-distortion, small texture budget.
+.{
+    .name = "web",
+    .target = .web,
+    .steps = .{
+        .{ .prune = .{
+            .unused_nodes = true,
+            .unused_materials = true,
+            .unused_textures = true,
+        } },
+        .{ .dedup = .{
+            .accessors = true,
+            .meshes = true,
+            .materials = true,
+        } },
+        .{ .weld = .{ .tolerance = 0.0 } },
+        .{ .join = .{} },
+        .{ .textures = .{
+            .format = .etc1s,
+            .quality = 128,
+            .rdo_lambda = 1.0,
+            .normal_maps_renormalize = true,
+            .generate_mips = true,
+            .max_size = 1024,
+        } },
+        .{ .quantize = .{
+            .position_bits = 14,
+            .normal_oct = true,
+            .uv_bits = 12,
+            .compress = true,
+        } },
+    },
+}

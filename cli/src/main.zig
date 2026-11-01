@@ -6,6 +6,8 @@ const usage =
     \\
     \\Usage:
     \\  basset info <file.glb> [--json]
+    \\  basset diff <old.glb> <new.glb> [--json]
+    \\  basset lint <file-or-dir> --budget <budget.json> [--json]
     \\  basset presets
     \\
     \\Exit codes: 0 ok, 1 lint violations, 2 error
@@ -57,6 +59,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     const code: u8 = switch (cmdId(args[0])) {
         .info => try cmdInfo(init, args[1..]),
+        .diff => try cmdDiff(init, args[1..]),
+        .lint => try cmdLint(init, args[1..]),
         .presets => try cmdPresets(),
         .help => blk: {
             std.debug.print("{s}\n", .{usage});
@@ -70,10 +74,12 @@ pub fn main(init: std.process.Init) !u8 {
     std.process.exit(code);
 }
 
-const Cmd = enum { info, presets, help, unknown };
+const Cmd = enum { info, diff, lint, presets, help, unknown };
 
 fn cmdId(s: []const u8) Cmd {
     if (std.mem.eql(u8, s, "info")) return .info;
+    if (std.mem.eql(u8, s, "diff")) return .diff;
+    if (std.mem.eql(u8, s, "lint")) return .lint;
     if (std.mem.eql(u8, s, "presets")) return .presets;
     if (std.mem.eql(u8, s, "help") or std.mem.eql(u8, s, "--help") or std.mem.eql(u8, s, "-h")) return .help;
     return .unknown;
@@ -240,4 +246,225 @@ fn cmdPresets() !u8 {
         std.debug.print("{s}\n", .{p});
     }
     return 0;
+}
+
+fn cmdDiff(init: std.process.Init, args: []const []const u8) !u8 {
+    const gpa = init.gpa;
+    var files: [2][]const u8 = undefined;
+    var n: usize = 0;
+    for (args) |a| {
+        if (std.mem.startsWith(u8, a, "--")) continue;
+        if (n == 2) {
+            std.debug.print("diff: expected exactly two files\n", .{});
+            return 2;
+        }
+        files[n] = a;
+        n += 1;
+    }
+    if (n != 2) {
+        std.debug.print("diff: usage: basset diff <old> <new> [--json]\n", .{});
+        return 2;
+    }
+    const as_json = hasFlag(args, "--json");
+
+    var old_loaded = core.parse.loadFile(init.io, gpa, files[0]) catch |err| {
+        std.debug.print("diff: {s}: {s}\n", .{ files[0], @errorName(err) });
+        return 2;
+    };
+    defer old_loaded.deinit();
+    var new_loaded = core.parse.loadFile(init.io, gpa, files[1]) catch |err| {
+        std.debug.print("diff: {s}: {s}\n", .{ files[1], @errorName(err) });
+        return 2;
+    };
+    defer new_loaded.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const rep = core.diff.compare(arena.allocator(), old_loaded.asset, new_loaded.asset) catch |err| {
+        std.debug.print("diff: {s}\n", .{@errorName(err)});
+        return 2;
+    };
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var wtr = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const w = &wtr.interface;
+
+    if (as_json) {
+        try core.diff.reportJson(w, rep);
+    } else {
+        try core.diff.summary(rep, w);
+    }
+    try w.flush();
+    return 0;
+}
+
+fn isGltfName(name: []const u8) bool {
+    const ext = std.fs.path.extension(name);
+    return std.ascii.eqlIgnoreCase(ext, ".glb") or std.ascii.eqlIgnoreCase(ext, ".gltf");
+}
+
+fn lessThanName(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn lintOneFile(
+    init: std.process.Init,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    budget: core.lint.Budget,
+    as_json: bool,
+    first: bool,
+    w: anytype,
+) !usize {
+    var loaded = try core.parse.loadFile(init.io, gpa, path);
+    defer loaded.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const st = try core.stats.compute(arena.allocator(), loaded.asset);
+    const vs = try core.lint.check(arena.allocator(), st, budget);
+
+    if (as_json) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("{\"file\": ");
+        try jsonStr(w, path);
+        try w.writeAll(", \"violations\": [");
+        for (vs, 0..) |v, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"code\": ");
+            try jsonStr(w, v.code);
+            try w.writeAll(", \"message\": ");
+            try jsonStr(w, v.message);
+            try w.writeAll(", \"index\": ");
+            if (v.index) |ix| {
+                try w.print("{d}", .{ix});
+            } else {
+                try w.writeAll("null");
+            }
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    } else if (vs.len == 0) {
+        try w.print("{s}: ok\n", .{path});
+    } else {
+        try w.print("{s}\n", .{path});
+        for (vs) |v| {
+            if (v.index) |ix| {
+                try w.print("  [{d}] {s}: {s}\n", .{ ix, v.code, v.message });
+            } else {
+                try w.print("  {s}: {s}\n", .{ v.code, v.message });
+            }
+        }
+    }
+    return vs.len;
+}
+
+fn cmdLint(init: std.process.Init, args: []const []const u8) !u8 {
+    const gpa = init.gpa;
+    var path: ?[]const u8 = null;
+    var budget_path: ?[]const u8 = null;
+    var as_json = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--json")) {
+            as_json = true;
+        } else if (std.mem.eql(u8, a, "--budget")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("lint: --budget needs a file\n", .{});
+                return 2;
+            }
+            budget_path = args[i];
+        } else if (std.mem.startsWith(u8, a, "--budget=")) {
+            budget_path = a["--budget=".len..];
+        } else if (!std.mem.startsWith(u8, a, "--")) {
+            if (path == null) path = a;
+        }
+    }
+    const p = path orelse {
+        std.debug.print("lint: missing <file-or-dir>\n", .{});
+        return 2;
+    };
+    const bp = budget_path orelse {
+        std.debug.print("lint: missing --budget <budget.json>\n", .{});
+        return 2;
+    };
+
+    const budget_bytes = std.Io.Dir.cwd().readFileAlloc(init.io, bp, gpa, .limited(1 << 20)) catch |err| {
+        std.debug.print("lint: {s}: {s}\n", .{ bp, @errorName(err) });
+        return 2;
+    };
+    defer gpa.free(budget_bytes);
+
+    var budget = core.lint.parseBudget(gpa, budget_bytes) catch |err| {
+        std.debug.print("lint: bad budget {s}: {s}\n", .{ bp, @errorName(err) });
+        return 2;
+    };
+    defer budget.deinit(gpa);
+
+    const st = std.Io.Dir.cwd().statFile(init.io, p, .{}) catch |err| {
+        std.debug.print("lint: {s}: {s}\n", .{ p, @errorName(err) });
+        return 2;
+    };
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var wtr = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const w = &wtr.interface;
+
+    var total: usize = 0;
+    var file_count: usize = 0;
+    if (as_json) try w.writeAll("{\"files\":[");
+
+    if (st.kind == .directory) {
+        var dir = std.Io.Dir.cwd().openDir(init.io, p, .{ .iterate = true }) catch |err| {
+            std.debug.print("lint: {s}: {s}\n", .{ p, @errorName(err) });
+            return 2;
+        };
+        defer dir.close(init.io);
+
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |nm| gpa.free(nm);
+            names.deinit(gpa);
+        }
+        var it = dir.iterate();
+        while (it.next(init.io) catch |err| {
+            std.debug.print("lint: {s}: {s}\n", .{ p, @errorName(err) });
+            return 2;
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!isGltfName(entry.name)) continue;
+            try names.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+        std.sort.block([]const u8, names.items, {}, lessThanName);
+
+        for (names.items) |nm| {
+            const full = try std.fs.path.join(gpa, &.{ p, nm });
+            defer gpa.free(full);
+            const count = lintOneFile(init, gpa, full, budget, as_json, file_count > 0, w) catch |err| {
+                std.debug.print("lint: {s}: {s}\n", .{ full, @errorName(err) });
+                return 2;
+            };
+            total += count;
+            file_count += 1;
+        }
+    } else {
+        const count = lintOneFile(init, gpa, p, budget, as_json, false, w) catch |err| {
+            std.debug.print("lint: {s}: {s}\n", .{ p, @errorName(err) });
+            return 2;
+        };
+        total += count;
+        file_count += 1;
+    }
+
+    if (as_json) {
+        try w.print("],\n  \"total\": {d}\n}}\n", .{total});
+    } else if (total == 0) {
+        try w.print("all {d} file(s) within budget\n", .{file_count});
+    } else {
+        try w.print("total: {d} violation(s) in {d} file(s)\n", .{ total, file_count });
+    }
+    try w.flush();
+    return if (total > 0) 1 else 0;
 }

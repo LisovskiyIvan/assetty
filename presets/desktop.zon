@@ -1,0 +1,33 @@
+// Desktop pipeline: BC7 textures, highest quality, meshopt compression.
+.{
+    .name = "desktop",
+    .target = .desktop,
+    .steps = .{
+        .{ .prune = .{
+            .unused_nodes = true,
+            .unused_materials = true,
+            .unused_textures = true,
+        } },
+        .{ .dedup = .{
+            .accessors = true,
+            .meshes = true,
+            .materials = true,
+        } },
+        .{ .weld = .{ .tolerance = 0.0 } },
+        .{ .join = .{} },
+        .{ .textures = .{
+            .format = .bc7,
+            .quality = 255,
+            .rdo_lambda = 1.0,
+            .normal_maps_renormalize = true,
+            .generate_mips = true,
+            .max_size = 0,
+        } },
+        .{ .quantize = .{
+            .position_bits = 14,
+            .normal_oct = true,
+            .uv_bits = 12,
+            .compress = true,
+        } },
+    },
+}

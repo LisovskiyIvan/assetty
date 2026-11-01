@@ -6,6 +6,7 @@ pub const decode = @import("tex/decode.zig");
 pub const diff = @import("diff.zig");
 pub const lint = @import("lint.zig");
 pub const preset = @import("pipeline/preset.zig");
+pub const prune = @import("ops/prune.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

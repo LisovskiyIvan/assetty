@@ -1,0 +1,9 @@
+{
+  "max_triangles": 100000,
+  "max_vertices": 100000,
+  "max_draw_calls": 64,
+  "max_vram_bytes": 67108864,
+  "max_texture_size": 2048,
+  "require_mips": false,
+  "allowed_image_formats": ["png"]
+}
