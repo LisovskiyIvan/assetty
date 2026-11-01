@@ -1,2 +1,1788 @@
-// OWNED BY: subagent W (GLB writer + round-trip). Replace this file entirely.
-pub const placeholder = true;
+//! GLB writer: serialize a parsed cgltf scene back into a self-contained GLB.
+//!
+//! The goal is *structural* losslessness (plus strict GLB spec compliance),
+//! not byte equality with the input file: cgltf normalizes formatting and
+//! drops information it does not model.  Writing the output of a parse a
+//! second time must, however, be byte-identical to the first write
+//! (idempotence), which is what the tests below check.
+
+const std = @import("std");
+const c = @import("cgltf");
+
+pub const Error = error{
+    /// External buffer uri or compressed (meshopt) buffer views.
+    Unsupported,
+    /// Buffer data has not been loaded (missing / truncated file).
+    InvalidData,
+} || std.mem.Allocator.Error;
+
+// ---------------------------------------------------------------------------
+// small cgltf helpers
+// ---------------------------------------------------------------------------
+
+fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
+    if (n == 0 or @intFromPtr(ptr) == 0) return &.{};
+    return ptr[0..n];
+}
+
+fn cstr(p: [*c]const u8) ?[]const u8 {
+    if (@intFromPtr(p) == 0) return null;
+    const s = std.mem.span(p);
+    return if (s.len == 0) null else s;
+}
+
+fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
+    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
+    const b: usize = @intFromPtr(base);
+    const q: usize = @intFromPtr(p);
+    if (q < b) return null;
+    const off = q - b;
+    if (off % @sizeOf(T) != 0) return null;
+    const i = off / @sizeOf(T);
+    if (i >= count) return null;
+    return @intCast(i);
+}
+
+fn viewBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
+    if (v.data) |d| {
+        const p: [*]const u8 = @ptrCast(d);
+        return p[0..v.size];
+    }
+    if (@intFromPtr(v.buffer) == 0) return null;
+    const data = v.buffer.*.data orelse return null;
+    if (v.offset + v.size > v.buffer.*.size) return null;
+    const p: [*]const u8 = @ptrCast(data);
+    return p[v.offset .. v.offset + v.size];
+}
+
+fn componentTypeInt(t: c.cgltf_component_type) u32 {
+    return switch (t) {
+        1 => 5120, // BYTE
+        2 => 5121, // UNSIGNED_BYTE
+        3 => 5122, // SHORT
+        4 => 5123, // UNSIGNED_SHORT
+        5 => 5125, // UNSIGNED_INT
+        6 => 5126, // FLOAT
+        else => 5126,
+    };
+}
+
+fn typeName(t: c.cgltf_type) []const u8 {
+    return switch (t) {
+        1 => "SCALAR",
+        2 => "VEC2",
+        3 => "VEC3",
+        4 => "VEC4",
+        5 => "MAT2",
+        6 => "MAT3",
+        7 => "MAT4",
+        else => "SCALAR",
+    };
+}
+
+fn numComponents(t: c.cgltf_type) usize {
+    return switch (t) {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 4,
+        6 => 9,
+        7 => 16,
+        else => 1,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// JSON emitter
+// ---------------------------------------------------------------------------
+
+const Out = struct {
+    a: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    /// comma state of every open container (false = nothing written yet)
+    stack: std.ArrayList(bool) = .empty,
+
+    fn raw(self: *Out, s: []const u8) !void {
+        try self.buf.appendSlice(self.a, s);
+    }
+
+    fn fmt(self: *Out, comptime f: []const u8, args: anytype) !void {
+        try self.buf.print(self.a, f, args);
+    }
+
+    fn sep(self: *Out) !void {
+        if (self.stack.items.len == 0) return;
+        const last = &self.stack.items[self.stack.items.len - 1];
+        if (last.*) try self.raw(",") else last.* = true;
+    }
+
+    fn beginObj(self: *Out) !void {
+        try self.raw("{");
+        try self.stack.append(self.a, false);
+    }
+
+    fn endObj(self: *Out) !void {
+        _ = self.stack.pop();
+        try self.raw("}");
+    }
+
+    fn beginArr(self: *Out) !void {
+        try self.raw("[");
+        try self.stack.append(self.a, false);
+    }
+
+    fn endArr(self: *Out) !void {
+        _ = self.stack.pop();
+        try self.raw("]");
+    }
+
+    fn key(self: *Out, name: []const u8) !void {
+        try self.sep();
+        try self.str(name);
+        try self.raw(":");
+    }
+
+    fn item(self: *Out) !void {
+        try self.sep();
+    }
+
+    fn str(self: *Out, s: []const u8) !void {
+        try self.raw("\"");
+        var start: usize = 0;
+        for (s, 0..) |ch, i| {
+            var esc: ?[]const u8 = null;
+            switch (ch) {
+                '"' => esc = "\\\"",
+                '\\' => esc = "\\\\",
+                '\n' => esc = "\\n",
+                '\r' => esc = "\\r",
+                '\t' => esc = "\\t",
+                0x08 => esc = "\\b",
+                0x0C => esc = "\\f",
+                else => {
+                    if (ch >= 0x20) continue;
+                },
+            }
+            if (i > start) try self.raw(s[start..i]);
+            if (esc) |e| {
+                try self.raw(e);
+            } else {
+                try self.fmt("\\u{x:0>4}", .{ch});
+            }
+            start = i + 1;
+        }
+        if (start < s.len) try self.raw(s[start..]);
+        try self.raw("\"");
+    }
+
+    fn int(self: *Out, v: anytype) !void {
+        try self.fmt("{d}", .{v});
+    }
+
+    fn float(self: *Out, v: f32) !void {
+        // be defensive: NaN/Inf are not valid JSON and should never occur
+        if (!std.math.isFinite(v)) return self.raw("0");
+        try self.fmt("{d}", .{v});
+    }
+
+    fn floatAff(self: *Out, v: anytype) !void {
+        try self.float(@floatCast(v));
+    }
+
+    fn floatArr(self: *Out, vals: anytype) !void {
+        try self.beginArr();
+        for (vals) |v| {
+            try self.item();
+            try self.floatAff(v);
+        }
+        try self.endArr();
+    }
+
+    fn intArr(self: *Out, vals: []const u32) !void {
+        try self.beginArr();
+        for (vals) |v| {
+            try self.item();
+            try self.int(v);
+        }
+        try self.endArr();
+    }
+
+    fn strArr(self: *Out, vals: []const []const u8) !void {
+        try self.beginArr();
+        for (vals) |v| {
+            try self.item();
+            try self.str(v);
+        }
+        try self.endArr();
+    }
+};
+
+fn isEmptyObjSlice(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') return false;
+    }
+    return true;
+}
+
+fn writeExtras(o: *Out, extras: *const c.cgltf_extras) !void {
+    const p = extras.data;
+    if (@intFromPtr(p) == 0) return;
+    const s = std.mem.span(p);
+    if (s.len == 0) return;
+    try o.key("extras");
+    try o.raw(s);
+}
+
+fn writeRawExtensions(o: *Out, exts: [*c]c.cgltf_extension, count: usize) !void {
+    if (count == 0) return;
+    try o.key("extensions");
+    try o.beginObj();
+    for (sl(c.cgltf_extension, exts, count)) |*e| {
+        const name = cstr(e.name) orelse continue;
+        const data = if (@intFromPtr(e.data) != 0) std.mem.span(e.data) else "{}";
+        if (isEmptyObjSlice(data)) {
+            try o.key(name);
+            try o.raw("{}");
+            continue;
+        }
+        try o.key(name);
+        try o.raw(data);
+    }
+    try o.endObj();
+}
+
+// ---------------------------------------------------------------------------
+// writer context
+// ---------------------------------------------------------------------------
+
+const Bounds = struct {
+    min: [16]f32 = undefined,
+    max: [16]f32 = undefined,
+};
+
+const Ctx = struct {
+    a: std.mem.Allocator,
+    d: *c.cgltf_data,
+    view_off: []const u64,
+    bin_len: u64,
+    keep_stride: []const bool,
+    bounds: []const ?Bounds,
+};
+
+fn emitTextureView(o: *Out, ctx: *const Ctx, view: *const c.cgltf_texture_view) !void {
+    if (@intFromPtr(view.texture) == 0) return;
+    const ti = ptrIndex(c.cgltf_texture, ctx.d.textures, ctx.d.textures_count, view.texture) orelse return;
+    try o.key("index");
+    try o.int(ti);
+    if (view.texcoord != 0) {
+        try o.key("texCoord");
+        try o.int(view.texcoord);
+    }
+    if (view.has_transform != 0) {
+        try o.key("extensions");
+        try o.beginObj();
+        try o.key("KHR_texture_transform");
+        try o.beginObj();
+        try o.key("offset");
+        try o.floatArr(view.transform.offset);
+        try o.key("rotation");
+        try o.floatAff(view.transform.rotation);
+        try o.key("scale");
+        try o.floatArr(view.transform.scale);
+        if (view.transform.has_texcoord != 0) {
+            try o.key("texCoord");
+            try o.int(view.transform.texcoord);
+        }
+        try o.endObj();
+        try o.endObj();
+    }
+}
+
+fn emitNormalTexture(o: *Out, ctx: *const Ctx, view: *const c.cgltf_texture_view) !void {
+    if (@intFromPtr(view.texture) == 0) return;
+    try o.key("normalTexture");
+    try o.beginObj();
+    try emitTextureView(o, ctx, view);
+    if (view.scale != 1.0) {
+        try o.key("scale");
+        try o.floatAff(view.scale);
+    }
+    try o.endObj();
+}
+
+fn emitOcclusionTexture(o: *Out, ctx: *const Ctx, view: *const c.cgltf_texture_view) !void {
+    if (@intFromPtr(view.texture) == 0) return;
+    try o.key("occlusionTexture");
+    try o.beginObj();
+    try emitTextureView(o, ctx, view);
+    if (view.scale != 1.0) {
+        try o.key("strength");
+        try o.floatAff(view.scale);
+    }
+    try o.endObj();
+}
+
+fn emitTexInfoKey(o: *Out, ctx: *const Ctx, name: []const u8, view: *const c.cgltf_texture_view) !void {
+    if (@intFromPtr(view.texture) == 0) return;
+    try o.key(name);
+    try o.beginObj();
+    try emitTextureView(o, ctx, view);
+    try o.endObj();
+}
+
+// ---------------------------------------------------------------------------
+// per-object emitters
+// ---------------------------------------------------------------------------
+
+fn writeAsset(o: *Out, d: *c.cgltf_data) !void {
+    const asset = &d.asset;
+    try o.beginObj();
+    if (cstr(asset.copyright)) |s| {
+        try o.key("copyright");
+        try o.str(s);
+    }
+    if (cstr(asset.generator)) |s| {
+        try o.key("generator");
+        try o.str(s);
+    }
+    try o.key("version");
+    try o.str(cstr(asset.version) orelse "2.0");
+    if (cstr(asset.min_version)) |s| {
+        try o.key("minVersion");
+        try o.str(s);
+    }
+    try writeRawExtensions(o, asset.extensions, asset.extensions_count);
+    try writeExtras(o, &asset.extras);
+    try o.endObj();
+}
+
+fn writeBuffer(o: *Out, ctx: *const Ctx, b: *const c.cgltf_buffer) !void {
+    try o.beginObj();
+    if (cstr(b.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    try o.key("byteLength");
+    try o.int(ctx.bin_len);
+    if (cstr(b.uri)) |s| {
+        try o.key("uri");
+        try o.str(s);
+    }
+    try writeRawExtensions(o, b.extensions, b.extensions_count);
+    try writeExtras(o, &b.extras);
+    try o.endObj();
+}
+
+fn writeBufferView(o: *Out, ctx: *const Ctx, i: usize, v: *const c.cgltf_buffer_view) !void {
+    try o.beginObj();
+    if (cstr(v.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_buffer, ctx.d.buffers, ctx.d.buffers_count, v.buffer)) |bi| {
+        try o.key("buffer");
+        try o.int(bi);
+    }
+    try o.key("byteOffset");
+    try o.int(ctx.view_off[i]);
+    try o.key("byteLength");
+    try o.int(v.size);
+    if (i < ctx.keep_stride.len and ctx.keep_stride[i] and v.stride != 0) {
+        try o.key("byteStride");
+        try o.int(v.stride);
+    }
+    switch (v.type) {
+        1 => {
+            try o.key("target");
+            try o.int(@as(u32, 34963));
+        },
+        2 => {
+            try o.key("target");
+            try o.int(@as(u32, 34962));
+        },
+        else => {},
+    }
+    try writeRawExtensions(o, v.extensions, v.extensions_count);
+    try writeExtras(o, &v.extras);
+    try o.endObj();
+}
+
+fn writeAccessor(o: *Out, ctx: *const Ctx, i: usize, acc: *const c.cgltf_accessor) !void {
+    try o.beginObj();
+    if (cstr(acc.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.buffer_view)) |bi| {
+        try o.key("bufferView");
+        try o.int(bi);
+    }
+    if (acc.offset != 0) {
+        try o.key("byteOffset");
+        try o.int(acc.offset);
+    }
+    try o.key("componentType");
+    try o.int(componentTypeInt(acc.component_type));
+    if (acc.normalized != 0) {
+        try o.key("normalized");
+        try o.raw("true");
+    }
+    try o.key("count");
+    try o.int(acc.count);
+    try o.key("type");
+    try o.str(typeName(acc.type));
+
+    const ncomp = numComponents(acc.type);
+    const bnd: ?Bounds = if (i < ctx.bounds.len) ctx.bounds[i] else null;
+
+    if (acc.has_min != 0) {
+        try o.key("min");
+        try o.beginArr();
+        for (0..ncomp) |k| {
+            try o.item();
+            try o.floatAff(acc.min[k]);
+        }
+        try o.endArr();
+    } else if (bnd) |b| {
+        try o.key("min");
+        try o.beginArr();
+        for (0..ncomp) |k| {
+            try o.item();
+            try o.float(b.min[k]);
+        }
+        try o.endArr();
+    }
+    if (acc.has_max != 0) {
+        try o.key("max");
+        try o.beginArr();
+        for (0..ncomp) |k| {
+            try o.item();
+            try o.floatAff(acc.max[k]);
+        }
+        try o.endArr();
+    } else if (bnd) |b| {
+        try o.key("max");
+        try o.beginArr();
+        for (0..ncomp) |k| {
+            try o.item();
+            try o.float(b.max[k]);
+        }
+        try o.endArr();
+    }
+
+    if (acc.is_sparse != 0) {
+        try o.key("sparse");
+        try o.beginObj();
+        try o.key("count");
+        try o.int(acc.sparse.count);
+        try o.key("indices");
+        try o.beginObj();
+        if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.sparse.indices_buffer_view)) |bi| {
+            try o.key("bufferView");
+            try o.int(bi);
+        }
+        try o.key("byteOffset");
+        try o.int(acc.sparse.indices_byte_offset);
+        try o.key("componentType");
+        try o.int(componentTypeInt(acc.sparse.indices_component_type));
+        try o.endObj();
+        try o.key("values");
+        try o.beginObj();
+        if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.sparse.values_buffer_view)) |bi| {
+            try o.key("bufferView");
+            try o.int(bi);
+        }
+        try o.key("byteOffset");
+        try o.int(acc.sparse.values_byte_offset);
+        try o.endObj();
+        try o.endObj();
+    }
+
+    try writeRawExtensions(o, acc.extensions, acc.extensions_count);
+    try writeExtras(o, &acc.extras);
+    try o.endObj();
+}
+
+fn writeImage(o: *Out, ctx: *const Ctx, im: *const c.cgltf_image) !void {
+    try o.beginObj();
+    if (cstr(im.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (cstr(im.uri)) |s| {
+        try o.key("uri");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, im.buffer_view)) |bi| {
+        try o.key("bufferView");
+        try o.int(bi);
+    }
+    if (cstr(im.mime_type)) |s| {
+        try o.key("mimeType");
+        try o.str(s);
+    }
+    try writeRawExtensions(o, im.extensions, im.extensions_count);
+    try writeExtras(o, &im.extras);
+    try o.endObj();
+}
+
+fn writeSampler(o: *Out, s: *const c.cgltf_sampler) !void {
+    try o.beginObj();
+    if (cstr(s.name)) |n| {
+        try o.key("name");
+        try o.str(n);
+    }
+    if (s.mag_filter != 0) {
+        try o.key("magFilter");
+        try o.int(s.mag_filter);
+    }
+    if (s.min_filter != 0) {
+        try o.key("minFilter");
+        try o.int(s.min_filter);
+    }
+    try o.key("wrapS");
+    try o.int(s.wrap_s);
+    try o.key("wrapT");
+    try o.int(s.wrap_t);
+    try writeRawExtensions(o, s.extensions, s.extensions_count);
+    try writeExtras(o, &s.extras);
+    try o.endObj();
+}
+
+fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
+    try o.beginObj();
+    if (cstr(t.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.image)) |ii| {
+        try o.key("source");
+        try o.int(ii);
+    }
+    if (ptrIndex(c.cgltf_sampler, ctx.d.samplers, ctx.d.samplers_count, t.sampler)) |si| {
+        try o.key("sampler");
+        try o.int(si);
+    }
+    if (t.has_basisu != 0 or t.has_webp != 0) {
+        try o.key("extensions");
+        try o.beginObj();
+        if (t.has_basisu != 0) {
+            try o.key("KHR_texture_basisu");
+            try o.beginObj();
+            if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.basisu_image)) |ii| {
+                try o.key("source");
+                try o.int(ii);
+            }
+            try o.endObj();
+        }
+        if (t.has_webp != 0) {
+            try o.key("EXT_texture_webp");
+            try o.beginObj();
+            if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.webp_image)) |ii| {
+                try o.key("source");
+                try o.int(ii);
+            }
+            try o.endObj();
+        }
+        try o.endObj();
+    }
+    try writeRawExtensions(o, t.extensions, t.extensions_count);
+    try writeExtras(o, &t.extras);
+    try o.endObj();
+}
+
+fn writeMaterial(o: *Out, ctx: *const Ctx, m: *const c.cgltf_material) !void {
+    try o.beginObj();
+    if (cstr(m.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+
+    if (m.has_pbr_metallic_roughness != 0) {
+        const pbr = &m.pbr_metallic_roughness;
+        try o.key("pbrMetallicRoughness");
+        try o.beginObj();
+        try o.key("baseColorFactor");
+        try o.floatArr(pbr.base_color_factor);
+        try o.key("metallicFactor");
+        try o.floatAff(pbr.metallic_factor);
+        try o.key("roughnessFactor");
+        try o.floatAff(pbr.roughness_factor);
+        try emitTexInfoKey(o, ctx, "baseColorTexture", &pbr.base_color_texture);
+        try emitTexInfoKey(o, ctx, "metallicRoughnessTexture", &pbr.metallic_roughness_texture);
+        try o.endObj();
+    }
+
+    try emitNormalTexture(o, ctx, &m.normal_texture);
+    try emitOcclusionTexture(o, ctx, &m.occlusion_texture);
+    try emitTexInfoKey(o, ctx, "emissiveTexture", &m.emissive_texture);
+
+    try o.key("emissiveFactor");
+    try o.floatArr(m.emissive_factor);
+
+    switch (m.alpha_mode) {
+        1 => {
+            try o.key("alphaMode");
+            try o.str("MASK");
+        },
+        2 => {
+            try o.key("alphaMode");
+            try o.str("BLEND");
+        },
+        else => {},
+    }
+    if (m.alpha_mode == 1 and m.alpha_cutoff != 0.5) {
+        try o.key("alphaCutoff");
+        try o.floatAff(m.alpha_cutoff);
+    }
+    if (m.double_sided != 0) {
+        try o.key("doubleSided");
+        try o.raw("true");
+    }
+
+    // typed KHR_materials_* extensions
+    var any_ext = m.unlit != 0 or
+        m.has_pbr_specular_glossiness != 0 or
+        m.has_clearcoat != 0 or
+        m.has_transmission != 0 or
+        m.has_volume != 0 or
+        m.has_ior != 0 or
+        m.has_specular != 0 or
+        m.has_sheen != 0 or
+        m.has_emissive_strength != 0 or
+        m.has_iridescence != 0 or
+        m.has_diffuse_transmission != 0 or
+        m.has_anisotropy != 0 or
+        m.has_dispersion != 0;
+    if (m.extensions_count > 0) any_ext = true;
+
+    if (any_ext) {
+        try o.key("extensions");
+        try o.beginObj();
+
+        if (m.has_pbr_specular_glossiness != 0) {
+            const sg = &m.pbr_specular_glossiness;
+            try o.key("KHR_materials_pbrSpecularGlossiness");
+            try o.beginObj();
+            try o.key("diffuseFactor");
+            try o.floatArr(sg.diffuse_factor);
+            try o.key("specularFactor");
+            try o.floatArr(sg.specular_factor);
+            try o.key("glossinessFactor");
+            try o.floatAff(sg.glossiness_factor);
+            try emitTexInfoKey(o, ctx, "diffuseTexture", &sg.diffuse_texture);
+            try emitTexInfoKey(o, ctx, "specularGlossinessTexture", &sg.specular_glossiness_texture);
+            try o.endObj();
+        }
+        if (m.unlit != 0) {
+            try o.key("KHR_materials_unlit");
+            try o.raw("{}");
+        }
+        if (m.has_emissive_strength != 0) {
+            try o.key("KHR_materials_emissive_strength");
+            try o.beginObj();
+            try o.key("emissiveStrength");
+            try o.floatAff(m.emissive_strength.emissive_strength);
+            try o.endObj();
+        }
+        if (m.has_clearcoat != 0) {
+            const cc = &m.clearcoat;
+            try o.key("KHR_materials_clearcoat");
+            try o.beginObj();
+            try o.key("clearcoatFactor");
+            try o.floatAff(cc.clearcoat_factor);
+            try o.key("clearcoatRoughnessFactor");
+            try o.floatAff(cc.clearcoat_roughness_factor);
+            try emitTexInfoKey(o, ctx, "clearcoatTexture", &cc.clearcoat_texture);
+            try emitTexInfoKey(o, ctx, "clearcoatRoughnessTexture", &cc.clearcoat_roughness_texture);
+            try emitTexInfoKey(o, ctx, "clearcoatNormalTexture", &cc.clearcoat_normal_texture);
+            try o.endObj();
+        }
+        if (m.has_transmission != 0) {
+            try o.key("KHR_materials_transmission");
+            try o.beginObj();
+            try o.key("transmissionFactor");
+            try o.floatAff(m.transmission.transmission_factor);
+            try emitTexInfoKey(o, ctx, "transmissionTexture", &m.transmission.transmission_texture);
+            try o.endObj();
+        }
+        if (m.has_volume != 0) {
+            const vol = &m.volume;
+            try o.key("KHR_materials_volume");
+            try o.beginObj();
+            try o.key("thicknessFactor");
+            try o.floatAff(vol.thickness_factor);
+            try emitTexInfoKey(o, ctx, "thicknessTexture", &vol.thickness_texture);
+            try o.key("attenuationDistance");
+            try o.floatAff(vol.attenuation_distance);
+            try o.key("attenuationColor");
+            try o.floatArr(vol.attenuation_color);
+            try o.endObj();
+        }
+        if (m.has_ior != 0) {
+            try o.key("KHR_materials_ior");
+            try o.beginObj();
+            try o.key("ior");
+            try o.floatAff(m.ior.ior);
+            try o.endObj();
+        }
+        if (m.has_specular != 0) {
+            const sp = &m.specular;
+            try o.key("KHR_materials_specular");
+            try o.beginObj();
+            try o.key("specularFactor");
+            try o.floatAff(sp.specular_factor);
+            try emitTexInfoKey(o, ctx, "specularTexture", &sp.specular_texture);
+            try o.key("specularColorFactor");
+            try o.floatArr(sp.specular_color_factor);
+            try emitTexInfoKey(o, ctx, "specularColorTexture", &sp.specular_color_texture);
+            try o.endObj();
+        }
+        if (m.has_sheen != 0) {
+            const sh = &m.sheen;
+            try o.key("KHR_materials_sheen");
+            try o.beginObj();
+            try o.key("sheenColorFactor");
+            try o.floatArr(sh.sheen_color_factor);
+            try emitTexInfoKey(o, ctx, "sheenColorTexture", &sh.sheen_color_texture);
+            try o.key("sheenRoughnessFactor");
+            try o.floatAff(sh.sheen_roughness_factor);
+            try emitTexInfoKey(o, ctx, "sheenRoughnessTexture", &sh.sheen_roughness_texture);
+            try o.endObj();
+        }
+        if (m.has_iridescence != 0) {
+            const ir = &m.iridescence;
+            try o.key("KHR_materials_iridescence");
+            try o.beginObj();
+            try o.key("iridescenceFactor");
+            try o.floatAff(ir.iridescence_factor);
+            try emitTexInfoKey(o, ctx, "iridescenceTexture", &ir.iridescence_texture);
+            try o.key("iridescenceIor");
+            try o.floatAff(ir.iridescence_ior);
+            try o.key("iridescenceThicknessMinimum");
+            try o.floatAff(ir.iridescence_thickness_min);
+            try o.key("iridescenceThicknessMaximum");
+            try o.floatAff(ir.iridescence_thickness_max);
+            try emitTexInfoKey(o, ctx, "iridescenceThicknessTexture", &ir.iridescence_thickness_texture);
+            try o.endObj();
+        }
+        if (m.has_diffuse_transmission != 0) {
+            const dt = &m.diffuse_transmission;
+            try o.key("KHR_materials_diffuse_transmission");
+            try o.beginObj();
+            try o.key("diffuseTransmissionFactor");
+            try o.floatAff(dt.diffuse_transmission_factor);
+            try emitTexInfoKey(o, ctx, "diffuseTransmissionTexture", &dt.diffuse_transmission_texture);
+            try o.key("diffuseTransmissionColorFactor");
+            try o.floatArr(dt.diffuse_transmission_color_factor);
+            try emitTexInfoKey(o, ctx, "diffuseTransmissionColorTexture", &dt.diffuse_transmission_color_texture);
+            try o.endObj();
+        }
+        if (m.has_anisotropy != 0) {
+            const an = &m.anisotropy;
+            try o.key("KHR_materials_anisotropy");
+            try o.beginObj();
+            try o.key("anisotropyStrength");
+            try o.floatAff(an.anisotropy_strength);
+            try o.key("anisotropyRotation");
+            try o.floatAff(an.anisotropy_rotation);
+            try emitTexInfoKey(o, ctx, "anisotropyTexture", &an.anisotropy_texture);
+            try o.endObj();
+        }
+        if (m.has_dispersion != 0) {
+            try o.key("KHR_materials_dispersion");
+            try o.beginObj();
+            try o.key("dispersion");
+            try o.floatAff(m.dispersion.dispersion);
+            try o.endObj();
+        }
+
+        for (sl(c.cgltf_extension, m.extensions, m.extensions_count)) |*e| {
+            const name = cstr(e.name) orelse continue;
+            const data = if (@intFromPtr(e.data) != 0) std.mem.span(e.data) else "{}";
+            try o.key(name);
+            try o.raw(if (isEmptyObjSlice(data)) "{}" else data);
+        }
+        try o.endObj();
+    }
+
+    try writeExtras(o, &m.extras);
+    try o.endObj();
+}
+
+fn writeAttributes(o: *Out, ctx: *const Ctx, attrs: [*c]c.cgltf_attribute, count: usize) !void {
+    try o.beginObj();
+    for (sl(c.cgltf_attribute, attrs, count)) |*a| {
+        const name = cstr(a.name) orelse continue;
+        const ai = ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, a.data) orelse continue;
+        try o.key(name);
+        try o.int(ai);
+    }
+    try o.endObj();
+}
+
+fn writePrimitive(o: *Out, ctx: *const Ctx, p: *const c.cgltf_primitive) !void {
+    try o.beginObj();
+    const mode: u32 = if (p.type == 0) 4 else @intCast(p.type - 1);
+    if (mode != 4) {
+        try o.key("mode");
+        try o.int(mode);
+    }
+    try o.key("attributes");
+    try writeAttributes(o, ctx, p.attributes, p.attributes_count);
+    if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, p.indices)) |ii| {
+        try o.key("indices");
+        try o.int(ii);
+    }
+    if (ptrIndex(c.cgltf_material, ctx.d.materials, ctx.d.materials_count, p.material)) |mi| {
+        try o.key("material");
+        try o.int(mi);
+    }
+    if (p.targets_count > 0) {
+        try o.key("targets");
+        try o.beginArr();
+        for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+            try o.item();
+            try writeAttributes(o, ctx, t.attributes, t.attributes_count);
+        }
+        try o.endArr();
+    }
+    try writeRawExtensions(o, p.extensions, p.extensions_count);
+    try writeExtras(o, &p.extras);
+    try o.endObj();
+}
+
+fn writeMesh(o: *Out, ctx: *const Ctx, m: *const c.cgltf_mesh) !void {
+    try o.beginObj();
+    if (cstr(m.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    try o.key("primitives");
+    try o.beginArr();
+    for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+        try o.item();
+        try writePrimitive(o, ctx, p);
+    }
+    try o.endArr();
+    if (m.weights_count > 0) {
+        try o.key("weights");
+        try o.beginArr();
+        for (sl(c.cgltf_float, m.weights, m.weights_count)) |w| {
+            try o.item();
+            try o.floatAff(w);
+        }
+        try o.endArr();
+    }
+    if (@intFromPtr(m.extras.data) != 0) {
+        try writeExtras(o, &m.extras);
+    } else if (m.target_names_count > 0) {
+        try o.key("extras");
+        try o.beginObj();
+        try o.key("targetNames");
+        try o.beginArr();
+        for (sl([*c]u8, @ptrCast(m.target_names), m.target_names_count)) |p| {
+            try o.item();
+            try o.str(cstr(p) orelse "");
+        }
+        try o.endArr();
+        try o.endObj();
+    }
+    try writeRawExtensions(o, m.extensions, m.extensions_count);
+    try o.endObj();
+}
+
+fn writeCamera(o: *Out, cam: *const c.cgltf_camera) !void {
+    try o.beginObj();
+    if (cstr(cam.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    switch (cam.type) {
+        1 => {
+            const p = &cam.data.perspective;
+            try o.key("type");
+            try o.str("perspective");
+            try o.key("perspective");
+            try o.beginObj();
+            try o.key("yfov");
+            try o.floatAff(p.yfov);
+            try o.key("znear");
+            try o.floatAff(p.znear);
+            if (p.has_aspect_ratio != 0) {
+                try o.key("aspectRatio");
+                try o.floatAff(p.aspect_ratio);
+            }
+            if (p.has_zfar != 0) {
+                try o.key("zfar");
+                try o.floatAff(p.zfar);
+            }
+            try writeExtras(o, &p.extras);
+            try o.endObj();
+        },
+        2 => {
+            const p = &cam.data.orthographic;
+            try o.key("type");
+            try o.str("orthographic");
+            try o.key("orthographic");
+            try o.beginObj();
+            try o.key("xmag");
+            try o.floatAff(p.xmag);
+            try o.key("ymag");
+            try o.floatAff(p.ymag);
+            try o.key("znear");
+            try o.floatAff(p.znear);
+            try o.key("zfar");
+            try o.floatAff(p.zfar);
+            try o.endObj();
+        },
+        else => {},
+    }
+    try writeRawExtensions(o, cam.extensions, cam.extensions_count);
+    try writeExtras(o, &cam.extras);
+    try o.endObj();
+}
+
+fn writeNode(o: *Out, ctx: *const Ctx, n: *const c.cgltf_node) !void {
+    try o.beginObj();
+    if (cstr(n.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_mesh, ctx.d.meshes, ctx.d.meshes_count, n.mesh)) |mi| {
+        try o.key("mesh");
+        try o.int(mi);
+    }
+    if (ptrIndex(c.cgltf_skin, ctx.d.skins, ctx.d.skins_count, n.skin)) |si| {
+        try o.key("skin");
+        try o.int(si);
+    }
+    if (ptrIndex(c.cgltf_camera, ctx.d.cameras, ctx.d.cameras_count, n.camera)) |ci| {
+        try o.key("camera");
+        try o.int(ci);
+    }
+    if (n.children_count > 0) {
+        try o.key("children");
+        try o.beginArr();
+        for (sl([*c]c.cgltf_node, n.children, n.children_count)) |ch| {
+            const ci = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, ch) orelse continue;
+            try o.item();
+            try o.int(ci);
+        }
+        try o.endArr();
+    }
+    if (n.has_matrix != 0) {
+        try o.key("matrix");
+        try o.floatArr(n.matrix);
+    } else {
+        if (n.has_translation != 0) {
+            try o.key("translation");
+            try o.floatArr(n.translation);
+        }
+        if (n.has_rotation != 0) {
+            try o.key("rotation");
+            try o.floatArr(n.rotation);
+        }
+        if (n.has_scale != 0) {
+            try o.key("scale");
+            try o.floatArr(n.scale);
+        }
+    }
+    if (n.weights_count > 0) {
+        try o.key("weights");
+        try o.beginArr();
+        for (sl(c.cgltf_float, n.weights, n.weights_count)) |w| {
+            try o.item();
+            try o.floatAff(w);
+        }
+        try o.endArr();
+    }
+    // extensions: KHR_lights_punctual + EXT_mesh_gpu_instancing + unknowns
+    const has_ext = @intFromPtr(n.light) != 0 or n.has_mesh_gpu_instancing != 0 or n.extensions_count > 0;
+    if (has_ext) {
+        try o.key("extensions");
+        try o.beginObj();
+        if (@intFromPtr(n.light) != 0) {
+            const li = ptrIndex(c.cgltf_light, ctx.d.lights, ctx.d.lights_count, n.light) orelse 0;
+            try o.key("KHR_lights_punctual");
+            try o.beginObj();
+            try o.key("light");
+            try o.int(li);
+            try o.endObj();
+        }
+        if (n.has_mesh_gpu_instancing != 0) {
+            try o.key("EXT_mesh_gpu_instancing");
+            try o.beginObj();
+            try o.key("attributes");
+            try writeAttributes(o, ctx, n.mesh_gpu_instancing.attributes, n.mesh_gpu_instancing.attributes_count);
+            try o.endObj();
+        }
+        for (sl(c.cgltf_extension, n.extensions, n.extensions_count)) |*e| {
+            const name = cstr(e.name) orelse continue;
+            const data = if (@intFromPtr(e.data) != 0) std.mem.span(e.data) else "{}";
+            try o.key(name);
+            try o.raw(if (isEmptyObjSlice(data)) "{}" else data);
+        }
+        try o.endObj();
+    }
+    try writeExtras(o, &n.extras);
+    try o.endObj();
+}
+
+fn writeScene(o: *Out, ctx: *const Ctx, s: *const c.cgltf_scene) !void {
+    try o.beginObj();
+    if (cstr(s.name)) |n| {
+        try o.key("name");
+        try o.str(n);
+    }
+    if (s.nodes_count > 0) {
+        try o.key("nodes");
+        try o.beginArr();
+        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |np| {
+            const ni = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, np) orelse continue;
+            try o.item();
+            try o.int(ni);
+        }
+        try o.endArr();
+    }
+    try writeRawExtensions(o, s.extensions, s.extensions_count);
+    try writeExtras(o, &s.extras);
+    try o.endObj();
+}
+
+fn writeSkin(o: *Out, ctx: *const Ctx, sk: *const c.cgltf_skin) !void {
+    try o.beginObj();
+    if (cstr(sk.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, sk.inverse_bind_matrices)) |ai| {
+        try o.key("inverseBindMatrices");
+        try o.int(ai);
+    }
+    if (ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, sk.skeleton)) |ni| {
+        try o.key("skeleton");
+        try o.int(ni);
+    }
+    try o.key("joints");
+    try o.beginArr();
+    for (sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |jp| {
+        const ji = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, jp) orelse continue;
+        try o.item();
+        try o.int(ji);
+    }
+    try o.endArr();
+    try writeRawExtensions(o, sk.extensions, sk.extensions_count);
+    try writeExtras(o, &sk.extras);
+    try o.endObj();
+}
+
+fn writeAnimation(o: *Out, ctx: *const Ctx, an: *const c.cgltf_animation) !void {
+    try o.beginObj();
+    if (cstr(an.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    try o.key("channels");
+    try o.beginArr();
+    for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+        try o.item();
+        try o.beginObj();
+        if (ptrIndex(c.cgltf_animation_sampler, an.samplers, an.samplers_count, ch.sampler)) |si| {
+            try o.key("sampler");
+            try o.int(si);
+        }
+        try o.key("target");
+        try o.beginObj();
+        if (ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, ch.target_node)) |ni| {
+            try o.key("node");
+            try o.int(ni);
+        }
+        const path: []const u8 = switch (ch.target_path) {
+            1 => "translation",
+            2 => "rotation",
+            3 => "scale",
+            4 => "weights",
+            else => "translation",
+        };
+        try o.key("path");
+        try o.str(path);
+        try o.endObj();
+        try writeRawExtensions(o, ch.extensions, ch.extensions_count);
+        try writeExtras(o, &ch.extras);
+        try o.endObj();
+    }
+    try o.endArr();
+
+    try o.key("samplers");
+    try o.beginArr();
+    for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+        try o.item();
+        try o.beginObj();
+        if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.input)) |ai| {
+            try o.key("input");
+            try o.int(ai);
+        }
+        if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.output)) |ai| {
+            try o.key("output");
+            try o.int(ai);
+        }
+        const interp: []const u8 = switch (s.interpolation) {
+            1 => "STEP",
+            2 => "CUBICSPLINE",
+            else => "LINEAR",
+        };
+        if (s.interpolation != 0) {
+            try o.key("interpolation");
+            try o.str(interp);
+        }
+        try writeRawExtensions(o, s.extensions, s.extensions_count);
+        try writeExtras(o, &s.extras);
+        try o.endObj();
+    }
+    try o.endArr();
+
+    try writeExtras(o, &an.extras);
+    try writeRawExtensions(o, an.extensions, an.extensions_count);
+    try o.endObj();
+}
+
+fn writeLight(o: *Out, l: *const c.cgltf_light) !void {
+    try o.beginObj();
+    if (cstr(l.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    try o.key("color");
+    try o.floatArr(l.color);
+    try o.key("intensity");
+    try o.floatAff(l.intensity);
+    const kind: ?[]const u8 = switch (l.type) {
+        1 => "directional",
+        2 => "point",
+        3 => "spot",
+        else => null,
+    };
+    if (kind) |k| {
+        try o.key("type");
+        try o.str(k);
+    }
+    if (l.type == 3) {
+        try o.key("range");
+        try o.floatAff(l.range);
+        try o.key("spot");
+        try o.beginObj();
+        try o.key("innerConeAngle");
+        try o.floatAff(l.spot_inner_cone_angle);
+        try o.key("outerConeAngle");
+        try o.floatAff(l.spot_outer_cone_angle);
+        try o.endObj();
+    } else if (l.type == 2 and l.range != 0) {
+        try o.key("range");
+        try o.floatAff(l.range);
+    }
+    try writeExtras(o, &l.extras);
+    try o.endObj();
+}
+
+// ---------------------------------------------------------------------------
+// bounds computation (POSITION must always carry min/max)
+// ---------------------------------------------------------------------------
+
+fn computeBounds(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !Bounds {
+    const ncomp = numComponents(acc.type);
+    const total = @as(usize, @intCast(acc.count)) * ncomp;
+    if (total == 0) return error.Unsupported;
+    const tmp = try a.alloc(f32, total);
+    const got = c.cgltf_accessor_unpack_floats(acc, tmp.ptr, total);
+    if (got < total) return error.Unsupported;
+    var out: Bounds = .{};
+    for (0..ncomp) |k| {
+        out.min[k] = tmp[k];
+        out.max[k] = tmp[k];
+    }
+    var e: usize = 1;
+    while (e < acc.count) : (e += 1) {
+        for (0..ncomp) |k| {
+            const v = tmp[e * ncomp + k];
+            if (v < out.min[k]) out.min[k] = v;
+            if (v > out.max[k]) out.max[k] = v;
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+/// Serialize `data` (parsed from `file_bytes`) into a self-contained GLB.
+///
+/// All allocations are made with `a`.  Returns `error.Unsupported` when the
+/// asset cannot be represented as a single-buffer GLB (external buffer uri or
+/// meshopt-compressed data).
+pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8) ![]u8 {
+    _ = file_bytes;
+
+    if (data.buffers_count > 1) return error.Unsupported;
+    for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
+        if (@intFromPtr(b.uri) != 0) return error.Unsupported;
+    }
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count)) |*v| {
+        if (v.has_meshopt_compression != 0) return error.Unsupported;
+    }
+
+    // --- BIN chunk: copy every buffer view, 4-byte aligned ---
+    const view_off = try a.alloc(u64, data.buffer_views_count);
+    var bin: std.ArrayList(u8) = .empty;
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+        const rem = bin.items.len % 4;
+        if (rem != 0) {
+            try bin.resize(a, bin.items.len + (4 - rem));
+            @memset(bin.items[bin.items.len - (4 - rem) ..], 0);
+        }
+        view_off[i] = bin.items.len;
+        const bytes = viewBytes(v) orelse return error.Unsupported;
+        try bin.appendSlice(a, bytes);
+    }
+
+    // --- byteStride: emit only when it differs from an accessor's natural stride ---
+    const keep_stride = try a.alloc(bool, data.buffer_views_count);
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+        keep_stride[i] = false;
+        if (v.stride == 0) continue;
+        for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
+            if (acc.buffer_view == v) {
+                const natural = c.cgltf_calc_size(acc.type, acc.component_type);
+                if (natural != v.stride) {
+                    keep_stride[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- mark POSITION accessors, compute missing min/max ---
+    const acc_count: usize = @intCast(data.accessors_count);
+    const is_position = try a.alloc(bool, acc_count);
+    @memset(is_position, false);
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                if (at.type == 1) {
+                    if (ptrIndex(c.cgltf_accessor, data.accessors, data.accessors_count, at.data)) |ai| is_position[ai] = true;
+                }
+            }
+            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+                    if (at.type == 1) {
+                        if (ptrIndex(c.cgltf_accessor, data.accessors, data.accessors_count, at.data)) |ai| is_position[ai] = true;
+                    }
+                }
+            }
+        }
+    }
+    const bounds = try a.alloc(?Bounds, acc_count);
+    @memset(bounds, null);
+    for (sl(c.cgltf_accessor, data.accessors, data.accessors_count), 0..) |*acc, i| {
+        if (is_position[i] and (acc.has_min == 0 or acc.has_max == 0)) {
+            bounds[i] = try computeBounds(a, acc);
+        }
+    }
+
+    const ctx = Ctx{
+        .a = a,
+        .d = data,
+        .view_off = view_off,
+        .bin_len = bin.items.len,
+        .keep_stride = keep_stride,
+        .bounds = bounds,
+    };
+
+    // --- JSON chunk ---
+    var o = Out{ .a = a };
+    try o.beginObj();
+
+    try o.key("asset");
+    try writeAsset(&o, data);
+
+    if (ptrIndex(c.cgltf_scene, data.scenes, data.scenes_count, data.scene)) |si| {
+        try o.key("scene");
+        try o.int(si);
+    }
+
+    if (data.scenes_count > 0) {
+        try o.key("scenes");
+        try o.beginArr();
+        for (sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
+            try o.item();
+            try writeScene(&o, &ctx, s);
+        }
+        try o.endArr();
+    }
+    if (data.nodes_count > 0) {
+        try o.key("nodes");
+        try o.beginArr();
+        for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+            try o.item();
+            try writeNode(&o, &ctx, n);
+        }
+        try o.endArr();
+    }
+    if (data.meshes_count > 0) {
+        try o.key("meshes");
+        try o.beginArr();
+        for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+            try o.item();
+            try writeMesh(&o, &ctx, m);
+        }
+        try o.endArr();
+    }
+    if (data.materials_count > 0) {
+        try o.key("materials");
+        try o.beginArr();
+        for (sl(c.cgltf_material, data.materials, data.materials_count)) |*m| {
+            try o.item();
+            try writeMaterial(&o, &ctx, m);
+        }
+        try o.endArr();
+    }
+    if (data.accessors_count > 0) {
+        try o.key("accessors");
+        try o.beginArr();
+        for (sl(c.cgltf_accessor, data.accessors, data.accessors_count), 0..) |*acc, i| {
+            try o.item();
+            try writeAccessor(&o, &ctx, i, acc);
+        }
+        try o.endArr();
+    }
+    if (data.buffer_views_count > 0) {
+        try o.key("bufferViews");
+        try o.beginArr();
+        for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+            try o.item();
+            try writeBufferView(&o, &ctx, i, v);
+        }
+        try o.endArr();
+    }
+    if (data.buffers_count > 0) {
+        try o.key("buffers");
+        try o.beginArr();
+        for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
+            try o.item();
+            try writeBuffer(&o, &ctx, b);
+        }
+        try o.endArr();
+    }
+    if (data.images_count > 0) {
+        try o.key("images");
+        try o.beginArr();
+        for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
+            try o.item();
+            try writeImage(&o, &ctx, im);
+        }
+        try o.endArr();
+    }
+    if (data.textures_count > 0) {
+        try o.key("textures");
+        try o.beginArr();
+        for (sl(c.cgltf_texture, data.textures, data.textures_count)) |*t| {
+            try o.item();
+            try writeTexture(&o, &ctx, t);
+        }
+        try o.endArr();
+    }
+    if (data.samplers_count > 0) {
+        try o.key("samplers");
+        try o.beginArr();
+        for (sl(c.cgltf_sampler, data.samplers, data.samplers_count)) |*s| {
+            try o.item();
+            try writeSampler(&o, s);
+        }
+        try o.endArr();
+    }
+    if (data.cameras_count > 0) {
+        try o.key("cameras");
+        try o.beginArr();
+        for (sl(c.cgltf_camera, data.cameras, data.cameras_count)) |*cam| {
+            try o.item();
+            try writeCamera(&o, cam);
+        }
+        try o.endArr();
+    }
+    if (data.skins_count > 0) {
+        try o.key("skins");
+        try o.beginArr();
+        for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+            try o.item();
+            try writeSkin(&o, &ctx, sk);
+        }
+        try o.endArr();
+    }
+    if (data.animations_count > 0) {
+        try o.key("animations");
+        try o.beginArr();
+        for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+            try o.item();
+            try writeAnimation(&o, &ctx, an);
+        }
+        try o.endArr();
+    }
+
+    // top-level extensions: KHR_lights_punctual + unknown
+    if (data.lights_count > 0 or data.data_extensions_count > 0 or data.variants_count > 0) {
+        try o.key("extensions");
+        try o.beginObj();
+        if (data.variants_count > 0) {
+            try o.key("KHR_materials_variants");
+            try o.beginObj();
+            try o.key("variants");
+            try o.beginArr();
+            for (sl(c.cgltf_material_variant, data.variants, data.variants_count)) |*v| {
+                try o.item();
+                try o.beginObj();
+                if (cstr(v.name)) |n| {
+                    try o.key("name");
+                    try o.str(n);
+                }
+                try writeExtras(&o, &v.extras);
+                try o.endObj();
+            }
+            try o.endArr();
+            try o.endObj();
+        }
+        if (data.lights_count > 0) {
+            try o.key("KHR_lights_punctual");
+            try o.beginObj();
+            try o.key("lights");
+            try o.beginArr();
+            for (sl(c.cgltf_light, data.lights, data.lights_count)) |*l| {
+                try o.item();
+                try writeLight(&o, l);
+            }
+            try o.endArr();
+            try o.endObj();
+        }
+        for (sl(c.cgltf_extension, data.data_extensions, data.data_extensions_count)) |*e| {
+            const name = cstr(e.name) orelse continue;
+            const data_js = if (@intFromPtr(e.data) != 0) std.mem.span(e.data) else "{}";
+            try o.key(name);
+            try o.raw(if (isEmptyObjSlice(data_js)) "{}" else data_js);
+        }
+        try o.endObj();
+    }
+
+    try writeExtras(&o, &data.extras);
+
+    if (data.extensions_used_count > 0) {
+        try o.key("extensionsUsed");
+        try o.beginArr();
+        for (sl([*c]u8, @ptrCast(data.extensions_used), data.extensions_used_count)) |p| {
+            try o.item();
+            try o.str(cstr(p) orelse "");
+        }
+        try o.endArr();
+    }
+    if (data.extensions_required_count > 0) {
+        try o.key("extensionsRequired");
+        try o.beginArr();
+        for (sl([*c]u8, @ptrCast(data.extensions_required), data.extensions_required_count)) |p| {
+            try o.item();
+            try o.str(cstr(p) orelse "");
+        }
+        try o.endArr();
+    }
+
+    try o.endObj();
+
+    const json = o.buf.items;
+    const json_pad = (4 - (json.len % 4)) % 4;
+    const bin_pad = (4 - (bin.items.len % 4)) % 4;
+    const has_bin = data.buffers_count > 0;
+    const total = 12 + 8 + json.len + json_pad + (if (has_bin) 8 + bin.items.len + bin_pad else 0);
+
+    const out = try a.alignedAlloc(u8, .@"8", total);
+    var w: usize = 0;
+
+    var tmp4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &tmp4, 0x46546C67, .little); // 'glTF'
+    @memcpy(out[w .. w + 4], &tmp4);
+    w += 4;
+    std.mem.writeInt(u32, &tmp4, 2, .little);
+    @memcpy(out[w .. w + 4], &tmp4);
+    w += 4;
+    std.mem.writeInt(u32, &tmp4, @intCast(total), .little);
+    @memcpy(out[w .. w + 4], &tmp4);
+    w += 4;
+
+    std.mem.writeInt(u32, &tmp4, @intCast(json.len + json_pad), .little);
+    @memcpy(out[w .. w + 4], &tmp4);
+    w += 4;
+    std.mem.writeInt(u32, &tmp4, 0x4E4F534A, .little); // 'JSON'
+    @memcpy(out[w .. w + 4], &tmp4);
+    w += 4;
+    @memcpy(out[w .. w + json.len], json);
+    w += json.len;
+    @memset(out[w .. w + json_pad], 0x20);
+    w += json_pad;
+
+    if (has_bin) {
+        std.mem.writeInt(u32, &tmp4, @intCast(bin.items.len + bin_pad), .little);
+        @memcpy(out[w .. w + 4], &tmp4);
+        w += 4;
+        std.mem.writeInt(u32, &tmp4, 0x004E4942, .little); // 'BIN\0'
+        @memcpy(out[w .. w + 4], &tmp4);
+        w += 4;
+        @memcpy(out[w .. w + bin.items.len], bin.items);
+        w += bin.items.len;
+        @memset(out[w .. w + bin_pad], 0);
+        w += bin_pad;
+    }
+
+    std.debug.assert(w == total);
+    return out;
+}
+
+// ===========================================================================
+// tests
+// ===========================================================================
+
+const parse_mod = @import("parse.zig");
+const model = @import("model.zig");
+
+fn entryLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn collectGlbs(a: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![][]const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |ent| {
+        if (ent.kind != .file) continue;
+        if (!std.mem.endsWith(u8, ent.name, ".glb")) continue;
+        try list.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ dir_path, ent.name }));
+    }
+    const out = try list.toOwnedSlice(a);
+    std.mem.sort([]const u8, out, {}, entryLessThan);
+    return out;
+}
+
+const Parsed = struct {
+    data: *c.cgltf_data,
+
+    fn deinit(self: *Parsed) void {
+        c.cgltf_free(self.data);
+    }
+};
+
+fn parseBytes(gpa: std.mem.Allocator, bytes: []const u8) !Parsed {
+    _ = gpa;
+    var options: c.cgltf_options = std.mem.zeroes(c.cgltf_options);
+    var data: ?*c.cgltf_data = null;
+    const res = c.cgltf_parse(&options, bytes.ptr, bytes.len, &data);
+    if (res != c.cgltf_result_success or data == null) return error.ParseFailed;
+    errdefer c.cgltf_free(data);
+    const lres = c.cgltf_load_buffers(&options, data, null);
+    if (lres != c.cgltf_result_success) return error.LoadFailed;
+    return .{ .data = data.? };
+}
+
+fn readLogFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) ![]f32 {
+    const ncomp = numComponents(acc.type);
+    const total = @as(usize, @intCast(acc.count)) * ncomp;
+    const buf = try a.alloc(f32, total);
+    const got = c.cgltf_accessor_unpack_floats(acc, buf.ptr, total);
+    return buf[0..got];
+}
+
+const Snapshot = struct {
+    /// attribute names joined with '\x00'
+    prim_attrs: []const u8 = &.{},
+    prim_counts: []const u32 = &.{},
+    tex_bindings: []const f32 = &.{},
+};
+
+fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data) !Snapshot {
+    var attrs: std.ArrayList(u8) = .empty;
+    var counts: std.ArrayList(u32) = .empty;
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                const name = cstr(at.name) orelse "";
+                try attrs.appendSlice(a, name);
+                try attrs.append(a, 0);
+                try counts.append(a, if (at.data != null) @intCast(at.data.*.count) else 0);
+            }
+        }
+    }
+    var bindings: std.ArrayList(f32) = .empty;
+    for (sl(c.cgltf_material, data.materials, data.materials_count)) |*m| {
+        const views = [_]*const c.cgltf_texture_view{
+            &m.pbr_metallic_roughness.base_color_texture,
+            &m.pbr_metallic_roughness.metallic_roughness_texture,
+            &m.normal_texture,
+            &m.occlusion_texture,
+            &m.emissive_texture,
+        };
+        for (views) |v| {
+            if (@intFromPtr(v.texture) == 0) {
+                try bindings.append(a, -1);
+                try bindings.append(a, -1);
+            } else {
+                try bindings.append(a, @floatFromInt(ptrIndex(c.cgltf_texture, data.textures, data.textures_count, v.texture) orelse 0));
+                try bindings.append(a, @floatFromInt(v.texcoord));
+            }
+            try bindings.append(a, @floatCast(v.scale));
+        }
+    }
+    return .{
+        .prim_attrs = try attrs.toOwnedSlice(a),
+        .prim_counts = try counts.toOwnedSlice(a),
+        .tex_bindings = try bindings.toOwnedSlice(a),
+    };
+}
+
+fn compareStructure(a: std.mem.Allocator, orig: *c.cgltf_data, new: *c.cgltf_data) !void {
+    try std.testing.expectEqual(orig.scenes_count, new.scenes_count);
+    try std.testing.expectEqual(orig.nodes_count, new.nodes_count);
+    try std.testing.expectEqual(orig.meshes_count, new.meshes_count);
+    try std.testing.expectEqual(orig.materials_count, new.materials_count);
+    try std.testing.expectEqual(orig.textures_count, new.textures_count);
+    try std.testing.expectEqual(orig.images_count, new.images_count);
+    try std.testing.expectEqual(orig.samplers_count, new.samplers_count);
+    try std.testing.expectEqual(orig.animations_count, new.animations_count);
+    try std.testing.expectEqual(orig.skins_count, new.skins_count);
+    try std.testing.expectEqual(orig.buffers_count, new.buffers_count);
+    try std.testing.expectEqual(orig.buffer_views_count, new.buffer_views_count);
+    try std.testing.expectEqual(orig.accessors_count, new.accessors_count);
+
+    // buffer view payload bytes
+    for (sl(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count), 0..) |*ov, i| {
+        const nv = &sl(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count)[i];
+        try std.testing.expectEqual(ov.size, nv.size);
+        const ob = viewBytes(ov) orelse return error.InvalidData;
+        const nb = viewBytes(nv) orelse return error.InvalidData;
+        try std.testing.expectEqualSlices(u8, ob, nb);
+    }
+
+    // accessors
+    for (sl(c.cgltf_accessor, orig.accessors, orig.accessors_count), 0..) |*oa, i| {
+        const na = &sl(c.cgltf_accessor, new.accessors, new.accessors_count)[i];
+        try std.testing.expectEqual(oa.component_type, na.component_type);
+        try std.testing.expectEqual(oa.type, na.type);
+        try std.testing.expectEqual(oa.count, na.count);
+        try std.testing.expectEqual(oa.normalized, na.normalized);
+        try std.testing.expectEqual(oa.is_sparse, na.is_sparse);
+        if (oa.buffer_view != null) {
+            const oi = ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view).?;
+            const ni = ptrIndex(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count, na.buffer_view).?;
+            try std.testing.expectEqual(oi, ni);
+        }
+        // values must round-trip exactly
+        const of = try readLogFloats(a, oa);
+        const nf = try readLogFloats(a, na);
+        try std.testing.expectEqualSlices(f32, of, nf);
+    }
+
+    // primitive attribute semantics + counts
+    const so = try snapshot(a, orig);
+    const sn = try snapshot(a, new);
+    try std.testing.expectEqualSlices(u8, so.prim_attrs, sn.prim_attrs);
+    try std.testing.expectEqualSlices(u32, so.prim_counts, sn.prim_counts);
+    try std.testing.expectEqualSlices(f32, so.tex_bindings, sn.tex_bindings);
+
+    // index/vertex counts per primitive
+    for (sl(c.cgltf_mesh, orig.meshes, orig.meshes_count), 0..) |*om, mi| {
+        const nm = &sl(c.cgltf_mesh, new.meshes, new.meshes_count)[mi];
+        try std.testing.expectEqual(om.primitives_count, nm.primitives_count);
+        for (sl(c.cgltf_primitive, om.primitives, om.primitives_count), 0..) |*op, pi| {
+            const np = &sl(c.cgltf_primitive, nm.primitives, nm.primitives_count)[pi];
+            try std.testing.expectEqual(op.type, np.type);
+            const oic: u64 = if (op.indices != null) @intCast(op.indices.*.count) else 0;
+            const nic: u64 = if (np.indices != null) @intCast(np.indices.*.count) else 0;
+            try std.testing.expectEqual(oic, nic);
+        }
+    }
+
+    // animations: channel counts + sampler counts
+    for (sl(c.cgltf_animation, orig.animations, orig.animations_count), 0..) |*oa, i| {
+        const na = &sl(c.cgltf_animation, new.animations, new.animations_count)[i];
+        try std.testing.expectEqual(oa.channels_count, na.channels_count);
+        try std.testing.expectEqual(oa.samplers_count, na.samplers_count);
+    }
+
+    // skins: joint counts
+    for (sl(c.cgltf_skin, orig.skins, orig.skins_count), 0..) |*os, i| {
+        const ns = &sl(c.cgltf_skin, new.skins, new.skins_count)[i];
+        try std.testing.expectEqual(os.joints_count, ns.joints_count);
+    }
+}
+
+fn checkFile(a: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8) !void {
+    const io = std.testing.io;
+    var loaded = try parse_mod.loadFile(io, gpa, path);
+    defer loaded.deinit();
+
+    const out1 = try serialize(a, loaded.cdata, loaded.map);
+    var p1 = try parseBytes(gpa, out1);
+    defer p1.deinit();
+
+    const out2 = try serialize(a, p1.data, out1);
+    if (!std.mem.eql(u8, out1, out2)) {
+        // show the first difference to make debugging tractable
+        var idx: usize = 0;
+        while (idx < @min(out1.len, out2.len) and out1[idx] == out2[idx]) : (idx += 1) {}
+        std.debug.print("idempotence mismatch in {s} at byte {d} (len {d} vs {d})\n", .{ path, idx, out1.len, out2.len });
+        const lo = if (idx > 80) idx - 80 else 0;
+        const hi1 = @min(out1.len, idx + 120);
+        const hi2 = @min(out2.len, idx + 120);
+        std.debug.print("out1: {s}\n", .{out1[lo..hi1]});
+        std.debug.print("out2: {s}\n", .{out2[lo..hi2]});
+        return error.NotIdempotent;
+    }
+
+    try compareStructure(a, loaded.cdata, p1.data);
+}
+
+test "glb writer: box fixture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try checkFile(arena.allocator(), std.testing.allocator, "test/fixtures/box.glb");
+}
+
+test "glb writer: real fixtures round-trip" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const files = try collectGlbs(aa, io, "test/fixtures/real");
+    if (files.len == 0) {
+        std.debug.print("no real fixtures found, skipping\n", .{});
+        return;
+    }
+    for (files) |path| {
+        std.debug.print("round-trip: {s}\n", .{path});
+        try checkFile(aa, a, path);
+    }
+}
+
+test "glb writer: rejects external buffers" {
+    // minimal synthetic cgltf_data with an external uri
+    var buf = c.cgltf_buffer{ .uri = @constCast("buffer.bin") };
+    var views: [0]c.cgltf_buffer_view = .{};
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.buffers = @ptrCast(&buf);
+    data.buffers_count = 1;
+    data.buffer_views = @ptrCast(&views);
+    data.buffer_views_count = 0;
+    try std.testing.expectError(error.Unsupported, serialize(std.testing.allocator, &data, ""));
+}
+
+test {
+    _ = @import("../golden.zig");
+}

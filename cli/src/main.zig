@@ -442,7 +442,7 @@ fn cmdLint(init: std.process.Init, args: []const []const u8) !u8 {
         for (names.items) |nm| {
             const full = try std.fs.path.join(gpa, &.{ p, nm });
             defer gpa.free(full);
-            const count = lintOneFile(init, gpa, full, budget, as_json, file_count > 0, w) catch |err| {
+            const count = lintOneFile(init, gpa, full, budget, as_json, file_count == 0, w) catch |err| {
                 std.debug.print("lint: {s}: {s}\n", .{ full, @errorName(err) });
                 return 2;
             };
@@ -450,7 +450,7 @@ fn cmdLint(init: std.process.Init, args: []const []const u8) !u8 {
             file_count += 1;
         }
     } else {
-        const count = lintOneFile(init, gpa, p, budget, as_json, false, w) catch |err| {
+        const count = lintOneFile(init, gpa, p, budget, as_json, true, w) catch |err| {
             std.debug.print("lint: {s}: {s}\n", .{ p, @errorName(err) });
             return 2;
         };

@@ -512,7 +512,7 @@ test "diff: identical assets produce empty report" {
     defer arena.deinit();
 
     const asset = model.Asset{
-        .nodes = &.{.{ .name = "a" }, .{ .name = "b" }},
+        .nodes = &.{ .{ .name = "a" }, .{ .name = "b" } },
         .meshes = &.{.{ .name = "m" }},
         .materials = &.{.{ .name = "mat" }},
     };

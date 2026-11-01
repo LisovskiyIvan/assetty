@@ -285,10 +285,13 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         }
         if (im.buffer_view) |bv| {
             const view = bv.*;
-            if (view.data) |d| {
-                const bytes: []const u8 = @as([*]const u8, @ptrCast(d))[0..view.size];
-                img.data = bytes;
-                img.disk_bytes = view.size;
+            // buffer->data points into the mmap after cgltf_load_buffers
+            if (view.buffer) |buf| {
+                if (buf.*.data) |bd| {
+                    const base: [*]const u8 = @ptrCast(bd);
+                    img.data = (base + view.offset)[0..view.size];
+                    img.disk_bytes = view.size;
+                }
             }
         }
         img.mime = sniffMime(img.data, im.mime_type);

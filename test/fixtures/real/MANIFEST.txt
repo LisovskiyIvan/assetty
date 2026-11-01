@@ -1,0 +1,17 @@
+# Real-world GLB fixtures
+# Source: KhronosGroup/glTF-Sample-Assets (main branch), glTF-Binary variant.
+# URL pattern: https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/<Name>/glTF-Binary/<Name>.glb
+# Format: sha256 | bytes | filename | role | source URL
+#
+ae89695479ad997f09ebea8060a5ad01312ad8fe7ffb92f73b4e895109feecd2 | 17540348 | AntiqueCamera.glb | multiple meshes, 6 PBR textures | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/AntiqueCamera/glTF-Binary/AntiqueCamera.glb
+f8b918445ebdd006768232205a62f5182d2208ca57f84c6ccc084943c0bc8f15 | 10614184 | BoomBox.glb | single mesh, 4 PBR textures | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/BoomBox/glTF-Binary/BoomBox.glb
+ed52f7192b8311d700ac0ce80644e3852cd01537e4d62241b9acba023da3d54e | 1664 | Box.glb | minimal untextured box | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Box/glTF-Binary/Box.glb
+b510eca2e2ef33f62f9ed57d6e7ce2d10ebb2bdebc4a8e59d347719ba81abdf4 | 5956 | BoxTextured.glb | minimal textured box, index accessor | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/BoxTextured/glTF-Binary/BoxTextured.glb
+ddda3a53b5c9771f992463034a430340ba2bac571e5869c723f7cba4976e9174 | 3194848 | BrainStem.glb | skin + morph-target animation, 59 primitives | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/BrainStem/glTF-Binary/BrainStem.glb
+b7001eaeea8254bd44773bcd247e78696d94169388fbb2a1800fc69434e777d9 | 438044 | CesiumMan.glb | skin + animation (walk cycle) | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/CesiumMan/glTF-Binary/CesiumMan.glb
+a1e3b04de97b11de564ce6e53b95f02954a297f0008183ac63a4f5974f6b32d8 | 3773916 | DamagedHelmet.glb | single PBR mesh, metallic-roughness + AO + emissive | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb
+d97044e701822bac5a62696459b27d7b375aada5de8574ed4362edbba94771f7 | 162852 | Fox.glb | skin + 3 animations (Survey/Walk/Run) | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Fox/glTF-Binary/Fox.glb
+17cfdc79ec9e38fadb28db159734c5f9592ca423977b546e5057e350ba29ff13 | 4083912 | IridescenceLamp.glb | KHR_materials_iridescence + transmission/volume | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/IridescenceLamp/glTF-Binary/IridescenceLamp.glb
+a79458c4b02d695187a952f23a63b8bf278e7bc3d316a3c2a314f2d6974181f1 | 9564264 | Lantern.glb | 3 meshes sharing one material, 4 textures | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Lantern/glTF-Binary/Lantern.glb
+450c05557b0823a10835e32c05caf77a7b175eba94516555c1c9bb084f563f01 | 11221356 | MetalRoughSpheres.glb | material grid stress test, ~500k triangles | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/MetalRoughSpheres/glTF-Binary/MetalRoughSpheres.glb
+5349e042ad41e695e89f1110230c4ee0c75b2bc62ef830c7016be6ecf665bfb6 | 10107912 | SheenWoodLeatherSofa.glb | KHR_materials_sheen, 6 meshes / 15 textures | https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/SheenWoodLeatherSofa/glTF-Binary/SheenWoodLeatherSofa.glb
