@@ -1,0 +1,7 @@
+.{
+    .name = .basset,
+    .fingerprint = 0x3073a2b3468a4472,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+}
