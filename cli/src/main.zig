@@ -160,7 +160,7 @@ fn printHuman(w: anytype, path: []const u8, asset: core.model.Asset, st: core.st
                 im.name orelse "-",
                 im.width,
                 im.height,
-                im.mime.label(),
+                im.format_label,
                 core.stats.formatBytes(&buf, im.vram),
                 core.stats.formatBytes(buf[16..], im.disk_bytes),
                 if (im.has_mips) "y" else "n",
@@ -223,7 +223,7 @@ fn printJson(w: anytype, path: []const u8, asset: core.model.Asset, st: core.sta
         if (i > 0) try w.writeByte(',');
         try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
         try jsonStrOpt(w, im.name);
-        try w.print(",\"mime\":\"{s}\",\"width\":{d},\"height\":{d},\"vram\":{d},\"disk\":{d},\"has_mips\":{s}}}", .{ im.mime.label(), im.width, im.height, im.vram, im.disk_bytes, if (im.has_mips) "true" else "false" });
+        try w.print(",\"format\":\"{s}\",\"width\":{d},\"height\":{d},\"vram\":{d},\"disk\":{d},\"has_mips\":{s}}}", .{ im.format_label, im.width, im.height, im.vram, im.disk_bytes, if (im.has_mips) "true" else "false" });
     }
     try w.writeAll("\n  ]}");
 

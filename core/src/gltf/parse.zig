@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("cgltf");
 const model = @import("model.zig");
 const decode = @import("../tex/decode.zig");
+const formats = @import("../tex/formats.zig");
 
 pub const Error = error{
     NotGltf,
@@ -318,16 +319,20 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         }
         img.mime = sniffMime(img.data, im.mime_type);
         if (img.data) |d| {
-            if (decode.infoFromMemory(d)) |info| {
+            if (formats.parseHeader(d)) |h| {
+                img.has_ktx2 = true;
+                img.mime = .ktx2;
+                img.vk_format = h.vk_format;
+                img.mip_levels = h.mip_levels;
+                img.width = h.width;
+                img.height = h.height;
+                img.components = 0;
+                img.has_dims = h.width > 0 and h.height > 0;
+            } else if (decode.infoFromMemory(d)) |info| {
                 img.width = info.width;
                 img.height = info.height;
                 img.components = info.components;
                 img.has_dims = true;
-            } else if (img.mime == .ktx2 and d.len >= 24) {
-                // KTX2 header: identifier[8], vkFormat u32, typeSize u32, pixelWidth u32, pixelHeight u32
-                img.width = std.mem.readInt(u32, d[16..20], .little);
-                img.height = std.mem.readInt(u32, d[20..24], .little);
-                img.has_dims = img.width > 0 and img.height > 0;
             }
         }
         images[i] = img;

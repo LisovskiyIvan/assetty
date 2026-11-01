@@ -1,5 +1,6 @@
 const std = @import("std");
 const model = @import("gltf/model.zig");
+const formats = @import("tex/formats.zig");
 
 pub const ImageStat = struct {
     index: u32,
@@ -8,9 +9,10 @@ pub const ImageStat = struct {
     width: u32 = 0,
     height: u32 = 0,
     has_dims: bool = false,
-    /// bytes/pixel estimate for GPU upload (step 1: RGBA8)
-    bpp: u32 = 4,
-    /// w*h*bpp * (mips ? 1.33 : 1)
+    /// bytes/pixel ×100 (ktx2: real format; else RGBA8 est)
+    bpp_x100: u32 = 400,
+    format_label: []const u8 = "rgba8",
+    /// w*h*bpp × mip chain
     vram: u64 = 0,
     has_mips: bool = false,
     disk_bytes: u64 = 0,
@@ -104,9 +106,17 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
             .height = img.height,
             .has_dims = img.has_dims,
         };
-        if (img.mime == .ktx2) ist.has_mips = true;
-        ist.vram = @as(u64, ist.width) * ist.height * ist.bpp;
-        if (ist.has_mips) ist.vram += ist.vram / 3;
+        if (img.has_ktx2) {
+            ist.bpp_x100 = formats.vkBytesPerPixelX100(img.vk_format);
+            ist.format_label = formats.formatLabel(img.vk_format);
+            ist.has_mips = img.mip_levels > 1;
+            if (ist.has_dims) {
+                ist.vram = formats.mipChainBytes(img.width, img.height, img.vk_format, @max(img.mip_levels, 1));
+            }
+        } else {
+            ist.format_label = img.mime.label();
+            if (ist.has_dims) ist.vram = @as(u64, ist.width) * ist.height * (ist.bpp_x100 / 100);
+        }
         st.vram_total += ist.vram;
         image_stats[i] = ist;
     }

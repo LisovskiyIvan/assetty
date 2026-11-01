@@ -198,6 +198,10 @@ pub const Image = struct {
     components: u32 = 0,
     has_dims: bool = false,
     disk_bytes: u64 = 0,
+    // ktx2-specific (filled from header)
+    has_ktx2: bool = false,
+    vk_format: u32 = 0,
+    mip_levels: u32 = 0,
 };
 
 pub const Filter = enum {
