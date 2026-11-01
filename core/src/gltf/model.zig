@@ -202,6 +202,8 @@ pub const Image = struct {
     has_ktx2: bool = false,
     vk_format: u32 = 0,
     mip_levels: u32 = 0,
+    /// KHR_DF color model when vk_format == 0 (163 ETC1S, 166 UASTC)
+    color_model: u8 = 0,
 };
 
 pub const Filter = enum {

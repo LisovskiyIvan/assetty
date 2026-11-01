@@ -1,0 +1,5 @@
+basis_universal v1_60 (tag v1_60)
+https://github.com/BinomialLLC/basis_universal/releases/tag/v1_60
+vendored subset: encoder/ (minus basisu_tool.cpp), transcoder/, zstd/
+wrapper: basisu_wrapper.h / basisu_wrapper.cpp (extern "C", RGBA8 <-> KTX2)
+build flags used by basset: -std=c++17 -O2 -w -DBASISU_SUPPORT_OPENCL=1 (macOS links OpenCL.framework; runtime OpenCL is never enabled)

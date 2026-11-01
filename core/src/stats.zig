@@ -107,11 +107,20 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
             .has_dims = img.has_dims,
         };
         if (img.has_ktx2) {
-            ist.bpp_x100 = formats.vkBytesPerPixelX100(img.vk_format);
-            ist.format_label = formats.formatLabel(img.vk_format);
+            if (img.vk_format == 0) {
+                if (formats.BasisModel.from(img.color_model)) |m| {
+                    ist.bpp_x100 = m.bppX100();
+                    ist.format_label = m.label();
+                } else {
+                    ist.format_label = formats.formatLabel(0);
+                }
+            } else {
+                ist.bpp_x100 = formats.vkBytesPerPixelX100(img.vk_format);
+                ist.format_label = formats.formatLabel(img.vk_format);
+            }
             ist.has_mips = img.mip_levels > 1;
             if (ist.has_dims) {
-                ist.vram = formats.mipChainBytes(img.width, img.height, img.vk_format, @max(img.mip_levels, 1));
+                ist.vram = formats.mipChainBytesBpp(img.width, img.height, ist.bpp_x100, @max(img.mip_levels, 1));
             }
         } else {
             ist.format_label = img.mime.label();

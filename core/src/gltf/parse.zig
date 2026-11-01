@@ -328,6 +328,7 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
                 img.height = h.height;
                 img.components = 0;
                 img.has_dims = h.width > 0 and h.height > 0;
+                if (img.vk_format == 0) img.color_model = formats.dfdColorModel(d);
             } else if (decode.infoFromMemory(d)) |info| {
                 img.width = info.width;
                 img.height = info.height;

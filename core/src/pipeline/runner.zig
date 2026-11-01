@@ -33,6 +33,12 @@ const weld = @import("../ops/weld.zig");
 const join = @import("../ops/join.zig");
 const quantize = @import("../ops/quantize.zig");
 const simplify = @import("../ops/simplify.zig");
+const geom = @import("../ops/geom.zig");
+const encode_ktx = @import("../tex/encode_ktx.zig");
+const decode = @import("../tex/decode.zig");
+const mips = @import("../tex/mips.zig");
+const formats = @import("../tex/formats.zig");
+const c = @import("cgltf");
 
 pub const StepStatus = struct {
     kind: []const u8, // "prune", "dedup", ...
@@ -158,11 +164,24 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     ),
                 };
             },
-            // step 4 (KTX2 encode via basisu)
-            .textures => .{
-                .kind = kind,
-                .applied = false,
-                .note = "not implemented, skipped",
+            // step 4: encode embedded png/jpeg images to KTX2 (basisu)
+            .textures => |p| blk: {
+                const res = encodeTextures(a, loaded, p, opts.preset.target) catch |err| {
+                    break :blk .{
+                        .kind = kind,
+                        .applied = false,
+                        .note = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(err)}),
+                    };
+                };
+                break :blk .{
+                    .kind = kind,
+                    .applied = res.encoded > 0,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "{s}: {d} encoded, {d} skipped; {d} -> {d} bytes",
+                        .{ res.mode_note, res.encoded, res.skipped, res.src_bytes, res.ktx_bytes },
+                    ),
+                };
             },
         };
     }
@@ -185,8 +204,135 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     return .{ .steps = steps, .before = before, .after = after };
 }
 
-fn notify(opts: Options, step: []const u8, pct: f32) void {
-    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct);
+const TexEncResult = struct {
+    encoded: u32 = 0,
+    skipped: u32 = 0,
+    src_bytes: u64 = 0,
+    ktx_bytes: u64 = 0,
+    mode_note: []const u8 = "",
+};
+
+fn isNormalName(name: [*c]const u8) bool {
+    const n = name orelse return false;
+    const s = std.mem.span(n);
+    if (s.len > 256) return false;
+    var buf: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..s.len], s);
+    return std.mem.indexOf(u8, lower, "normal") != null;
+}
+
+fn embeddedImageBytes(data: *c.cgltf_data, im: *const c.cgltf_image) ?[]const u8 {
+    _ = data;
+    const bv = im.buffer_view orelse return null;
+    const buf = bv.*.buffer orelse return null;
+    const bd = buf.*.data orelse return null;
+    const base: [*]const u8 = @ptrCast(bd);
+    return (base + bv.*.offset)[0..bv.*.size];
+}
+
+fn setMimeKtx2(d: *c.cgltf_data, im: *c.cgltf_image) void {
+    const s = "image/ktx2";
+    const mem = d.memory;
+    if (im.*.mime_type) |old| {
+        if (@intFromPtr(old) != 0) {
+            if (mem.free_func) |ff| ff(mem.user_data, old);
+        }
+        im.*.mime_type = null;
+    }
+    const allocf = mem.alloc_func orelse return;
+    const dst = allocf(mem.user_data, s.len + 1) orelse return;
+    const dstu: [*]u8 = @ptrCast(dst);
+    @memcpy(dstu[0..s.len], s);
+    dstu[s.len] = 0;
+    im.*.mime_type = @ptrCast(dstu);
+}
+
+fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureParams, target: preset.Target) !TexEncResult {
+    var res: TexEncResult = .{};
+    const mode: encode_ktx.Mode = switch (p.format) {
+        // ETC1S transcodes to ASTC/ETC2/BC1-5 at load — the compact choice
+        .etc1s => .etc1s,
+        .astc => .etc1s,
+        // UASTC transcodes to BC7 (quality path)
+        .uastc, .bc7 => .uastc,
+        .auto => switch (target) {
+            .desktop => .uastc,
+            .mobile, .web => .etc1s,
+        },
+    };
+    res.mode_note = switch (p.format) {
+        .astc => "etc1s (transcode to astc at load)",
+        .bc7 => "uastc (transcode to bc7 at load)",
+        .etc1s => "etc1s",
+        .uastc => "uastc",
+        .auto => switch (mode) {
+            .etc1s => "etc1s",
+            .uastc => "uastc",
+        },
+    };
+
+    var gb = try geom.Builder.init(a, loaded.cdata);
+    defer gb.deinit();
+
+    const Pending = struct { img: *c.cgltf_image, view_idx: usize, normal: bool };
+    var pending: std.ArrayList(Pending) = .empty;
+
+    const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
+    for (images) |*im| {
+        const bytes = embeddedImageBytes(loaded.cdata, im) orelse {
+            res.skipped += 1;
+            continue;
+        };
+        var dec = decode.decodeRgba(a, bytes) orelse {
+            res.skipped += 1;
+            continue;
+        };
+        defer dec.deinit(a);
+
+        const normal = isNormalName(im.name);
+        var px = dec.pixels;
+        var w = dec.width;
+        var h = dec.height;
+        if (p.max_size > 0 and (w > p.max_size or h > p.max_size)) {
+            const fit = try mips.fitMaxSize(a, px, w, h, p.max_size);
+            px = fit.pixels;
+            w = fit.w;
+            h = fit.h;
+        }
+
+        const out = encode_ktx.encode(a, px, w, h, .{
+            .mode = mode,
+            .quality = p.quality,
+            .rdo_lambda = p.rdo_lambda,
+            .normal_map = normal and p.normal_maps_renormalize,
+            .generate_mips = p.generate_mips,
+            .max_size = 0, // already downscaled
+            .srgb = !normal,
+        }) catch {
+            res.skipped += 1;
+            continue;
+        };
+
+        res.src_bytes += bytes.len;
+        res.ktx_bytes += out.ktx2.len;
+        const vi = try gb.addView(out.ktx2, 0);
+        try pending.append(a, .{ .img = im, .view_idx = vi, .normal = normal });
+        res.encoded += 1;
+    }
+
+    if (pending.items.len == 0) return res;
+    try gb.finish();
+
+    const views = geom.sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
+    for (pending.items) |pd| {
+        pd.img.*.buffer_view = @ptrCast(&views[pd.view_idx]);
+        setMimeKtx2(loaded.cdata, pd.img);
+    }
+    _ = formats; // format label comes from the written file's header via stats
+    return res;
+}
+
+fn notify(opts: Options, step: []const u8, pct: f32) void {    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct);
 }
 
 /// `Stats.image_stats[].name` points into the loader's arena. Copy any names
@@ -293,7 +439,7 @@ test "run noop preset on box fixture" {
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 }
 
-test "run skips unimplemented steps" {
+test "run: weld and textures apply" {
     const io = testing.io;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -308,8 +454,9 @@ test "run skips unimplemented steps" {
 
     try testing.expectEqual(@as(usize, 2), rep.steps.len);
     try testing.expectEqualStrings("weld", rep.steps[0].kind);
-    try testing.expect(!rep.steps[0].applied);
-    try testing.expectEqualStrings("not implemented, skipped", rep.steps[0].note);
+    try testing.expect(rep.steps[0].applied);
     try testing.expectEqualStrings("textures", rep.steps[1].kind);
-    try testing.expect(!rep.steps[1].applied);
+    // box.glb ships one embedded PNG → now encoded to KTX2
+    try testing.expect(rep.steps[1].applied);
+    try testing.expect(std.mem.indexOf(u8, rep.steps[1].note, "1 encoded") != null);
 }

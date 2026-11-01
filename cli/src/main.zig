@@ -8,6 +8,7 @@ const usage =
     \\  basset info <file.glb> [--json]
     \\  basset diff <old.glb> <new.glb> [--json]
     \\  basset lint <file-or-dir> --budget <budget.json> [--json]
+    \\  basset textures <file.glb> [--encode N] [--json]
     \\  basset presets
     \\  basset optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>]
     \\
@@ -62,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
         .info => try cmdInfo(init, args[1..]),
         .diff => try cmdDiff(init, args[1..]),
         .lint => try cmdLint(init, args[1..]),
+        .textures => try cmdTextures(init, args[1..]),
         .presets => try cmdPresets(),
         .optimize => try cmdOptimize(init, args[1..]),
         .help => blk: {
@@ -76,12 +78,13 @@ pub fn main(init: std.process.Init) !u8 {
     std.process.exit(code);
 }
 
-const Cmd = enum { info, diff, lint, presets, optimize, help, unknown };
+const Cmd = enum { info, diff, lint, textures, presets, optimize, help, unknown };
 
 fn cmdId(s: []const u8) Cmd {
     if (std.mem.eql(u8, s, "info")) return .info;
     if (std.mem.eql(u8, s, "diff")) return .diff;
     if (std.mem.eql(u8, s, "lint")) return .lint;
+    if (std.mem.eql(u8, s, "textures")) return .textures;
     if (std.mem.eql(u8, s, "presets")) return .presets;
     if (std.mem.eql(u8, s, "optimize")) return .optimize;
     if (std.mem.eql(u8, s, "help") or std.mem.eql(u8, s, "--help") or std.mem.eql(u8, s, "-h")) return .help;
@@ -240,6 +243,286 @@ fn printJson(w: anytype, path: []const u8, asset: core.model.Asset, st: core.sta
     try w.writeAll(",\"uncompressed_embedded\":");
     try idxList(w, st.garbage.uncompressed_embedded);
     try w.writeAll("}\n}\n");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn mipLevelsFor(w: u32, h: u32) u32 {
+    const m = @max(w, h);
+    if (m == 0) return 1;
+    return @as(u32, 32 - @clz(m)) + 1; // floor(log2(m)) + 1
+}
+
+fn cmdTextures(init: std.process.Init, args: []const []const u8) !u8 {
+    const gpa = init.gpa;
+    var path: ?[]const u8 = null;
+    var encode_idx: ?u32 = null;
+    var as_json = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--json")) {
+            as_json = true;
+        } else if (std.mem.eql(u8, a, "--encode")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("textures: --encode needs an image index\n", .{});
+                return 2;
+            }
+            encode_idx = std.fmt.parseInt(u32, args[i], 10) catch {
+                std.debug.print("textures: --encode expects a number, got '{s}'\n", .{args[i]});
+                return 2;
+            };
+        } else if (std.mem.startsWith(u8, a, "--encode=")) {
+            const v = a["--encode=".len..];
+            encode_idx = std.fmt.parseInt(u32, v, 10) catch {
+                std.debug.print("textures: --encode expects a number, got '{s}'\n", .{v});
+                return 2;
+            };
+        } else if (!std.mem.startsWith(u8, a, "--")) {
+            if (path == null) path = a;
+        }
+    }
+
+    const file_path = path orelse {
+        std.debug.print("textures: missing <file.glb>\n", .{});
+        return 2;
+    };
+
+    var loaded = core.parse.loadFile(init.io, gpa, file_path) catch |err| {
+        std.debug.print("textures: {s}: {s}\n", .{ file_path, @errorName(err) });
+        return 2;
+    };
+    defer loaded.deinit();
+
+    var arena2 = std.heap.ArenaAllocator.init(gpa);
+    defer arena2.deinit();
+    const a = arena2.allocator();
+    const st = try core.stats.compute(a, loaded.asset);
+
+    var encode_res: ?EncodeResult = null;
+    if (encode_idx) |idx| {
+        if (idx >= loaded.asset.images.len) {
+            std.debug.print("textures: image {d} out of range (file has {d})\n", .{ idx, loaded.asset.images.len });
+            return 2;
+        }
+        encode_res = runEncode(a, loaded.asset.images[idx], idx) catch |err| {
+            std.debug.print("textures: encode [{d}]: {s}\n", .{ idx, @errorName(err) });
+            return 2;
+        };
+    }
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var wtr = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const w = &wtr.interface;
+
+    if (as_json) {
+        try printTexturesJson(w, file_path, loaded.asset, st, encode_idx, encode_res);
+    } else {
+        try printTexturesHuman(w, file_path, loaded.asset, st, encode_idx, encode_res);
+    }
+    try w.flush();
+    return 0;
+}
+
+const EncodeResult = struct {
+    index: u32,
+    name: ?[]const u8,
+    width: u32,
+    height: u32,
+    mode: core.encode_ktx.Mode,
+    quality: u8,
+    srgb: bool,
+    normal_map: bool,
+    src_disk_bytes: u64,
+    ktx2_bytes: u64,
+    format_label: []const u8,
+    mip_levels: u32,
+    vram_before: u64,
+    vram_after: u64,
+    psnr_db: f32,
+};
+
+/// Decode image `img` to RGBA, encode it to KTX2, decode back and measure PSNR.
+/// Returns null when the image is not decodable (missing/external/unsupported);
+/// hard encoder failures surface as errors (CLI exit code 2).
+fn runEncode(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?EncodeResult {
+    const bytes = img.data orelse {
+        std.debug.print("  encode: [{d}] skipped: image data not embedded (uri)\n", .{idx});
+        return null;
+    };
+    const dec = core.decode.decodeRgba(a, bytes) orelse {
+        std.debug.print("  encode: [{d}] skipped: cannot decode source image ({s})\n", .{ idx, img.mime.label() });
+        return null;
+    };
+
+    const is_normal = if (img.name) |n| containsIgnoreCase(n, "normal") else false;
+    const opts: core.encode_ktx.Options = .{ .normal_map = is_normal };
+
+    const out = try core.encode_ktx.encode(a, dec.pixels, dec.width, dec.height, opts);
+    const rt = try core.encode_ktx.decodeToRgba(a, out.ktx2);
+    if (rt.width != dec.width or rt.height != dec.height) {
+        std.debug.print("  encode: [{d}] skipped: round-trip dims {d}x{d} != {d}x{d}\n", .{ idx, rt.width, rt.height, dec.width, dec.height });
+        return null;
+    }
+
+    const levels = mipLevelsFor(dec.width, dec.height);
+    const vram_before = core.formats.mipChainBytes(dec.width, dec.height, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
+    return .{
+        .index = idx,
+        .name = img.name,
+        .width = dec.width,
+        .height = dec.height,
+        .mode = opts.mode,
+        .quality = opts.quality,
+        .srgb = opts.srgb,
+        .normal_map = is_normal,
+        .src_disk_bytes = img.disk_bytes,
+        .ktx2_bytes = out.ktx2.len,
+        .format_label = out.format_label,
+        .mip_levels = out.mip_levels,
+        .vram_before = vram_before,
+        .vram_after = out.ktx2.len,
+        .psnr_db = core.encode_ktx.psnr(dec.pixels, rt.pixels),
+    };
+}
+
+fn printTexturesHuman(
+    w: anytype,
+    path: []const u8,
+    asset: core.model.Asset,
+    st: core.stats.Stats,
+    encode_idx: ?u32,
+    enc: ?EncodeResult,
+) !void {
+    var buf: [64]u8 = undefined;
+    try w.print("{s}\n", .{path});
+    try w.print("  images: {d}  textures: {d}  vram est: {s}\n\n", .{
+        asset.images.len,
+        asset.textures.len,
+        core.stats.formatBytes(&buf, st.vram_total),
+    });
+    if (asset.images.len == 0) {
+        try w.print("  (no images)\n", .{});
+        return;
+    }
+    for (st.image_stats) |im| {
+        if (im.has_dims) {
+            try w.print("  [{d}] {s}  {d}x{d}  {s}", .{
+                im.index, im.name orelse "-", im.width, im.height, im.format_label,
+            });
+        } else {
+            try w.print("  [{d}] {s}  -  {s}", .{ im.index, im.name orelse "-", im.format_label });
+        }
+        try w.print("  disk {s}  vram {s}  mips {s}\n", .{
+            core.stats.formatBytes(&buf, im.disk_bytes),
+            core.stats.formatBytes(buf[16..], im.vram),
+            if (im.has_mips) "y" else "n",
+        });
+    }
+    if (encode_idx != null and enc == null) {
+        // runEncode already printed the reason; nothing else to show.
+        return;
+    }
+    const e = enc orelse return;
+    const pct: f64 = if (e.src_disk_bytes > 0)
+        @as(f64, @floatFromInt(e.ktx2_bytes)) / @as(f64, @floatFromInt(e.src_disk_bytes)) * 100.0
+    else
+        0;
+    try w.print("\n  encode: [{d}] {s}  {d}x{d}  {s} q{d}{s}\n", .{
+        e.index,
+        e.name orelse "-",
+        e.width,
+        e.height,
+        if (e.mode == .etc1s) "etc1s" else "uastc",
+        e.quality,
+        if (e.normal_map) "  normal-map" else "",
+    });
+    try w.print("    source:  {s} on disk\n", .{
+        core.stats.formatBytes(&buf, e.src_disk_bytes),
+    });
+    try w.print("    ktx2:    {s}  ({d:.1}% of source)  {s}, {d} mip(s)\n", .{
+        core.stats.formatBytes(buf[16..], e.ktx2_bytes),
+        pct,
+        e.format_label,
+        e.mip_levels,
+    });
+    try w.print("    vram:    {s} rgba8+mips -> {s} ktx2 bytes\n", .{
+        core.stats.formatBytes(buf[32..], e.vram_before),
+        core.stats.formatBytes(&buf, e.vram_after),
+    });
+    try w.print("    psnr:    {d:.2} dB\n", .{e.psnr_db});
+}
+
+fn printTexturesJson(
+    w: anytype,
+    path: []const u8,
+    asset: core.model.Asset,
+    st: core.stats.Stats,
+    encode_idx: ?u32,
+    enc: ?EncodeResult,
+) !void {
+    try w.writeAll("{\n  \"file\": ");
+    try jsonStr(w, path);
+    try w.print(",\n  \"images_count\": {d},\n  \"vram_total_est\": {d},\n  \"images\": [", .{
+        asset.images.len,
+        st.vram_total,
+    });
+    for (st.image_stats, 0..) |im, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("\n    {\"index\":");
+        try w.print("{d},\"name\":", .{im.index});
+        try jsonStrOpt(w, im.name);
+        try w.writeAll(",\"format\":");
+        try jsonStr(w, im.format_label);
+        try w.print(",\"width\":{d},\"height\":{d},\"disk\":{d},\"vram\":{d},\"has_mips\":{s}}}", .{
+            im.width,
+            im.height,
+            im.disk_bytes,
+            im.vram,
+            if (im.has_mips) "true" else "false",
+        });
+    }
+    try w.writeAll("\n  ]");
+
+    if (encode_idx) |idx| {
+        try w.print(",\n  \"encode_request\": {d}", .{idx});
+        if (enc) |e| {
+            try w.writeAll(",\n  \"encode\": {\"index\":");
+            try w.print("{d},\"name\":", .{e.index});
+            try jsonStrOpt(w, e.name);
+            try w.writeAll(",\"mode\":\"");
+            try w.writeAll(if (e.mode == .etc1s) "etc1s" else "uastc");
+            try w.print("\",\"quality\":{d},\"srgb\":{s},\"normal_map\":{s}", .{
+                e.quality,
+                if (e.srgb) "true" else "false",
+                if (e.normal_map) "true" else "false",
+            });
+            try w.print(",\"width\":{d},\"height\":{d},\"mip_levels\":{d},\"format\":", .{
+                e.width, e.height, e.mip_levels,
+            });
+            try jsonStr(w, e.format_label);
+            try w.print(",\"source_bytes\":{d},\"ktx2_bytes\":{d},\"vram_before\":{d},\"vram_after\":{d},\"psnr_db\":{d:.2}}}", .{
+                e.src_disk_bytes,
+                e.ktx2_bytes,
+                e.vram_before,
+                e.vram_after,
+                e.psnr_db,
+            });
+        } else {
+            try w.writeAll(",\n  \"encode\": null");
+        }
+    }
+    try w.writeAll("\n}\n");
 }
 
 fn cmdPresets() !u8 {
