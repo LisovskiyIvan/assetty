@@ -245,6 +245,7 @@ fn attributesEqual(o: []const model.Attribute, n: []const model.Attribute) bool 
     if (o.len != n.len) return false;
     for (o, n) |oa, na| {
         if (oa.semantic != na.semantic or
+            oa.semantic_index != na.semantic_index or
             oa.count != na.count or
             oa.component != na.component or
             oa.dim != na.dim) return false;
@@ -255,7 +256,7 @@ fn attributesEqual(o: []const model.Attribute, n: []const model.Attribute) bool 
 fn extensionsEqual(o: model.Extensions, n: model.Extensions) bool {
     const names = @typeInfo(model.Extensions).@"struct".field_names;
     inline for (names) |fname| {
-        if (@field(o, fname) != @field(n, fname)) return false;
+        if (!std.meta.eql(@field(o, fname), @field(n, fname))) return false;
     }
     return true;
 }

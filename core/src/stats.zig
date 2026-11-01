@@ -122,21 +122,7 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     @memset(used_textures, false);
     @memset(used_images, false);
 
-    // materials/textures referenced anywhere count as used
-    for (asset.materials) |mat| {
-        const names = @typeInfo(model.Material).@"struct".field_names;
-        const types = @typeInfo(model.Material).@"struct".field_types;
-        inline for (names, types) |fname, ftype| {
-            if (ftype == ?model.TextureInfo) {
-                if (@field(mat, fname)) |ti| used_textures[ti.texture] = true;
-            }
-        }
-    }
-    for (asset.textures) |tex| {
-        if (tex.image) |im| used_images[im] = true;
-    }
-
-    // node reachability from scenes; materials via reachable nodes
+    // materials via reachable nodes
     const stack = try a.alloc(u32, asset.nodes.len + 1);
     var sp: usize = 0;
     for (asset.scenes) |scene| {
@@ -163,6 +149,23 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
             }
         }
     }
+    // animation targets keep nodes alive
+    for (asset.animations) |anim| {
+        for (anim.targets) |t| {
+            if (t < used_nodes.len and !used_nodes[t]) markSubtree(asset, used_nodes, t, stack);
+        }
+    }
+
+    // textures used only by reachable materials; images only by reachable textures
+    for (used_materials, 0..) |u, i| {
+        if (!u) continue;
+        model.markUsedTextures(asset.materials[i], used_textures);
+    }
+    for (used_textures, 0..) |u, i| {
+        if (!u) continue;
+        const tex = asset.textures[i];
+        if (tex.image) |im| used_images[im] = true;
+    }
 
     st.garbage = .{
         .unused_nodes = try collectIdx(a, u32, used_nodes),
@@ -186,6 +189,24 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     st.garbage.uncompressed_embedded = try uncompressed.toOwnedSlice(a);
 
     return st;
+}
+
+fn markSubtree(asset: model.Asset, used_nodes: []bool, root: u32, stack: []u32) void {
+    var sp: usize = 0;
+    stack[sp] = root;
+    sp += 1;
+    while (sp > 0) {
+        sp -= 1;
+        const ni = stack[sp];
+        if (used_nodes[ni]) continue;
+        used_nodes[ni] = true;
+        for (asset.nodes[ni].children) |ch| {
+            if (ch < used_nodes.len and sp < stack.len) {
+                stack[sp] = ch;
+                sp += 1;
+            }
+        }
+    }
 }
 
 fn collectIdx(a: std.mem.Allocator, comptime T: type, used: []const bool) ![]const T {

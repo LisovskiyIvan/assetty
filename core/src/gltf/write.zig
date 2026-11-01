@@ -564,7 +564,7 @@ fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
         try o.key("sampler");
         try o.int(si);
     }
-    if (t.has_basisu != 0 or t.has_webp != 0) {
+    if (t.has_basisu != 0 or t.has_webp != 0 or t.extensions_count > 0) {
         try o.key("extensions");
         try o.beginObj();
         if (t.has_basisu != 0) {
@@ -585,9 +585,14 @@ fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
             }
             try o.endObj();
         }
+        for (sl(c.cgltf_extension, t.extensions, t.extensions_count)) |*e| {
+            const name = cstr(e.name) orelse continue;
+            const data = if (@intFromPtr(e.data) != 0) std.mem.span(e.data) else "{}";
+            try o.key(name);
+            try o.raw(if (isEmptyObjSlice(data)) "{}" else data);
+        }
         try o.endObj();
     }
-    try writeRawExtensions(o, t.extensions, t.extensions_count);
     try writeExtras(o, &t.extras);
     try o.endObj();
 }
@@ -935,6 +940,7 @@ fn writeCamera(o: *Out, cam: *const c.cgltf_camera) !void {
             try o.floatAff(p.znear);
             try o.key("zfar");
             try o.floatAff(p.zfar);
+            try writeExtras(o, &p.extras);
             try o.endObj();
         },
         else => {},
@@ -1195,7 +1201,10 @@ fn computeBounds(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !Bounds {
     const total = @as(usize, @intCast(acc.count)) * ncomp;
     if (total == 0) return error.Unsupported;
     const tmp = try a.alloc(f32, total);
-    const got = c.cgltf_accessor_unpack_floats(acc, tmp.ptr, total);
+    // cgltf fills accessor->stride during parse; default 0 means tightly packed
+    var acc2 = acc.*;
+    if (acc2.stride == 0) acc2.stride = c.cgltf_calc_size(acc2.type, acc2.component_type);
+    const got = c.cgltf_accessor_unpack_floats(&acc2, tmp.ptr, total);
     if (got < total) return error.Unsupported;
     var out: Bounds = .{};
     for (0..ncomp) |k| {
@@ -1676,6 +1685,15 @@ fn compareStructure(a: std.mem.Allocator, orig: *c.cgltf_data, new: *c.cgltf_dat
         try std.testing.expectEqual(oa.count, na.count);
         try std.testing.expectEqual(oa.normalized, na.normalized);
         try std.testing.expectEqual(oa.is_sparse, na.is_sparse);
+        const nc = numComponents(oa.type);
+        if (oa.has_min != 0) {
+            try std.testing.expect(na.has_min != 0);
+            for (0..nc) |k| try std.testing.expectEqual(oa.min[k], na.min[k]);
+        }
+        if (oa.has_max != 0) {
+            try std.testing.expect(na.has_max != 0);
+            for (0..nc) |k| try std.testing.expectEqual(oa.max[k], na.max[k]);
+        }
         if (oa.buffer_view != null) {
             const oi = ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view).?;
             const ni = ptrIndex(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count, na.buffer_view).?;
@@ -1767,7 +1785,9 @@ test "glb writer: real fixtures round-trip" {
     }
     for (files) |path| {
         std.debug.print("round-trip: {s}\n", .{path});
-        try checkFile(aa, a, path);
+        var fa = std.heap.ArenaAllocator.init(a);
+        defer fa.deinit();
+        try checkFile(fa.allocator(), a, path);
     }
 }
 
@@ -1785,4 +1805,75 @@ test "glb writer: rejects external buffers" {
 
 test {
     _ = @import("../golden.zig");
+}
+
+test "glb writer: computes missing POSITION min/max" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // three vec3 positions
+    var positions = [9]f32{ -1, 0, 5, 2, -3, 1, 0, 4, -2 };
+
+    var buf = std.mem.zeroes(c.cgltf_buffer);
+    buf.size = @sizeOf(@TypeOf(positions));
+    buf.data = @ptrCast(&positions);
+
+    var bv = std.mem.zeroes(c.cgltf_buffer_view);
+    bv.buffer = &buf;
+    bv.size = buf.size;
+    bv.type = 2; // ARRAY_BUFFER
+
+    var acc = std.mem.zeroes(c.cgltf_accessor);
+    acc.component_type = 6; // FLOAT
+    acc.type = 3; // VEC3
+    acc.count = 3;
+    acc.buffer_view = &bv;
+
+    var attr = std.mem.zeroes(c.cgltf_attribute);
+    attr.name = @constCast("POSITION");
+    attr.type = 1;
+    attr.data = &acc;
+
+    var prim = std.mem.zeroes(c.cgltf_primitive);
+    prim.type = 5; // triangles
+    prim.attributes = &attr;
+    prim.attributes_count = 1;
+
+    var mesh = std.mem.zeroes(c.cgltf_mesh);
+    mesh.primitives = &prim;
+    mesh.primitives_count = 1;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.buffers = &buf;
+    data.buffers_count = 1;
+    data.buffer_views = &bv;
+    data.buffer_views_count = 1;
+    data.accessors = &acc;
+    data.accessors_count = 1;
+    data.meshes = &mesh;
+    data.meshes_count = 1;
+
+    const out = try serialize(a, &data, "");
+    // GLB header / chunk sanity
+    try std.testing.expectEqual(@as(u32, 0x46546C67), std.mem.readInt(u32, out[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out[4..8], .little));
+    try std.testing.expectEqual(@as(u32, @intCast(out.len)), std.mem.readInt(u32, out[8..12], .little));
+    const jlen = std.mem.readInt(u32, out[12..16], .little);
+    try std.testing.expectEqual(@as(u32, 0x4E4F534A), std.mem.readInt(u32, out[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 0), jlen % 4);
+    const boff = 20 + jlen;
+    try std.testing.expectEqual(@as(u32, 0x004E4942), std.mem.readInt(u32, out[boff + 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), out.len - boff - 8 - std.mem.readInt(u32, out[boff..][0..4], .little));
+
+    var p = try parseBytes(std.testing.allocator, out);
+    defer p.deinit();
+    const na = &sl(c.cgltf_accessor, p.data.accessors, p.data.accessors_count)[0];
+    try std.testing.expect(na.has_min != 0 and na.has_max != 0);
+    try std.testing.expectEqualSlices(f32, &.{ -1, -3, -2 }, na.min[0..3]);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 4, 5 }, na.max[0..3]);
+
+    // idempotent
+    const out2 = try serialize(a, p.data, out);
+    try std.testing.expectEqualSlices(u8, out, out2);
 }

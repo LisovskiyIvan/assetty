@@ -4,11 +4,10 @@ pub const Semantic = enum {
     position,
     normal,
     tangent,
-    texcoord_0,
-    texcoord_1,
-    color_0,
-    joints_0,
-    weights_0,
+    texcoord,
+    color,
+    joints,
+    weights,
     other,
 
     pub fn label(self: Semantic) []const u8 {
@@ -16,11 +15,10 @@ pub const Semantic = enum {
             .position => "POSITION",
             .normal => "NORMAL",
             .tangent => "TANGENT",
-            .texcoord_0 => "TEXCOORD_0",
-            .texcoord_1 => "TEXCOORD_1",
-            .color_0 => "COLOR_0",
-            .joints_0 => "JOINTS_0",
-            .weights_0 => "WEIGHTS_0",
+            .texcoord => "TEXCOORD",
+            .color => "COLOR",
+            .joints => "JOINTS",
+            .weights => "WEIGHTS",
             .other => "OTHER",
         };
     }
@@ -80,6 +78,8 @@ pub const Mode = enum {
 
 pub const Attribute = struct {
     semantic: Semantic,
+    /// set index: TEXCOORD_1 → semantic=.texcoord, semantic_index=1
+    semantic_index: u32 = 0,
     count: u32,
     component: ComponentType,
     dim: Dim,
@@ -120,6 +120,18 @@ pub const Extensions = struct {
     texture_transform: bool = false,
     iridescence: bool = false,
     anisotropy: bool = false,
+
+    // extension texture bindings (must not be pruned / count as used)
+    clearcoat_texture: ?TextureInfo = null,
+    clearcoat_roughness_texture: ?TextureInfo = null,
+    sheen_color_texture: ?TextureInfo = null,
+    sheen_roughness_texture: ?TextureInfo = null,
+    transmission_texture: ?TextureInfo = null,
+    specular_texture: ?TextureInfo = null,
+    specular_color_texture: ?TextureInfo = null,
+    iridescence_texture: ?TextureInfo = null,
+    iridescence_thickness_texture: ?TextureInfo = null,
+    volume_thickness_texture: ?TextureInfo = null,
 };
 
 pub const Material = struct {
@@ -141,6 +153,23 @@ pub const Material = struct {
     has_pbr: bool = true,
     extensions: Extensions = .{},
 };
+
+pub const texture_info_fields = [_][]const u8{ "base_color_texture", "metallic_roughness_texture", "normal_texture", "occlusion_texture", "emissive_texture" };
+pub const ext_texture_info_fields = [_][]const u8{ "clearcoat_texture", "clearcoat_roughness_texture", "sheen_color_texture", "sheen_roughness_texture", "transmission_texture", "specular_texture", "specular_color_texture", "iridescence_texture", "iridescence_thickness_texture", "volume_thickness_texture" };
+
+/// mark every texture referenced by this material (core + extension bindings)
+pub fn markUsedTextures(mat: Material, used: []bool) void {
+    inline for (texture_info_fields) |f| {
+        if (@field(mat, f)) |ti| {
+            if (ti.texture < used.len) used[ti.texture] = true;
+        }
+    }
+    inline for (ext_texture_info_fields) |f| {
+        if (@field(mat.extensions, f)) |ti| {
+            if (ti.texture < used.len) used[ti.texture] = true;
+        }
+    }
+}
 
 pub const Mime = enum {
     png,
@@ -171,7 +200,15 @@ pub const Image = struct {
     disk_bytes: u64 = 0,
 };
 
-pub const Filter = enum { nearest, linear, unknown };
+pub const Filter = enum {
+    nearest,
+    linear,
+    nearest_mipmap_nearest,
+    linear_mipmap_nearest,
+    nearest_mipmap_linear,
+    linear_mipmap_linear,
+    unknown,
+};
 pub const Wrap = enum { clamp_to_edge, mirrored_repeat, repeat, unknown };
 
 pub const Sampler = struct {
@@ -196,7 +233,7 @@ pub const Node = struct {
     rotation: [4]f32 = .{ 0, 0, 0, 1 },
     scale: [3]f32 = .{ 1, 1, 1 },
     has_matrix: bool = false,
-    matrix: [16]f32 = undefined,
+    matrix: [16]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
 };
 
 pub const Scene = struct {

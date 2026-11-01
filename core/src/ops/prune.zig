@@ -87,14 +87,7 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
     }
     for (used_materials, 0..) |u, i| {
         if (!u) continue;
-        const mat = asset.materials[i];
-        inline for (@typeInfo(model.Material).@"struct".field_names, @typeInfo(model.Material).@"struct".field_types) |fname, ftype| {
-            if (ftype == ?model.TextureInfo) {
-                if (@field(mat, fname)) |ti| {
-                    if (ti.texture < used_textures.len) used_textures[ti.texture] = true;
-                }
-            }
-        }
+        model.markUsedTextures(asset.materials[i], used_textures);
     }
     for (used_textures, 0..) |u, i| {
         if (!u) continue;
@@ -171,11 +164,14 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
     const new_materials = try a.alloc(model.Material, material_map.len);
     for (material_map, 0..) |old_i, new_i| {
         var mat = asset.materials[old_i];
-        inline for (@typeInfo(model.Material).@"struct".field_names, @typeInfo(model.Material).@"struct".field_types) |fname, ftype| {
-            if (ftype == ?model.TextureInfo) {
-                if (@field(mat, fname)) |*ti| {
-                    ti.texture = texture_map[ti.texture];
-                }
+        inline for (model.texture_info_fields) |fname| {
+            if (@field(mat, fname)) |*ti| {
+                ti.texture = texture_map[ti.texture];
+            }
+        }
+        inline for (model.ext_texture_info_fields) |fname| {
+            if (@field(mat.extensions, fname)) |*ti| {
+                ti.texture = texture_map[ti.texture];
             }
         }
         new_materials[new_i] = mat;

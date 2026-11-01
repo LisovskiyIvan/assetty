@@ -179,15 +179,15 @@ fn convDim(t: c_uint) model.Dim {
     };
 }
 
-fn semanticOf(attr_type: c_uint, index: c_int) model.Semantic {
+fn semanticOf(attr_type: c_uint) model.Semantic {
     return switch (attr_type) {
         1 => .position,
         2 => .normal,
         3 => .tangent,
-        4 => if (index == 0) .texcoord_0 else if (index == 1) .texcoord_1 else .other,
-        5 => .color_0,
-        6 => .joints_0,
-        7 => .weights_0,
+        4 => .texcoord,
+        5 => .color,
+        6 => .joints,
+        7 => .weights,
         else => .other,
     };
 }
@@ -272,6 +272,28 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         for (m.emissive_factor, 0..) |v, k| mat.emissive_factor[k] = @floatCast(v);
         for (sl(c.cgltf_extension, m.extensions, m.extensions_count)) |*ext| markExt(&mat.extensions, ext.name);
         if (m.unlit != 0) mat.extensions.unlit = true;
+        if (m.has_clearcoat != 0) {
+            mat.extensions.clearcoat_texture = try convTextureView(&m.clearcoat.clearcoat_texture, &maps);
+            mat.extensions.clearcoat_roughness_texture = try convTextureView(&m.clearcoat.clearcoat_roughness_texture, &maps);
+        }
+        if (m.has_sheen != 0) {
+            mat.extensions.sheen_color_texture = try convTextureView(&m.sheen.sheen_color_texture, &maps);
+            mat.extensions.sheen_roughness_texture = try convTextureView(&m.sheen.sheen_roughness_texture, &maps);
+        }
+        if (m.has_transmission != 0) {
+            mat.extensions.transmission_texture = try convTextureView(&m.transmission.transmission_texture, &maps);
+        }
+        if (m.has_specular != 0) {
+            mat.extensions.specular_texture = try convTextureView(&m.specular.specular_texture, &maps);
+            mat.extensions.specular_color_texture = try convTextureView(&m.specular.specular_color_texture, &maps);
+        }
+        if (m.has_iridescence != 0) {
+            mat.extensions.iridescence_texture = try convTextureView(&m.iridescence.iridescence_texture, &maps);
+            mat.extensions.iridescence_thickness_texture = try convTextureView(&m.iridescence.iridescence_thickness_texture, &maps);
+        }
+        if (m.has_volume != 0) {
+            mat.extensions.volume_thickness_texture = try convTextureView(&m.volume.thickness_texture, &maps);
+        }
         materials[i] = mat;
     }
     out.materials = materials;
@@ -327,9 +349,18 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     // --- textures ---
     const textures = try a.alloc(model.Texture, data.textures_count);
     for (sl(c.cgltf_texture, data.textures, data.textures_count), 0..) |*t, i| {
+        // core source wins; fallback to webp/basisu extension images
+        var img: ?*c.cgltf_image = null;
+        if (@intFromPtr(t.image) != 0) {
+            img = t.image;
+        } else if (@intFromPtr(t.webp_image) != 0) {
+            img = t.webp_image;
+        } else if (@intFromPtr(t.basisu_image) != 0) {
+            img = t.basisu_image;
+        }
         textures[i] = .{
             .name = try dupName(a, t.name),
-            .image = if (t.image) |im| maps.images.get(im) else null,
+            .image = if (img) |im| maps.images.get(im) else null,
             .sampler = if (t.sampler) |s| maps.samplers.get(s) else null,
         };
     }
@@ -345,7 +376,8 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
             for (sl(c.cgltf_attribute, p.attributes, p.attributes_count), 0..) |*attr, k| {
                 const acc = attr.data;
                 attrs[k] = .{
-                    .semantic = semanticOf(attr.type, attr.index),
+                    .semantic = semanticOf(attr.type),
+                    .semantic_index = @intCast(@max(attr.index, 0)),
                     .count = @intCast(acc.*.count),
                     .component = convComponent(acc.*.component_type),
                     .dim = convDim(acc.*.type),
@@ -471,6 +503,10 @@ fn convFilter(v: c_uint) model.Filter {
     return switch (v) {
         9728 => .nearest,
         9729 => .linear,
+        9984 => .nearest_mipmap_nearest,
+        9985 => .linear_mipmap_nearest,
+        9986 => .nearest_mipmap_linear,
+        9987 => .linear_mipmap_linear,
         else => .unknown,
     };
 }
