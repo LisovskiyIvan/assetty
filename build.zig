@@ -11,13 +11,22 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     }).createModule();
 
+    const meshopt_mod = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/meshoptimizer/meshoptimizer.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }).createModule();
+
     const core_mod = b.createModule(.{
         .root_source_file = b.path("core/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .link_libcpp = true,
         .imports = &.{
             .{ .name = "cgltf", .module = cgltf_mod },
+            .{ .name = "meshopt", .module = meshopt_mod },
         },
     });
     core_mod.addCSourceFiles(.{
@@ -25,6 +34,8 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "cgltf/cgltf_impl.c",
             "stb/stb_impl.c",
+            "meshoptimizer/quantization.cpp",
+            "meshoptimizer/simplifier.cpp",
         },
         .flags = &.{"-O2"},
     });
