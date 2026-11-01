@@ -1,0 +1,9 @@
+// Minimal pipeline preset used by the runner tests: model-level cleanup only.
+.{
+    .name = "noop",
+    .target = .desktop,
+    .steps = .{
+        .{ .prune = .{} },
+        .{ .dedup = .{} },
+    },
+}

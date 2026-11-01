@@ -261,6 +261,285 @@ const Bounds = struct {
     max: [16]f32 = undefined,
 };
 
+// ---------------------------------------------------------------------------
+// reachability GC
+//
+// Before emitting anything we compute, for every cgltf pool, which entries are
+// actually referenced by the output.  Unreferenced (garbage) entries are
+// skipped entirely: no JSON, no BIN bytes.  `rank` maps an old pool index to
+// its new emitted index (`dropped` when the entry is not kept).
+// ---------------------------------------------------------------------------
+
+/// value stored in `Pool.rank` for entries that are not emitted
+const dropped = std.math.maxInt(u32);
+
+const Pool = struct {
+    keep: []bool,
+    rank: []u32,
+
+    fn init(a: std.mem.Allocator, n: usize) !Pool {
+        const keep = try a.alloc(bool, n);
+        @memset(keep, false);
+        const rank = try a.alloc(u32, n);
+        @memset(rank, dropped);
+        return .{ .keep = keep, .rank = rank };
+    }
+
+    fn finalize(self: *Pool) void {
+        var next: u32 = 0;
+        for (self.keep, 0..) |k, i| {
+            if (!k) continue;
+            self.rank[i] = next;
+            next += 1;
+        }
+    }
+
+    fn count(self: *const Pool) usize {
+        var n: usize = 0;
+        for (self.keep) |k| {
+            if (k) n += 1;
+        }
+        return n;
+    }
+};
+
+const Keep = struct {
+    nodes: Pool,
+    meshes: Pool,
+    materials: Pool,
+    textures: Pool,
+    images: Pool,
+    samplers: Pool,
+    cameras: Pool,
+    lights: Pool,
+    accessors: Pool,
+    views: Pool,
+
+    fn compute(a: std.mem.Allocator, d: *c.cgltf_data) !Keep {
+        var k = Keep{
+            .nodes = try Pool.init(a, d.nodes_count),
+            .meshes = try Pool.init(a, d.meshes_count),
+            .materials = try Pool.init(a, d.materials_count),
+            .textures = try Pool.init(a, d.textures_count),
+            .images = try Pool.init(a, d.images_count),
+            .samplers = try Pool.init(a, d.samplers_count),
+            .cameras = try Pool.init(a, d.cameras_count),
+            .lights = try Pool.init(a, d.lights_count),
+            .accessors = try Pool.init(a, d.accessors_count),
+            .views = try Pool.init(a, d.buffer_views_count),
+        };
+
+        // Without any scene/animation/skin anchor there is no graph to reason
+        // about: keep everything (the writer used to emit every pool element
+        // and must stay lossless for such inputs).
+        const anchored = d.scenes_count > 0 or d.animations_count > 0 or d.skins_count > 0;
+
+        const stack = try a.alloc(u32, d.nodes_count + 1);
+
+        // nodes reachable from scene roots
+        if (d.scenes_count > 0) {
+            for (sl(c.cgltf_scene, d.scenes, d.scenes_count)) |*s| {
+                for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |np| {
+                    markSubtree(k.nodes.keep, stack, d, np);
+                }
+            }
+        }
+        // animation channels target live nodes even when unreachable from a scene
+        for (sl(c.cgltf_animation, d.animations, d.animations_count)) |*an| {
+            for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+                if (@intFromPtr(ch.target_node) != 0) markSubtree(k.nodes.keep, stack, d, ch.target_node);
+            }
+        }
+        // skins are always emitted, so their joints must stay addressable
+        for (sl(c.cgltf_skin, d.skins, d.skins_count)) |*sk| {
+            for (sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |jp| markSubtree(k.nodes.keep, stack, d, jp);
+            if (@intFromPtr(sk.skeleton) != 0) markSubtree(k.nodes.keep, stack, d, sk.skeleton);
+        }
+        if (!anchored) {
+            @memset(k.nodes.keep, true);
+            @memset(k.meshes.keep, true);
+        }
+
+        // meshes referenced by kept nodes
+        for (sl(c.cgltf_node, d.nodes, d.nodes_count), 0..) |*n, ni| {
+            if (!k.nodes.keep[ni]) continue;
+            if (ptrIndex(c.cgltf_mesh, d.meshes, d.meshes_count, n.mesh)) |mi| k.meshes.keep[mi] = true;
+        }
+
+        // materials + accessors referenced by kept meshes
+        var draco_views: std.ArrayList(usize) = .empty;
+        var draco_accs: std.ArrayList(usize) = .empty;
+        defer draco_views.deinit(a);
+        defer draco_accs.deinit(a);
+
+        for (sl(c.cgltf_mesh, d.meshes, d.meshes_count), 0..) |*m, mi| {
+            if (!k.meshes.keep[mi]) continue;
+            for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+                for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                    markAccessor(&k, d, at.data);
+                }
+                markAccessor(&k, d, p.indices);
+                for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                    for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+                        markAccessor(&k, d, at.data);
+                    }
+                }
+                if (ptrIndex(c.cgltf_material, d.materials, d.materials_count, p.material)) |mat_i| k.materials.keep[mat_i] = true;
+                for (sl(c.cgltf_material_mapping, p.mappings, p.mappings_count)) |*mp| {
+                    if (ptrIndex(c.cgltf_material, d.materials, d.materials_count, mp.material)) |mat_i| k.materials.keep[mat_i] = true;
+                }
+                if (p.has_draco_mesh_compression != 0) {
+                    for (sl(c.cgltf_attribute, p.draco_mesh_compression.attributes, p.draco_mesh_compression.attributes_count)) |*at| {
+                        if (ptrIndex(c.cgltf_accessor, d.accessors, d.accessors_count, at.data)) |ai| try draco_accs.append(a, ai);
+                    }
+                    if (ptrIndex(c.cgltf_buffer_view, d.buffer_views, d.buffer_views_count, p.draco_mesh_compression.buffer_view)) |vi| {
+                        try draco_views.append(a, vi);
+                    }
+                }
+            }
+        }
+
+        // instancing attributes live on kept nodes
+        for (sl(c.cgltf_node, d.nodes, d.nodes_count), 0..) |*n, ni| {
+            if (!k.nodes.keep[ni]) continue;
+            if (n.has_mesh_gpu_instancing != 0) {
+                for (sl(c.cgltf_attribute, n.mesh_gpu_instancing.attributes, n.mesh_gpu_instancing.attributes_count)) |*at| {
+                    markAccessor(&k, d, at.data);
+                }
+            }
+            if (ptrIndex(c.cgltf_camera, d.cameras, d.cameras_count, n.camera)) |ci| k.cameras.keep[ci] = true;
+            if (ptrIndex(c.cgltf_light, d.lights, d.lights_count, n.light)) |li| k.lights.keep[li] = true;
+        }
+
+        // animation + skin accessors (all animations and skins are emitted)
+        for (sl(c.cgltf_animation, d.animations, d.animations_count)) |*an| {
+            for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+                markAccessor(&k, d, s.input);
+                markAccessor(&k, d, s.output);
+            }
+        }
+        for (sl(c.cgltf_skin, d.skins, d.skins_count)) |*sk| {
+            markAccessor(&k, d, sk.inverse_bind_matrices);
+        }
+        for (draco_accs.items) |ai| k.accessors.keep[ai] = true;
+
+        // textures referenced by kept materials
+        for (sl(c.cgltf_material, d.materials, d.materials_count), 0..) |*m, mi| {
+            if (!k.materials.keep[mi]) continue;
+            markMaterialTextures(&k, d, m);
+        }
+
+        // images/samplers referenced by kept textures
+        for (sl(c.cgltf_texture, d.textures, d.textures_count), 0..) |*t, ti| {
+            if (!k.textures.keep[ti]) continue;
+            markImage(&k, d, t.image);
+            markImage(&k, d, t.basisu_image);
+            markImage(&k, d, t.webp_image);
+            if (ptrIndex(c.cgltf_sampler, d.samplers, d.samplers_count, t.sampler)) |si| k.samplers.keep[si] = true;
+        }
+
+        // buffer views used by kept accessors / images
+        for (sl(c.cgltf_accessor, d.accessors, d.accessors_count), 0..) |*acc, ai| {
+            if (!k.accessors.keep[ai]) continue;
+            markView(&k, d, acc.buffer_view);
+            if (acc.is_sparse != 0) {
+                markView(&k, d, acc.sparse.indices_buffer_view);
+                markView(&k, d, acc.sparse.values_buffer_view);
+            }
+        }
+        for (sl(c.cgltf_image, d.images, d.images_count), 0..) |*im, ii| {
+            if (!k.images.keep[ii]) continue;
+            markView(&k, d, im.buffer_view);
+        }
+        for (draco_views.items) |vi| k.views.keep[vi] = true;
+
+        k.nodes.finalize();
+        k.meshes.finalize();
+        k.materials.finalize();
+        k.textures.finalize();
+        k.images.finalize();
+        k.samplers.finalize();
+        k.cameras.finalize();
+        k.lights.finalize();
+        k.accessors.finalize();
+        k.views.finalize();
+        return k;
+    }
+};
+
+fn markSubtree(keep_nodes: []bool, stack: []u32, d: *c.cgltf_data, root: [*c]c.cgltf_node) void {
+    if (@intFromPtr(root) == 0 or stack.len == 0) return;
+    const ri = ptrIndex(c.cgltf_node, d.nodes, d.nodes_count, root) orelse return;
+    if (keep_nodes[ri]) return;
+    keep_nodes[ri] = true;
+    var sp: usize = 0;
+    stack[sp] = ri;
+    sp += 1;
+    const nodes = sl(c.cgltf_node, d.nodes, d.nodes_count);
+    while (sp > 0) {
+        sp -= 1;
+        const n = &nodes[stack[sp]];
+        for (sl([*c]c.cgltf_node, n.children, n.children_count)) |ch| {
+            if (@intFromPtr(ch) == 0) continue;
+            const ci = ptrIndex(c.cgltf_node, d.nodes, d.nodes_count, ch) orelse continue;
+            if (keep_nodes[ci]) continue;
+            keep_nodes[ci] = true;
+            // every node is pushed at most once, so this cannot overflow
+            stack[sp] = ci;
+            sp += 1;
+        }
+    }
+}
+
+fn markAccessor(k: *Keep, d: *c.cgltf_data, p: [*c]c.cgltf_accessor) void {
+    if (@intFromPtr(p) == 0) return;
+    if (ptrIndex(c.cgltf_accessor, d.accessors, d.accessors_count, p)) |ai| k.accessors.keep[ai] = true;
+}
+
+fn markView(k: *Keep, d: *c.cgltf_data, p: [*c]c.cgltf_buffer_view) void {
+    if (@intFromPtr(p) == 0) return;
+    if (ptrIndex(c.cgltf_buffer_view, d.buffer_views, d.buffer_views_count, p)) |vi| k.views.keep[vi] = true;
+}
+
+fn markImage(k: *Keep, d: *c.cgltf_data, p: [*c]c.cgltf_image) void {
+    if (@intFromPtr(p) == 0) return;
+    if (ptrIndex(c.cgltf_image, d.images, d.images_count, p)) |ii| k.images.keep[ii] = true;
+}
+
+/// every texture_view field of a material (core + typed extensions)
+fn materialTextureViews(m: *const c.cgltf_material) [21]*const c.cgltf_texture_view {
+    return .{
+        &m.pbr_metallic_roughness.base_color_texture,
+        &m.pbr_metallic_roughness.metallic_roughness_texture,
+        &m.normal_texture,
+        &m.occlusion_texture,
+        &m.emissive_texture,
+        &m.pbr_specular_glossiness.diffuse_texture,
+        &m.pbr_specular_glossiness.specular_glossiness_texture,
+        &m.clearcoat.clearcoat_texture,
+        &m.clearcoat.clearcoat_roughness_texture,
+        &m.clearcoat.clearcoat_normal_texture,
+        &m.transmission.transmission_texture,
+        &m.volume.thickness_texture,
+        &m.specular.specular_texture,
+        &m.specular.specular_color_texture,
+        &m.sheen.sheen_color_texture,
+        &m.sheen.sheen_roughness_texture,
+        &m.iridescence.iridescence_texture,
+        &m.iridescence.iridescence_thickness_texture,
+        &m.diffuse_transmission.diffuse_transmission_texture,
+        &m.diffuse_transmission.diffuse_transmission_color_texture,
+        &m.anisotropy.anisotropy_texture,
+    };
+}
+
+fn markMaterialTextures(k: *Keep, d: *c.cgltf_data, m: *const c.cgltf_material) void {
+    for (materialTextureViews(m)) |v| {
+        if (@intFromPtr(v.texture) == 0) continue;
+        if (ptrIndex(c.cgltf_texture, d.textures, d.textures_count, v.texture)) |ti| k.textures.keep[ti] = true;
+    }
+}
+
 const Ctx = struct {
     a: std.mem.Allocator,
     d: *c.cgltf_data,
@@ -268,11 +547,25 @@ const Ctx = struct {
     bin_len: u64,
     keep_stride: []const bool,
     bounds: []const ?Bounds,
+    keep: *const Keep,
 };
+
+/// Map an old pool index to the emitted index, or null when the entry was
+/// garbage collected.
+fn kept(rank: []const u32, i: u32) ?u32 {
+    if (i >= rank.len) return null;
+    const r = rank[i];
+    return if (r == dropped) null else r;
+}
+
+fn ranked(comptime T: type, base: [*c]T, count: usize, p: [*c]T, rank: []const u32) ?u32 {
+    const i = ptrIndex(T, base, count, p) orelse return null;
+    return kept(rank, i);
+}
 
 fn emitTextureView(o: *Out, ctx: *const Ctx, view: *const c.cgltf_texture_view) !void {
     if (@intFromPtr(view.texture) == 0) return;
-    const ti = ptrIndex(c.cgltf_texture, ctx.d.textures, ctx.d.textures_count, view.texture) orelse return;
+    const ti = ranked(c.cgltf_texture, ctx.d.textures, ctx.d.textures_count, view.texture, ctx.keep.textures.rank) orelse return;
     try o.key("index");
     try o.int(ti);
     if (view.texcoord != 0) {
@@ -415,8 +708,10 @@ fn writeAccessor(o: *Out, ctx: *const Ctx, i: usize, acc: *const c.cgltf_accesso
         try o.str(s);
     }
     if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.buffer_view)) |bi| {
-        try o.key("bufferView");
-        try o.int(bi);
+        if (kept(ctx.keep.views.rank, bi)) |bv| {
+            try o.key("bufferView");
+            try o.int(bv);
+        }
     }
     if (acc.offset != 0) {
         try o.key("byteOffset");
@@ -479,8 +774,10 @@ fn writeAccessor(o: *Out, ctx: *const Ctx, i: usize, acc: *const c.cgltf_accesso
         try o.key("indices");
         try o.beginObj();
         if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.sparse.indices_buffer_view)) |bi| {
-            try o.key("bufferView");
-            try o.int(bi);
+            if (kept(ctx.keep.views.rank, bi)) |bv| {
+                try o.key("bufferView");
+                try o.int(bv);
+            }
         }
         try o.key("byteOffset");
         try o.int(acc.sparse.indices_byte_offset);
@@ -490,8 +787,10 @@ fn writeAccessor(o: *Out, ctx: *const Ctx, i: usize, acc: *const c.cgltf_accesso
         try o.key("values");
         try o.beginObj();
         if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, acc.sparse.values_buffer_view)) |bi| {
-            try o.key("bufferView");
-            try o.int(bi);
+            if (kept(ctx.keep.views.rank, bi)) |bv| {
+                try o.key("bufferView");
+                try o.int(bv);
+            }
         }
         try o.key("byteOffset");
         try o.int(acc.sparse.values_byte_offset);
@@ -515,8 +814,10 @@ fn writeImage(o: *Out, ctx: *const Ctx, im: *const c.cgltf_image) !void {
         try o.str(s);
     }
     if (ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, im.buffer_view)) |bi| {
-        try o.key("bufferView");
-        try o.int(bi);
+        if (kept(ctx.keep.views.rank, bi)) |bv| {
+            try o.key("bufferView");
+            try o.int(bv);
+        }
     }
     if (cstr(im.mime_type)) |s| {
         try o.key("mimeType");
@@ -556,11 +857,11 @@ fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
         try o.key("name");
         try o.str(s);
     }
-    if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.image)) |ii| {
+    if (ranked(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.image, ctx.keep.images.rank)) |ii| {
         try o.key("source");
         try o.int(ii);
     }
-    if (ptrIndex(c.cgltf_sampler, ctx.d.samplers, ctx.d.samplers_count, t.sampler)) |si| {
+    if (ranked(c.cgltf_sampler, ctx.d.samplers, ctx.d.samplers_count, t.sampler, ctx.keep.samplers.rank)) |si| {
         try o.key("sampler");
         try o.int(si);
     }
@@ -570,7 +871,7 @@ fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
         if (t.has_basisu != 0) {
             try o.key("KHR_texture_basisu");
             try o.beginObj();
-            if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.basisu_image)) |ii| {
+            if (ranked(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.basisu_image, ctx.keep.images.rank)) |ii| {
                 try o.key("source");
                 try o.int(ii);
             }
@@ -579,7 +880,7 @@ fn writeTexture(o: *Out, ctx: *const Ctx, t: *const c.cgltf_texture) !void {
         if (t.has_webp != 0) {
             try o.key("EXT_texture_webp");
             try o.beginObj();
-            if (ptrIndex(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.webp_image)) |ii| {
+            if (ranked(c.cgltf_image, ctx.d.images, ctx.d.images_count, t.webp_image, ctx.keep.images.rank)) |ii| {
                 try o.key("source");
                 try o.int(ii);
             }
@@ -820,7 +1121,7 @@ fn writeAttributes(o: *Out, ctx: *const Ctx, attrs: [*c]c.cgltf_attribute, count
     try o.beginObj();
     for (sl(c.cgltf_attribute, attrs, count)) |*a| {
         const name = cstr(a.name) orelse continue;
-        const ai = ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, a.data) orelse continue;
+        const ai = ranked(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, a.data, ctx.keep.accessors.rank) orelse continue;
         try o.key(name);
         try o.int(ai);
     }
@@ -836,11 +1137,11 @@ fn writePrimitive(o: *Out, ctx: *const Ctx, p: *const c.cgltf_primitive) !void {
     }
     try o.key("attributes");
     try writeAttributes(o, ctx, p.attributes, p.attributes_count);
-    if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, p.indices)) |ii| {
+    if (ranked(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, p.indices, ctx.keep.accessors.rank)) |ii| {
         try o.key("indices");
         try o.int(ii);
     }
-    if (ptrIndex(c.cgltf_material, ctx.d.materials, ctx.d.materials_count, p.material)) |mi| {
+    if (ranked(c.cgltf_material, ctx.d.materials, ctx.d.materials_count, p.material, ctx.keep.materials.rank)) |mi| {
         try o.key("material");
         try o.int(mi);
     }
@@ -956,7 +1257,7 @@ fn writeNode(o: *Out, ctx: *const Ctx, n: *const c.cgltf_node) !void {
         try o.key("name");
         try o.str(s);
     }
-    if (ptrIndex(c.cgltf_mesh, ctx.d.meshes, ctx.d.meshes_count, n.mesh)) |mi| {
+    if (ranked(c.cgltf_mesh, ctx.d.meshes, ctx.d.meshes_count, n.mesh, ctx.keep.meshes.rank)) |mi| {
         try o.key("mesh");
         try o.int(mi);
     }
@@ -964,7 +1265,7 @@ fn writeNode(o: *Out, ctx: *const Ctx, n: *const c.cgltf_node) !void {
         try o.key("skin");
         try o.int(si);
     }
-    if (ptrIndex(c.cgltf_camera, ctx.d.cameras, ctx.d.cameras_count, n.camera)) |ci| {
+    if (ranked(c.cgltf_camera, ctx.d.cameras, ctx.d.cameras_count, n.camera, ctx.keep.cameras.rank)) |ci| {
         try o.key("camera");
         try o.int(ci);
     }
@@ -972,7 +1273,7 @@ fn writeNode(o: *Out, ctx: *const Ctx, n: *const c.cgltf_node) !void {
         try o.key("children");
         try o.beginArr();
         for (sl([*c]c.cgltf_node, n.children, n.children_count)) |ch| {
-            const ci = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, ch) orelse continue;
+            const ci = ranked(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, ch, ctx.keep.nodes.rank) orelse continue;
             try o.item();
             try o.int(ci);
         }
@@ -1010,7 +1311,7 @@ fn writeNode(o: *Out, ctx: *const Ctx, n: *const c.cgltf_node) !void {
         try o.key("extensions");
         try o.beginObj();
         if (@intFromPtr(n.light) != 0) {
-            const li = ptrIndex(c.cgltf_light, ctx.d.lights, ctx.d.lights_count, n.light) orelse 0;
+            const li = ranked(c.cgltf_light, ctx.d.lights, ctx.d.lights_count, n.light, ctx.keep.lights.rank) orelse 0;
             try o.key("KHR_lights_punctual");
             try o.beginObj();
             try o.key("light");
@@ -1042,11 +1343,16 @@ fn writeScene(o: *Out, ctx: *const Ctx, s: *const c.cgltf_scene) !void {
         try o.key("name");
         try o.str(n);
     }
-    if (s.nodes_count > 0) {
+    var kept_roots: usize = 0;
+    for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |np| {
+        const ni = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, np) orelse continue;
+        if (kept(ctx.keep.nodes.rank, ni) != null) kept_roots += 1;
+    }
+    if (kept_roots > 0) {
         try o.key("nodes");
         try o.beginArr();
         for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |np| {
-            const ni = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, np) orelse continue;
+            const ni = ranked(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, np, ctx.keep.nodes.rank) orelse continue;
             try o.item();
             try o.int(ni);
         }
@@ -1063,18 +1369,18 @@ fn writeSkin(o: *Out, ctx: *const Ctx, sk: *const c.cgltf_skin) !void {
         try o.key("name");
         try o.str(s);
     }
-    if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, sk.inverse_bind_matrices)) |ai| {
+    if (ranked(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, sk.inverse_bind_matrices, ctx.keep.accessors.rank)) |ai| {
         try o.key("inverseBindMatrices");
         try o.int(ai);
     }
-    if (ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, sk.skeleton)) |ni| {
+    if (ranked(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, sk.skeleton, ctx.keep.nodes.rank)) |ni| {
         try o.key("skeleton");
         try o.int(ni);
     }
     try o.key("joints");
     try o.beginArr();
     for (sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |jp| {
-        const ji = ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, jp) orelse continue;
+        const ji = ranked(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, jp, ctx.keep.nodes.rank) orelse continue;
         try o.item();
         try o.int(ji);
     }
@@ -1102,8 +1408,10 @@ fn writeAnimation(o: *Out, ctx: *const Ctx, an: *const c.cgltf_animation) !void 
         try o.key("target");
         try o.beginObj();
         if (ptrIndex(c.cgltf_node, ctx.d.nodes, ctx.d.nodes_count, ch.target_node)) |ni| {
-            try o.key("node");
-            try o.int(ni);
+            if (kept(ctx.keep.nodes.rank, ni)) |nn| {
+                try o.key("node");
+                try o.int(nn);
+            }
         }
         const path: []const u8 = switch (ch.target_path) {
             1 => "translation",
@@ -1126,11 +1434,11 @@ fn writeAnimation(o: *Out, ctx: *const Ctx, an: *const c.cgltf_animation) !void 
     for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
         try o.item();
         try o.beginObj();
-        if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.input)) |ai| {
+        if (ranked(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.input, ctx.keep.accessors.rank)) |ai| {
             try o.key("input");
             try o.int(ai);
         }
-        if (ptrIndex(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.output)) |ai| {
+        if (ranked(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count, s.output, ctx.keep.accessors.rank)) |ai| {
             try o.key("output");
             try o.int(ai);
         }
@@ -1242,10 +1550,15 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         if (v.has_meshopt_compression != 0) return error.Unsupported;
     }
 
-    // --- BIN chunk: copy every buffer view, 4-byte aligned ---
+    // --- reachability GC: which pool entries are actually referenced? ---
+    const keep = try Keep.compute(a, data);
+
+    // --- BIN chunk: copy every kept buffer view, 4-byte aligned ---
     const view_off = try a.alloc(u64, data.buffer_views_count);
+    @memset(view_off, 0);
     var bin: std.ArrayList(u8) = .empty;
     for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+        if (!keep.views.keep[i]) continue;
         const rem = bin.items.len % 4;
         if (rem != 0) {
             try bin.resize(a, bin.items.len + (4 - rem));
@@ -1258,10 +1571,12 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
 
     // --- byteStride: emit only when it differs from an accessor's natural stride ---
     const keep_stride = try a.alloc(bool, data.buffer_views_count);
+    @memset(keep_stride, false);
     for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
-        keep_stride[i] = false;
+        if (!keep.views.keep[i]) continue;
         if (v.stride == 0) continue;
-        for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
+        for (sl(c.cgltf_accessor, data.accessors, data.accessors_count), 0..) |*acc, ai| {
+            if (!keep.accessors.keep[ai]) continue;
             if (acc.buffer_view == v) {
                 const natural = c.cgltf_calc_size(acc.type, acc.component_type);
                 if (natural != v.stride) {
@@ -1276,7 +1591,8 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     const acc_count: usize = @intCast(data.accessors_count);
     const is_position = try a.alloc(bool, acc_count);
     @memset(is_position, false);
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, mi| {
+        if (!keep.meshes.keep[mi]) continue;
         for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 if (at.type == 1) {
@@ -1295,6 +1611,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     const bounds = try a.alloc(?Bounds, acc_count);
     @memset(bounds, null);
     for (sl(c.cgltf_accessor, data.accessors, data.accessors_count), 0..) |*acc, i| {
+        if (!keep.accessors.keep[i]) continue;
         if (is_position[i] and (acc.has_min == 0 or acc.has_max == 0)) {
             bounds[i] = try computeBounds(a, acc);
         }
@@ -1307,6 +1624,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         .bin_len = bin.items.len,
         .keep_stride = keep_stride,
         .bounds = bounds,
+        .keep = &keep,
     };
 
     // --- JSON chunk ---
@@ -1330,46 +1648,51 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         }
         try o.endArr();
     }
-    if (data.nodes_count > 0) {
+    if (keep.nodes.count() > 0) {
         try o.key("nodes");
         try o.beginArr();
-        for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        for (sl(c.cgltf_node, data.nodes, data.nodes_count), 0..) |*n, i| {
+            if (!keep.nodes.keep[i]) continue;
             try o.item();
             try writeNode(&o, &ctx, n);
         }
         try o.endArr();
     }
-    if (data.meshes_count > 0) {
+    if (keep.meshes.count() > 0) {
         try o.key("meshes");
         try o.beginArr();
-        for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, i| {
+            if (!keep.meshes.keep[i]) continue;
             try o.item();
             try writeMesh(&o, &ctx, m);
         }
         try o.endArr();
     }
-    if (data.materials_count > 0) {
+    if (keep.materials.count() > 0) {
         try o.key("materials");
         try o.beginArr();
-        for (sl(c.cgltf_material, data.materials, data.materials_count)) |*m| {
+        for (sl(c.cgltf_material, data.materials, data.materials_count), 0..) |*m, i| {
+            if (!keep.materials.keep[i]) continue;
             try o.item();
             try writeMaterial(&o, &ctx, m);
         }
         try o.endArr();
     }
-    if (data.accessors_count > 0) {
+    if (keep.accessors.count() > 0) {
         try o.key("accessors");
         try o.beginArr();
         for (sl(c.cgltf_accessor, data.accessors, data.accessors_count), 0..) |*acc, i| {
+            if (!keep.accessors.keep[i]) continue;
             try o.item();
             try writeAccessor(&o, &ctx, i, acc);
         }
         try o.endArr();
     }
-    if (data.buffer_views_count > 0) {
+    if (keep.views.count() > 0) {
         try o.key("bufferViews");
         try o.beginArr();
         for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+            if (!keep.views.keep[i]) continue;
             try o.item();
             try writeBufferView(&o, &ctx, i, v);
         }
@@ -1384,37 +1707,41 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         }
         try o.endArr();
     }
-    if (data.images_count > 0) {
+    if (keep.images.count() > 0) {
         try o.key("images");
         try o.beginArr();
-        for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
+        for (sl(c.cgltf_image, data.images, data.images_count), 0..) |*im, i| {
+            if (!keep.images.keep[i]) continue;
             try o.item();
             try writeImage(&o, &ctx, im);
         }
         try o.endArr();
     }
-    if (data.textures_count > 0) {
+    if (keep.textures.count() > 0) {
         try o.key("textures");
         try o.beginArr();
-        for (sl(c.cgltf_texture, data.textures, data.textures_count)) |*t| {
+        for (sl(c.cgltf_texture, data.textures, data.textures_count), 0..) |*t, i| {
+            if (!keep.textures.keep[i]) continue;
             try o.item();
             try writeTexture(&o, &ctx, t);
         }
         try o.endArr();
     }
-    if (data.samplers_count > 0) {
+    if (keep.samplers.count() > 0) {
         try o.key("samplers");
         try o.beginArr();
-        for (sl(c.cgltf_sampler, data.samplers, data.samplers_count)) |*s| {
+        for (sl(c.cgltf_sampler, data.samplers, data.samplers_count), 0..) |*s, i| {
+            if (!keep.samplers.keep[i]) continue;
             try o.item();
             try writeSampler(&o, s);
         }
         try o.endArr();
     }
-    if (data.cameras_count > 0) {
+    if (keep.cameras.count() > 0) {
         try o.key("cameras");
         try o.beginArr();
-        for (sl(c.cgltf_camera, data.cameras, data.cameras_count)) |*cam| {
+        for (sl(c.cgltf_camera, data.cameras, data.cameras_count), 0..) |*cam, i| {
+            if (!keep.cameras.keep[i]) continue;
             try o.item();
             try writeCamera(&o, cam);
         }
@@ -1440,7 +1767,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     }
 
     // top-level extensions: KHR_lights_punctual + unknown
-    if (data.lights_count > 0 or data.data_extensions_count > 0 or data.variants_count > 0) {
+    if (keep.lights.count() > 0 or data.data_extensions_count > 0 or data.variants_count > 0) {
         try o.key("extensions");
         try o.beginObj();
         if (data.variants_count > 0) {
@@ -1461,12 +1788,13 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
             try o.endArr();
             try o.endObj();
         }
-        if (data.lights_count > 0) {
+        if (keep.lights.count() > 0) {
             try o.key("KHR_lights_punctual");
             try o.beginObj();
             try o.key("lights");
             try o.beginArr();
-            for (sl(c.cgltf_light, data.lights, data.lights_count)) |*l| {
+            for (sl(c.cgltf_light, data.lights, data.lights_count), 0..) |*l, i| {
+                if (!keep.lights.keep[i]) continue;
                 try o.item();
                 try writeLight(&o, l);
             }
@@ -1614,10 +1942,11 @@ const Snapshot = struct {
     tex_bindings: []const f32 = &.{},
 };
 
-fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data) !Snapshot {
+fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data, keep: *const Keep) !Snapshot {
     var attrs: std.ArrayList(u8) = .empty;
     var counts: std.ArrayList(u32) = .empty;
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, mi| {
+        if (!keep.meshes.keep[mi]) continue;
         for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 const name = cstr(at.name) orelse "";
@@ -1628,7 +1957,8 @@ fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data) !Snapshot {
         }
     }
     var bindings: std.ArrayList(f32) = .empty;
-    for (sl(c.cgltf_material, data.materials, data.materials_count)) |*m| {
+    for (sl(c.cgltf_material, data.materials, data.materials_count), 0..) |*m, mi| {
+        if (!keep.materials.keep[mi]) continue;
         const views = [_]*const c.cgltf_texture_view{
             &m.pbr_metallic_roughness.base_color_texture,
             &m.pbr_metallic_roughness.metallic_roughness_texture,
@@ -1637,12 +1967,12 @@ fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data) !Snapshot {
             &m.emissive_texture,
         };
         for (views) |v| {
-            if (@intFromPtr(v.texture) == 0) {
-                try bindings.append(a, -1);
-                try bindings.append(a, -1);
-            } else {
-                try bindings.append(a, @floatFromInt(ptrIndex(c.cgltf_texture, data.textures, data.textures_count, v.texture) orelse 0));
+            if (ranked(c.cgltf_texture, data.textures, data.textures_count, v.texture, keep.textures.rank)) |ti| {
+                try bindings.append(a, @floatFromInt(ti));
                 try bindings.append(a, @floatFromInt(v.texcoord));
+            } else {
+                try bindings.append(a, -1);
+                try bindings.append(a, -1);
             }
             try bindings.append(a, @floatCast(v.scale));
         }
@@ -1655,31 +1985,41 @@ fn snapshot(a: std.mem.Allocator, data: *c.cgltf_data) !Snapshot {
 }
 
 fn compareStructure(a: std.mem.Allocator, orig: *c.cgltf_data, new: *c.cgltf_data) !void {
+    // the writer emits exactly the reachable subset of the input pools
+    const ok = try Keep.compute(a, orig);
+
     try std.testing.expectEqual(orig.scenes_count, new.scenes_count);
-    try std.testing.expectEqual(orig.nodes_count, new.nodes_count);
-    try std.testing.expectEqual(orig.meshes_count, new.meshes_count);
-    try std.testing.expectEqual(orig.materials_count, new.materials_count);
-    try std.testing.expectEqual(orig.textures_count, new.textures_count);
-    try std.testing.expectEqual(orig.images_count, new.images_count);
-    try std.testing.expectEqual(orig.samplers_count, new.samplers_count);
+    try std.testing.expectEqual(ok.nodes.count(), new.nodes_count);
+    try std.testing.expectEqual(ok.meshes.count(), new.meshes_count);
+    try std.testing.expectEqual(ok.materials.count(), new.materials_count);
+    try std.testing.expectEqual(ok.textures.count(), new.textures_count);
+    try std.testing.expectEqual(ok.images.count(), new.images_count);
+    try std.testing.expectEqual(ok.samplers.count(), new.samplers_count);
+    try std.testing.expectEqual(ok.cameras.count(), new.cameras_count);
+    try std.testing.expectEqual(ok.accessors.count(), new.accessors_count);
+    try std.testing.expectEqual(ok.views.count(), new.buffer_views_count);
     try std.testing.expectEqual(orig.animations_count, new.animations_count);
     try std.testing.expectEqual(orig.skins_count, new.skins_count);
     try std.testing.expectEqual(orig.buffers_count, new.buffers_count);
-    try std.testing.expectEqual(orig.buffer_views_count, new.buffer_views_count);
-    try std.testing.expectEqual(orig.accessors_count, new.accessors_count);
 
-    // buffer view payload bytes
+    // buffer view payload bytes (kept views in pool order)
+    var nvi: usize = 0;
     for (sl(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count), 0..) |*ov, i| {
-        const nv = &sl(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count)[i];
+        if (!ok.views.keep[i]) continue;
+        const nv = &sl(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count)[nvi];
+        nvi += 1;
         try std.testing.expectEqual(ov.size, nv.size);
         const ob = viewBytes(ov) orelse return error.InvalidData;
         const nb = viewBytes(nv) orelse return error.InvalidData;
         try std.testing.expectEqualSlices(u8, ob, nb);
     }
 
-    // accessors
+    // accessors (kept accessors in pool order)
+    var nai: usize = 0;
     for (sl(c.cgltf_accessor, orig.accessors, orig.accessors_count), 0..) |*oa, i| {
-        const na = &sl(c.cgltf_accessor, new.accessors, new.accessors_count)[i];
+        if (!ok.accessors.keep[i]) continue;
+        const na = &sl(c.cgltf_accessor, new.accessors, new.accessors_count)[nai];
+        nai += 1;
         try std.testing.expectEqual(oa.component_type, na.component_type);
         try std.testing.expectEqual(oa.type, na.type);
         try std.testing.expectEqual(oa.count, na.count);
@@ -1695,7 +2035,7 @@ fn compareStructure(a: std.mem.Allocator, orig: *c.cgltf_data, new: *c.cgltf_dat
             for (0..nc) |k| try std.testing.expectEqual(oa.max[k], na.max[k]);
         }
         if (oa.buffer_view != null) {
-            const oi = ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view).?;
+            const oi = ranked(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view, ok.views.rank).?;
             const ni = ptrIndex(c.cgltf_buffer_view, new.buffer_views, new.buffer_views_count, na.buffer_view).?;
             try std.testing.expectEqual(oi, ni);
         }
@@ -1706,15 +2046,19 @@ fn compareStructure(a: std.mem.Allocator, orig: *c.cgltf_data, new: *c.cgltf_dat
     }
 
     // primitive attribute semantics + counts
-    const so = try snapshot(a, orig);
-    const sn = try snapshot(a, new);
+    const nk = try Keep.compute(a, new);
+    const so = try snapshot(a, orig, &ok);
+    const sn = try snapshot(a, new, &nk);
     try std.testing.expectEqualSlices(u8, so.prim_attrs, sn.prim_attrs);
     try std.testing.expectEqualSlices(u32, so.prim_counts, sn.prim_counts);
     try std.testing.expectEqualSlices(f32, so.tex_bindings, sn.tex_bindings);
 
     // index/vertex counts per primitive
+    var nmi: usize = 0;
     for (sl(c.cgltf_mesh, orig.meshes, orig.meshes_count), 0..) |*om, mi| {
-        const nm = &sl(c.cgltf_mesh, new.meshes, new.meshes_count)[mi];
+        if (!ok.meshes.keep[mi]) continue;
+        const nm = &sl(c.cgltf_mesh, new.meshes, new.meshes_count)[nmi];
+        nmi += 1;
         try std.testing.expectEqual(om.primitives_count, nm.primitives_count);
         for (sl(c.cgltf_primitive, om.primitives, om.primitives_count), 0..) |*op, pi| {
             const np = &sl(c.cgltf_primitive, nm.primitives, nm.primitives_count)[pi];
@@ -1769,6 +2113,32 @@ test "glb writer: box fixture" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try checkFile(arena.allocator(), std.testing.allocator, "test/fixtures/box.glb");
+}
+
+test "glb writer: gc drops unreachable pools" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, std.testing.allocator, "test/fixtures/dup.glb");
+    defer loaded.deinit();
+    // the fixture has one garbage node -> garbage mesh -> garbage accessors
+    try std.testing.expect(loaded.cdata.meshes_count > 1);
+
+    const out1 = try serialize(aa, loaded.cdata, loaded.map);
+    var p1 = try parseBytes(std.testing.allocator, out1);
+    defer p1.deinit();
+
+    try std.testing.expect(p1.data.accessors_count < loaded.cdata.accessors_count);
+    try std.testing.expect(p1.data.meshes_count < loaded.cdata.meshes_count);
+    try std.testing.expect(p1.data.materials_count < loaded.cdata.materials_count);
+    try std.testing.expect(p1.data.nodes_count < loaded.cdata.nodes_count);
+    try std.testing.expect(p1.data.buffer_views_count < loaded.cdata.buffer_views_count);
+    // the two reachable duplicate meshes survive (only dedup can collapse them)
+    try std.testing.expectEqual(@as(usize, 2), p1.data.meshes_count);
+
+    const out2 = try serialize(aa, p1.data, out1);
+    try std.testing.expectEqualSlices(u8, out1, out2);
 }
 
 test "glb writer: real fixtures round-trip" {
