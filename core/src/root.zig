@@ -11,6 +11,8 @@ pub const prune = @import("ops/prune.zig");
 pub const dedup = @import("ops/dedup.zig");
 pub const weld = @import("ops/weld.zig");
 pub const join = @import("ops/join.zig");
+pub const quantize = @import("ops/quantize.zig");
+pub const simplify = @import("ops/simplify.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
