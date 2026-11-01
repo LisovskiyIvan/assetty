@@ -1,3 +1,4 @@
+const std = @import("std");
 // OWNED BY: subagent O3 (weld + join + geom builder). Replace entirely. Public API fixed.
 const c = @import("cgltf");
 

@@ -1,3 +1,4 @@
+const std = @import("std");
 // OWNED BY: subagent O4 (meshopt quantize/simplify). Replace entirely. Public API fixed.
 const c = @import("cgltf");
 
