@@ -29,6 +29,10 @@ const parse = @import("../gltf/parse.zig");
 const write = @import("../gltf/write.zig");
 const prune = @import("../ops/prune.zig");
 const dedup = @import("../ops/dedup.zig");
+const weld = @import("../ops/weld.zig");
+const join = @import("../ops/join.zig");
+const quantize = @import("../ops/quantize.zig");
+const simplify = @import("../ops/simplify.zig");
 
 pub const StepStatus = struct {
     kind: []const u8, // "prune", "dedup", ...
@@ -97,8 +101,65 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     ),
                 };
             },
-            // Not wired yet; the progress callback still fires for them.
-            .weld, .join, .quantize, .simplify, .textures => .{
+            .weld => |p| blk: {
+                const res = try weld.run(a, loaded.cdata, loaded.map, .{ .tolerance = p.tolerance });
+                break :blk .{
+                    .kind = kind,
+                    .applied = true,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "merged {d} verts across {d} prim(s)",
+                        .{ res.removed_vertices, res.rewritten_prims },
+                    ),
+                };
+            },
+            .join => blk: {
+                const res = try join.run(a, loaded.cdata, loaded.map);
+                break :blk .{
+                    .kind = kind,
+                    .applied = true,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "merged {d} prim(s), rewrote {d} mesh(es)",
+                        .{ res.merged_prims, res.rewritten_meshes },
+                    ),
+                };
+            },
+            .quantize => |p| blk: {
+                const res = try quantize.run(a, loaded.cdata, loaded.map, .{
+                    .position_bits = p.position_bits,
+                    .uv_bits = p.uv_bits,
+                    .normal_oct = p.normal_oct,
+                });
+                break :blk .{
+                    .kind = kind,
+                    .applied = true,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "quantized {d} pos, {d} uv, {d} normal accessor(s)",
+                        .{ res.quantized_positions, res.quantized_uvs, res.quantized_normals },
+                    ),
+                };
+            },
+            .simplify => |p| blk: {
+                const res = try simplify.run(a, loaded.cdata, loaded.map, .{
+                    .target_ratio = p.target_ratio,
+                    .error_tolerance = p.error_tolerance,
+                    .aggressive = p.aggressive,
+                    .lock_borders = p.lock_borders,
+                });
+                break :blk .{
+                    .kind = kind,
+                    .applied = true,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "{d} -> {d} tris",
+                        .{ res.before, res.after },
+                    ),
+                };
+            },
+            // step 4 (KTX2 encode via basisu)
+            .textures => .{
                 .kind = kind,
                 .applied = false,
                 .note = "not implemented, skipped",
