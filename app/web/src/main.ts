@@ -1,10 +1,11 @@
 import "./style.css";
 import { app } from "./app";
 import { checkKtx2Assets, configureKtx2, reportDecoderFailure } from "./ktx2";
-import { notify, onLog } from "./notify";
+import { logHistory, notify, onLog } from "./notify";
 import { createInspectorDock } from "./inspector";
 import { Logger } from "@babylonjs/core/Misc/logger";
-import { el, fmtBytes, fmtNum } from "./ui";
+import { clear, copyText, el, fmtBytes, fmtCompact, statChip } from "./ui";
+import type { StatChip } from "./ui";
 import { mountViewer } from "./tabs/viewer";
 import { mountOptimize } from "./tabs/optimize";
 import { mountTextures } from "./tabs/textures";
@@ -92,24 +93,124 @@ async function toggleInspector(): Promise<void> {
 }
 
 const status = {
-  fps: el("span", { class: "metric", text: "fps —" }),
-  tris: el("span", { class: "metric", text: "tris —" }),
-  draws: el("span", { class: "metric", text: "draws —" }),
-  meshes: el("span", { class: "metric", text: "meshes —" }),
-  materials: el("span", { class: "metric", text: "materials —" }),
-  textures: el("span", { class: "metric", text: "textures —" }),
-  vram: el("span", { class: "metric", text: "vram —" }),
-  disk: el("span", { class: "metric", text: "disk —" }),
-  path: el("span", { class: "metric status-path", text: "no file" }),
-  log: el("span", { class: "status-log", text: "" }),
+  fps: statChip("FPS"),
+  tris: statChip("TRIS"),
+  draws: statChip("DRAWS"),
+  meshes: statChip("MESH"),
+  materials: statChip("MAT"),
+  textures: statChip("TEX"),
+  vram: statChip("VRAM"),
+  disk: statChip("DISK"),
 };
 
-const sep = () => el("span", { class: "sep" });
+const statusMetrics = el(
+  "div",
+  { class: "status-metrics" },
+  status.fps.el,
+  status.tris.el,
+  status.draws.el,
+  status.meshes.el,
+  status.materials.el,
+  status.textures.el,
+  status.vram.el,
+  status.disk.el,
+);
+
+status.vram.el.dataset.chip = "vram";
+status.disk.el.dataset.chip = "disk";
+
+/* ------------------------------------------------ statusbar: path + log popover */
+
+function basename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+const pathText = el("span", { class: "v", text: "no file" });
+const pathChip = el(
+  "button",
+  {
+    class: "status-path",
+    title: "no model open",
+    onclick: () => {
+      const path = app.pathA;
+      if (!path) return;
+      void copyText(path).then((ok) => notify(ok ? "copied model path" : path, ok ? "ok" : "info"));
+    },
+  },
+  pathText,
+);
+pathChip.dataset.empty = "true";
+
+const logList = el("div", { class: "log-list" });
+const logPopover = el(
+  "div",
+  { class: "status-popover", title: "recent messages" },
+  el(
+    "div",
+    { class: "popover-head" },
+    el("span", { text: "recent messages" }),
+    el("span", { class: "muted mono", text: "last 20" }),
+  ),
+  logList,
+);
+logPopover.hidden = true;
+
+function renderLog(): void {
+  clear(logList);
+  const entries = logHistory();
+  if (entries.length === 0) {
+    logList.append(el("div", { class: "empty", text: "no messages yet" }));
+    return;
+  }
+  logList.append(
+    ...entries
+      .slice()
+      .reverse()
+      .map((entry) =>
+        el(
+          "div",
+          { class: `log-entry ${entry.kind}` },
+          el("span", {
+            class: "ts mono",
+            text: new Date(entry.at).toLocaleTimeString("en-GB", { hour12: false }),
+          }),
+          el("span", { class: "msg", text: entry.message }),
+        ),
+      ),
+  );
+}
+renderLog();
+
+const infoBtn = el("button", {
+  class: "status-info",
+  text: "ⓘ",
+  title: "recent messages",
+  onclick: (ev: Event) => {
+    ev.stopPropagation();
+    logPopover.hidden = !logPopover.hidden;
+    if (!logPopover.hidden) renderLog();
+  },
+});
+
+document.addEventListener("click", (ev) => {
+  if (logPopover.hidden) return;
+  const target = ev.target as Node | null;
+  if (target && (logPopover.contains(target) || infoBtn.contains(target))) return;
+  logPopover.hidden = true;
+});
 
 onLog((message, kind) => {
-  status.log.textContent = message;
-  status.log.title = message;
-  status.log.dataset.kind = kind;
+  infoBtn.classList.toggle("has-error", kind === "error");
+  infoBtn.title = kind === "error" ? `error: ${message}` : `last: ${message}`;
+  if (!logPopover.hidden) renderLog();
+});
+
+const narrowPath = window.matchMedia("(max-width: 1200px)");
+let pathIsNarrow = narrowPath.matches;
+narrowPath.addEventListener("change", (ev) => {
+  pathIsNarrow = ev.matches;
+  updateStatusBar();
 });
 
 const appRoot = el("div", { id: "app" });
@@ -127,25 +228,11 @@ appRoot.append(
   el(
     "footer",
     { class: "statusbar" },
-    status.fps,
-    sep(),
-    status.tris,
-    sep(),
-    status.draws,
-    sep(),
-    status.meshes,
-    sep(),
-    status.materials,
-    sep(),
-    status.textures,
-    sep(),
-    status.vram,
-    sep(),
-    status.disk,
-    sep(),
-    status.path,
-    el("span", { class: "grow" }),
-    status.log,
+    statusMetrics,
+    pathChip,
+    el("span", { class: "status-spacer" }),
+    infoBtn,
+    logPopover,
   ),
 );
 document.body.append(appRoot);
@@ -220,38 +307,41 @@ for (const def of TAB_DEFS) {
 /* ---------------------------------------------------------------- status bar */
 
 const updateStatusBar = (): void => {
+  const set = (chip: StatChip, value: string): void => {
+    if (chip.value.textContent !== value) chip.value.textContent = value;
+  };
   const viewer = app.viewer;
   if (!viewer) {
-    status.fps.textContent = "fps —";
-    status.tris.textContent = "tris —";
-    status.draws.textContent = "draws —";
-    status.meshes.textContent = "meshes —";
-    status.materials.textContent = "materials —";
-    status.textures.textContent = "textures —";
+    set(status.fps, "—");
+    set(status.tris, "—");
+    set(status.draws, "—");
+    set(status.meshes, "—");
+    set(status.materials, "—");
+    set(status.textures, "—");
   } else {
     const s = viewer.getStats();
-    status.fps.textContent = `fps ${s.fps.toFixed(0)}`;
-    status.tris.textContent = `tris ${fmtNum(s.triangles)}`;
-    status.draws.textContent = `draws ${fmtNum(s.drawCalls)}`;
-    status.meshes.textContent = `meshes ${fmtNum(s.meshes)}`;
-    status.materials.textContent = `materials ${fmtNum(s.materials)}`;
-    status.textures.textContent = `textures ${fmtNum(s.textures)}`;
+    set(status.fps, s.fps.toFixed(0));
+    set(status.tris, fmtCompact(s.triangles));
+    set(status.draws, fmtCompact(s.drawCalls));
+    set(status.meshes, fmtCompact(s.meshes));
+    set(status.materials, fmtCompact(s.materials));
+    set(status.textures, fmtCompact(s.textures));
   }
   const info = app.info;
-  status.vram.textContent = `vram ${info ? fmtBytes(info.vram.total_est) : "—"}`;
-  status.disk.textContent = `disk ${info ? fmtBytes(info.disk.total) : "—"}`;
-  const path = app.pathA ?? "no file";
-  if (status.path.textContent !== path) status.path.textContent = path;
-  status.path.title = app.pathA ?? "";
+  set(status.vram, info ? fmtBytes(info.vram.total_est) : "—");
+  set(status.disk, info ? fmtBytes(info.disk.total) : "—");
+
+  const path = app.pathA;
+  const label = path ? (pathIsNarrow ? basename(path) : path) : "no file";
+  if (pathText.textContent !== label) pathText.textContent = label;
+  pathChip.title = path ? `${path}\nclick to copy` : "no model open";
+  pathChip.dataset.empty = path ? "false" : "true";
 };
 
 setInterval(updateStatusBar, 500);
 updateStatusBar();
 
-app.on("path", (d) => {
-  status.path.textContent = d.path;
-  status.path.title = d.path;
-});
+app.on("path", () => updateStatusBar());
 app.on("context", () => updateStatusBar());
 
 /* ------------------------------------------------------------------- boot */

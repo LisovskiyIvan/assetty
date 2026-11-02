@@ -13,13 +13,30 @@ type LogListener = (message: string, kind: NotifyKind) => void;
 
 const listeners = new Set<LogListener>();
 
+/** Rolling buffer so the status bar popover can list what just happened. */
+export interface LogEntry {
+  message: string;
+  kind: NotifyKind;
+  at: number;
+}
+
+const HISTORY_LIMIT = 20;
+const history: LogEntry[] = [];
+
 /** Subscribes to every `notify()` call (used by the status bar). */
 export function onLog(cb: LogListener): () => void {
   listeners.add(cb);
   return () => listeners.delete(cb);
 }
 
+/** Newest-last copy of the last ~20 messages. */
+export function logHistory(): LogEntry[] {
+  return history.slice();
+}
+
 export function notify(message: string, kind: NotifyKind = "info", ms = 4200): void {
+  history.push({ message, kind, at: Date.now() });
+  if (history.length > HISTORY_LIMIT) history.splice(0, history.length - HISTORY_LIMIT);
   toast(message, kind, ms);
   for (const cb of listeners) {
     try {

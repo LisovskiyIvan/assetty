@@ -25,6 +25,7 @@ pub fn run(init: std.process.Init) !u8 {
     try app.registerEvent(events.Log);
     try app.registerEvent(events.OptimizeDone);
     try app.registerEvent(events.TextureEncodeDone);
+    try app.registerEvent(events.TexturePreviewDone);
 
     _ = try app.newWindow(.{
         .title = "assetty",

@@ -98,6 +98,49 @@ export const demoEncode: EncodeResult = {
   vram_after: 5_592_405,
 };
 
+/**
+ * Stand-in image for demo mode (no host, no real pixels). Keyed by the path the
+ * backend would have returned so before/after stay visually distinct.
+ */
+const demoPngCache = new Map<string, string>();
+
+export function demoPngDataUrl(key: string): string {
+  const hit = demoPngCache.get(key);
+  if (hit) return hit;
+  const canvas = document.createElement("canvas");
+  canvas.width = 320;
+  canvas.height = 320;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  const after = /after|ktx2/i.test(key);
+  const grad = ctx.createLinearGradient(0, 0, 320, 320);
+  if (after) {
+    grad.addColorStop(0, "#16324d");
+    grad.addColorStop(1, "#3f8ad6");
+  } else {
+    grad.addColorStop(0, "#3b2a17");
+    grad.addColorStop(1, "#c98b3f");
+  }
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 320, 320);
+  ctx.fillStyle = "rgba(0, 0, 0, 0.18)";
+  for (let y = 0; y < 320; y += 32) {
+    for (let x = 0; x < 320; x += 32) {
+      if (((x + y) / 32) % 2 === 0) ctx.fillRect(x, y, 32, 32);
+    }
+  }
+  ctx.fillStyle = "#eef4fb";
+  ctx.textAlign = "center";
+  ctx.font = "600 18px ui-monospace, Menlo, monospace";
+  ctx.fillText(after ? "KTX2" : "ORIGINAL", 160, 150);
+  ctx.font = "11px ui-monospace, Menlo, monospace";
+  const name = (key.split(/[\\/]/).pop() ?? key).slice(-30);
+  ctx.fillText(name, 160, 174);
+  const url = canvas.toDataURL("image/png");
+  demoPngCache.set(key, url);
+  return url;
+}
+
 export const demoOptimize: OptimizeResult = {
   out_path: "/demo/optimized.glb",
   report: {

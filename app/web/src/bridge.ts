@@ -14,6 +14,8 @@
  *                              (older hosts: { out_path, report } synchronously)
  *   optimizeCustom(path, spec) -> same shape; spec is a JSON string
  *   textures(path)          -> { images }
+ *   texturePreview(path, i) -> { started: true } — image arrives as "texturePreviewDone"
+ *                              (missing on older hosts: feature-detected, preview disabled)
  *   textureEncode(path, i)  -> { started: true } — result arrives as "textureEncodeDone"
  *                              (older hosts: { ktx2_size, psnr, vram_after } synchronously)
  *   diff(a, b)              -> DiffReport
@@ -26,7 +28,9 @@
  *
  * Events: "progress" { step, pct }, "log" { line },
  *         "optimizeDone" { ok: true, out_path, report } | { ok: false, error },
- *         "textureEncodeDone" { ok: true, index, ktx2_size, psnr, vram_after }
+ *         "texturePreviewDone" { ok: true, index, b64, width, height } | { ok: false, index, error },
+ *         "textureEncodeDone" { ok: true, index, ktx2_size, psnr, vram_after, before_png, after_png,
+ *                               width, height, mip_levels, format, settings }
  *                            | { ok: false, index, error }
  */
 
@@ -36,12 +40,14 @@ import { toast } from "./ui";
 import type {
   DiffReport,
   EncodeResult,
+  EncodeSettings,
   Info,
   LintResult,
   LintViolation,
   OptimizeReport,
   OptimizeResult,
   Stats,
+  TexturePreview,
   TexturesResult,
 } from "./types";
 
@@ -74,6 +80,13 @@ export type TextureEncodeDoneEvent =
   | { ok: true; index: number; result: EncodeResult }
   | { ok: false; index: number; error: string };
 
+/** What `texturePreview()` resolves to (async on new hosts, immediate on old ones). */
+export type PreviewInvocation = { started: true } | { started: false; result: TexturePreview };
+
+export type TexturePreviewDoneEvent =
+  | { ok: true; index: number; result: TexturePreview }
+  | { ok: false; index: number; error: string };
+
 const METHOD_NAMES = [
   "openDialog",
   "info",
@@ -81,6 +94,7 @@ const METHOD_NAMES = [
   "optimize",
   "optimizeCustom",
   "textures",
+  "texturePreview",
   "textureEncode",
   "diff",
   "lint",
@@ -170,7 +184,7 @@ function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
         key,
       );
     if (!m) continue;
@@ -320,13 +334,67 @@ function normalizeEncodeDone(raw: unknown): TextureEncodeDoneEvent {
   if (r.ok === false || (r.error != null && r.ok !== true)) {
     return { ok: false, index, error: String(r.error ?? "encode failed") };
   }
+  return { ok: true, index, result: normalizeEncodeResult(r) };
+}
+
+function optNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+function optString(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+function normalizeSettings(raw: unknown): EncodeSettings | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const s = raw as Record<string, unknown>;
+  const out: EncodeSettings = {
+    format: optString(s.format),
+    quality: optNumber(s.quality),
+    max_size: optNumber(s.max_size ?? s.maxSize),
+    generate_mips:
+      typeof s.generate_mips === "boolean"
+        ? s.generate_mips
+        : typeof s.mips === "boolean"
+          ? s.mips
+          : undefined,
+  };
+  return out;
+}
+
+/** Normalizes both the event payload and the legacy synchronous reply. */
+export function normalizeEncodeResult(raw: unknown): EncodeResult {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  return {
+    ktx2_size: asNumber(r.ktx2_size ?? r.size),
+    psnr: asNumber(r.psnr),
+    vram_after: asNumber(r.vram_after ?? r.vram),
+    before_png: optString(r.before_png ?? r.beforePng),
+    after_png: optString(r.after_png ?? r.afterPng),
+    width: optNumber(r.width),
+    height: optNumber(r.height),
+    mip_levels: optNumber(r.mip_levels ?? r.mipLevels ?? r.mips),
+    format: optString(r.format),
+    settings: normalizeSettings(r.settings ?? r.applied_settings),
+  };
+}
+
+function normalizePreviewDone(raw: unknown): TexturePreviewDoneEvent {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const index = asNumber(r.index, -1);
+  if (r.ok === false || (r.error != null && r.ok !== true)) {
+    return { ok: false, index, error: String(r.error ?? "preview failed") };
+  }
+  const payload =
+    r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
   return {
     ok: true,
     index,
     result: {
-      ktx2_size: asNumber(r.ktx2_size ?? r.size),
-      psnr: asNumber(r.psnr),
-      vram_after: asNumber(r.vram_after ?? r.vram),
+      index,
+      b64: String(payload.b64 ?? payload.base64 ?? payload.data ?? ""),
+      width: asNumber(payload.width),
+      height: asNumber(payload.height),
     },
   };
 }
@@ -395,6 +463,18 @@ class DemoBackend {
     return demo.demoTextures;
   }
 
+  async texturePreview(path: string, index: number): Promise<TexturePreview> {
+    await sleep(220);
+    const img = demo.demoTextures.images[index] ?? demo.demoTextures.images[0];
+    const dataUrl = demo.demoPngDataUrl(`${path}#preview-${index}`);
+    return {
+      index,
+      b64: dataUrl.replace(/^data:image\/png;base64,/, ""),
+      width: img?.width ?? 0,
+      height: img?.height ?? 0,
+    };
+  }
+
   async textureEncode(_path: string, index: number): Promise<EncodeResult> {
     await sleep(400);
     const img = demo.demoTextures.images[index];
@@ -403,6 +483,13 @@ class DemoBackend {
       ktx2_size: Math.round(demo.demoEncode.ktx2_size * ratio),
       psnr: demo.demoEncode.psnr - (index % 3) * 2.4,
       vram_after: Math.round(demo.demoEncode.vram_after * ratio),
+      before_png: `/demo/image${index}_before.png`,
+      after_png: `/demo/image${index}_after.png`,
+      width: img?.width,
+      height: img?.height,
+      mip_levels: img ? Math.floor(Math.log2(Math.max(img.width, img.height))) + 1 : undefined,
+      format: "ETC1S",
+      settings: { format: "etc1s", quality: 128, max_size: 0, generate_mips: true },
     };
   }
 
@@ -555,6 +642,40 @@ export class Bridge {
     return normalizeImages(parseMaybeJson(await this.raw("textures", [path])));
   }
 
+  /**
+   * Renders one image of the asset to a PNG. New hosts answer
+   * `{ started: true }` and report through `texturePreviewDone`; older hosts
+   * may reply with the payload directly (the tab handles both).
+   */
+  async texturePreview(path: string, index: number): Promise<PreviewInvocation> {
+    if (!this.live) {
+      return { started: false, result: await this.demo.texturePreview(path, index) };
+    }
+    if (!this.native?.methods.includes("texturePreview")) {
+      throw new Error("backend has no texturePreview()");
+    }
+    const res = parseMaybeJson<Record<string, unknown>>(
+      await this.raw("texturePreview", [path, index]),
+    );
+    if (isStartedAck(res)) return { started: true };
+    const event = normalizePreviewDone({ ...res, ok: true });
+    if (!event.ok) throw new Error(event.error);
+    return { started: false, result: event.result };
+  }
+
+  /** Reads a PNG off disk and wraps it as a data URL (null when unavailable). */
+  async pngDataUrl(path: string): Promise<string | null> {
+    if (!path) return null;
+    if (!this.live) return demo.demoPngDataUrl(path);
+    try {
+      const b64 = await this.loadBytes(path);
+      const clean = b64.replace(/\s+/g, "");
+      return clean ? `data:image/png;base64,${clean}` : null;
+    } catch {
+      return null;
+    }
+  }
+
   async textureEncode(path: string, index: number): Promise<EncodeInvocation> {
     if (!this.live) {
       return { started: false, result: await this.demo.textureEncode(path, index) };
@@ -563,14 +684,9 @@ export class Bridge {
       await this.raw("textureEncode", [path, index]),
     );
     if (isStartedAck(res)) return { started: true };
-    return {
-      started: false,
-      result: {
-        ktx2_size: asNumber(res.ktx2_size ?? res.size),
-        psnr: asNumber(res.psnr),
-        vram_after: asNumber(res.vram_after ?? res.vram),
-      },
-    };
+    const payload =
+      res.result && typeof res.result === "object" ? (res.result as Record<string, unknown>) : res;
+    return { started: false, result: normalizeEncodeResult(payload) };
   }
 
   async diff(a: string, b: string): Promise<DiffReport> {
@@ -636,6 +752,11 @@ export class Bridge {
   /** Final result of a background `textureEncode()` run. */
   onTextureEncodeDone(cb: (event: TextureEncodeDoneEvent) => void): () => void {
     return this.on("textureEncodeDone", (payload) => cb(normalizeEncodeDone(payload)));
+  }
+
+  /** One decoded image for the texture preview pane. */
+  onTexturePreviewDone(cb: (event: TexturePreviewDoneEvent) => void): () => void {
+    return this.on("texturePreviewDone", (payload) => cb(normalizePreviewDone(payload)));
   }
 
   /** Subscribe to a backend event ("progress" | "log"). Returns an unsubscribe fn. */

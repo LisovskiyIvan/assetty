@@ -9,10 +9,11 @@
 //! # Long jobs
 //!
 //! Bound methods run on the main thread, so anything that takes seconds
-//! (basisu, meshopt) would freeze the webview. `optimize`, `optimizeCustom`
-//! and `textureEncode` therefore only validate their arguments, hand the work
-//! to a worker thread and answer `{"started":true}`; the result arrives as the
-//! `optimizeDone` / `textureEncodeDone` event. See "background jobs" below.
+//! (basisu, meshopt) would freeze the webview. `optimize`, `optimizeCustom`,
+//! `textureEncode` and `texturePreview` therefore only validate their
+//! arguments, hand the work to a worker thread and answer `{"started":true}`;
+//! the result arrives as the `optimizeDone` / `textureEncodeDone` /
+//! `texturePreviewDone` event. See "background jobs" below.
 const std = @import("std");
 const core = @import("core");
 const nanoui = @import("nanoui");
@@ -22,12 +23,34 @@ const events = @import("events.zig");
 const max_load_bytes: usize = 512 * 1024 * 1024;
 const max_text_bytes: usize = 1 << 20;
 
+/// Allocator for everything a background job owns across threads: the `Job`
+/// struct, its path/preset copies, the per-run arena (weld keys, decoded
+/// pixels), report buffers and the messages posted to the main thread.
+///
+/// `init.gpa` is the debug `std.heap.SafeAllocator` (leak-checking), and a job
+/// is deliberately *not* waited for at exit: the detached worker can still be
+/// halfway through a basisu encode while the process is already tearing down,
+/// so every allocation it holds at that moment would be reported as a leak.
+/// `c_allocator` is thread-safe, has no leak checker and needs no teardown
+/// ordering, which is exactly what a fire-and-forget worker wants.
+const job_gpa: std.mem.Allocator = std.heap.c_allocator;
+
+/// Longest side of the PNG a `texturePreview` event carries. The IPC message
+/// is a single JS string (base64 PNG); 1024 keeps it around a megabyte even
+/// for photos, which is what the preview pane shows anyway.
+const preview_max_dim: u32 = 1024;
+
+/// Where the app drops its outputs, relative to the working directory.
+const out_dir = ".zig-cache/assetty-app";
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// The background run in flight, if any: `optimize`/`optimizeCustom` and
     /// `textureEncode` share this one gate.
     job: ?*Job = null,
+    /// previews gate separately from pipeline jobs
+    preview_job: ?*Job = null,
     job_lock: Gate = .{},
     /// Test seam: receives a finished job instead of the main-thread queue.
     on_job_done: ?*const fn (ctx: ?*anyopaque, job: *Job) void = null,
@@ -42,6 +65,7 @@ pub const Backend = struct {
         .optimizeCustom = .{ "path", "spec" },
         .textures = .{"path"},
         .textureEncode = .{ "path", "index" },
+        .texturePreview = .{ "path", "index" },
         .diff = .{ "a", "b" },
         .lint = .{ "path", "budgetJson" },
         .presetLoad = .{"name"},
@@ -112,10 +136,22 @@ pub const Backend = struct {
 
     /// Encodes image `index` to KTX2 in the background: answers
     /// `{"started":true}` at once, then `textureEncodeDone` with the size, the
-    /// PSNR and the VRAM it now needs.
+    /// PSNR, the VRAM it now needs and paths to the before/after PNGs.
     pub fn textureEncode(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
         return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index);
+    }
+
+    /// Renders image `index` as a PNG the page can show: answers
+    /// `{"started":true}` at once, then `texturePreviewDone` with
+    /// `{"ok":true,"index":N,"b64":"<base64 PNG>","width":W,"height":H}`.
+    ///
+    /// Async like `textureEncode`: decode (stb/basisu) plus PNG encode of a
+    /// 2K texture is seconds, not milliseconds, so it must not run on the main
+    /// thread.
+    pub fn texturePreview(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
+        if (self.previewBusy()) return json.errorRaw(call.arena, "busy", .{});
+        return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index);
     }
 
     // ---- report -----------------------------------------------------------
@@ -294,9 +330,9 @@ pub const Backend = struct {
         sinks: Sinks,
     ) PipelineOutcome {
         const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
-        const out_path = std.fmt.allocPrint(a, ".zig-cache/assetty-app/opt_{d}.glb", .{nanos}) catch
+        const out_path = std.fmt.allocPrint(a, "{s}/opt_{d}.glb", .{ out_dir, nanos }) catch
             return .out_of_memory;
-        std.Io.Dir.cwd().createDirPath(self.io, ".zig-cache/assetty-app") catch |err| {
+        std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |err| {
             const msg = std.fmt.allocPrint(a, "out dir: {s}", .{@errorName(err)}) catch return .out_of_memory;
             sinks.logFmt("optimize failed: {s}", .{msg});
             return .{ .failed = msg };
@@ -430,7 +466,8 @@ pub const Backend = struct {
         p: ?core.preset.Preset,
         index: u32,
     ) !json.Raw {
-        if (self.busy()) return json.errorRaw(a, "busy", .{});
+        if (self.busy() and kind != .texture_preview) return json.errorRaw(a, "busy", .{});
+        if (kind == .texture_preview and self.previewBusy()) return json.errorRaw(a, "busy", .{});
         // Cheap readability check now, so a mistyped path is an immediate
         // `{"error":..}` instead of an event a second later.
         _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
@@ -443,12 +480,18 @@ pub const Backend = struct {
         return json.raw(started_reply);
     }
 
-    /// One job at a time: true while a worker (or its undelivered result)
-    /// holds the gate.
+    /// One job at a time per gate: pipeline jobs (optimize/encode) and
+    /// previews gate separately — a slow preview must not block a run.
     fn busy(self: *Backend) bool {
         self.job_lock.lock();
         defer self.job_lock.unlock();
         return self.job != null;
+    }
+
+    fn previewBusy(self: *Backend) bool {
+        self.job_lock.lock();
+        defer self.job_lock.unlock();
+        return self.preview_job != null;
     }
 
     fn spawn(
@@ -461,9 +504,13 @@ pub const Backend = struct {
     ) SpawnError!*Job {
         self.job_lock.lock();
         defer self.job_lock.unlock();
-        if (self.job != null) return error.Busy;
+        const is_preview = kind == .texture_preview;
+        const slot = if (is_preview) &self.preview_job else &self.job;
+        if (slot.* != null) return error.Busy;
 
-        const gpa = self.gpa;
+        // `job_gpa`, not `self.gpa`: this struct and everything it deep-copies
+        // outlives the call and may outlive the process's leak checker.
+        const gpa = job_gpa;
         const path_copy = try gpa.dupe(u8, path);
         errdefer gpa.free(path_copy);
         const preset_copy: ?core.preset.Preset = if (p) |preset| try clonePreset(gpa, preset) else null;
@@ -486,9 +533,9 @@ pub const Backend = struct {
 
         // The gate is closed before the worker exists: a job that finishes
         // immediately must still find (and clear) its own entry.
-        self.job = job;
+        slot.* = job;
         const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
-            self.job = null;
+            slot.* = null;
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.SpawnFailed,
@@ -505,7 +552,12 @@ pub const Backend = struct {
     fn releaseJob(self: *Backend, job: *Job) void {
         self.job_lock.lock();
         defer self.job_lock.unlock();
-        if (self.job == job) self.job = null;
+        // preview jobs have their own gate: they must not block a pipeline run
+        if (job.kind == .texture_preview) {
+            if (self.preview_job == job) self.preview_job = null;
+        } else {
+            if (self.job == job) self.job = null;
+        }
     }
 
     /// Worker thread: runs the delivery, which hops to the main thread.
@@ -525,7 +577,7 @@ pub const Backend = struct {
 /// The `{"started":true}` reply of every background method.
 const started_reply = "{\"started\":true}";
 
-const JobKind = enum { optimize, texture_encode };
+const JobKind = enum { optimize, texture_encode, texture_preview };
 
 /// Guards `Backend.job`. Critical sections are a pointer compare, so a spin
 /// lock is plenty (and `std.Io.Mutex` would need an `Io` in a `.c` callback).
@@ -641,7 +693,8 @@ fn specPresetOrMessage(a: std.mem.Allocator, spec: []const u8) Resolved {
 /// everything else, writes `result` (or the message in `err_buf`) and posts.
 const Job = struct {
     backend: *Backend,
-    /// `init.gpa`: thread-safe, so the worker allocates and frees it itself.
+    /// `job_gpa` (`c_allocator`): thread-safe and leak-checker-free, because
+    /// the worker allocates and frees across threads and may outlive main.
     gpa: std.mem.Allocator,
     io: std.Io,
     kind: JobKind,
@@ -662,6 +715,8 @@ const Job = struct {
         optimize: struct { out_path: []u8, report: []u8 },
         /// The numbers `textureEncodeDone` carries.
         texture: Encoded,
+        /// The base64 PNG `texturePreviewDone` carries.
+        preview: Preview,
     };
 
     /// Thread entry.
@@ -669,6 +724,7 @@ const Job = struct {
         switch (self.kind) {
             .optimize => self.runOptimize(),
             .texture_encode => self.runTextureEncode(),
+            .texture_preview => self.runTexturePreview(),
         }
         self.backend.deliver(self);
     }
@@ -699,8 +755,43 @@ const Job = struct {
         const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index) catch
             return self.fail("out of memory", .{});
         switch (outcome) {
-            .done => |d| self.result = .{ .texture = d },
+            // The two paths point into the arena, which dies here: the job's
+            // result must own them before that.
+            .done => |d| {
+                const owned = self.adoptEncoded(d) orelse return self.fail("out of memory", .{});
+                self.result = .{ .texture = owned };
+            },
             .skipped => self.fail("image {d} is not encodable (external or unsupported format)", .{self.index}),
+            .failed => |msg| self.fail("{s}", .{msg}),
+        }
+    }
+
+    /// Copies an arena-owned `Encoded` into `gpa`. Null on OOM.
+    fn adoptEncoded(self: *Job, d: Encoded) ?Encoded {
+        var out = d;
+        out.before_png = self.gpa.dupe(u8, d.before_png) catch return null;
+        out.after_png = self.gpa.dupe(u8, d.after_png) catch {
+            self.gpa.free(out.before_png);
+            return null;
+        };
+        return out;
+    }
+
+    fn runTexturePreview(self: *Job) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const outcome = previewTexture(self.io, arena.allocator(), self.path, self.index) catch
+            return self.fail("out of memory", .{});
+        switch (outcome) {
+            .done => |p| {
+                const b64 = self.gpa.dupe(u8, p.b64) catch return self.fail("out of memory", .{});
+                self.result = .{ .preview = .{
+                    .index = p.index,
+                    .b64 = b64,
+                    .width = p.width,
+                    .height = p.height,
+                } };
+            },
             .failed => |msg| self.fail("{s}", .{msg}),
         }
     }
@@ -773,7 +864,11 @@ const Job = struct {
                 gpa.free(o.out_path);
                 gpa.free(o.report);
             },
-            .texture => {},
+            .texture => |t| {
+                gpa.free(t.before_png);
+                gpa.free(t.after_png);
+            },
+            .preview => |p| gpa.free(p.b64),
         };
         gpa.destroy(self);
     }
@@ -845,6 +940,25 @@ fn delivered(ctx: ?*anyopaque) callconv(.c) void {
                 .ktx2_size = t.ktx2_size,
                 .psnr = t.psnr,
                 .vram_after = t.vram_after,
+                .before_png = t.before_png,
+                .after_png = t.after_png,
+                .width = t.width,
+                .height = t.height,
+                .mip_levels = t.mip_levels,
+                .format = t.format_label,
+                .settings = .{
+                    .format = if (t.mode == .uastc) "uastc" else "etc1s",
+                    .quality = t.quality,
+                    .max_size = t.max_size,
+                    .generate_mips = t.generate_mips,
+                },
+            }),
+            .preview => |p| events.TexturePreviewDone.emit(window, .{
+                .ok = true,
+                .index = p.index,
+                .b64 = p.b64,
+                .width = p.width,
+                .height = p.height,
             }),
         }
     } else {
@@ -862,6 +976,11 @@ fn emitFailure(job: *Job, window: *nanoui.Window) void {
             .ok = false,
             .index = job.index,
             .@"error" = if (job.err_len > 0) job.err() else "encode failed",
+        }),
+        .texture_preview => events.TexturePreviewDone.emit(window, .{
+            .ok = false,
+            .index = job.index,
+            .@"error" = if (job.err_len > 0) job.err() else "preview failed",
         }),
     }
 }
@@ -905,11 +1024,33 @@ const EncodeOutcome = union(enum) {
     failed: []const u8,
 };
 
-/// What `textureEncodeDone` reports: the encoded size, the quality and the
-/// VRAM the texture needs afterwards.
-const Encoded = struct { index: u32, ktx2_size: u64, psnr: f32, vram_after: u64 };
+/// What `textureEncodeDone` reports: the encoded size and quality numbers plus
+/// the before/after PNGs the page shows side by side.
+///
+/// `before_png`/`after_png` point at bytes; coming out of `encodeTexture` they
+/// are arena-owned, `Job.adoptEncoded` moves them to the job's allocator.
+const Encoded = struct {
+    index: u32,
+    ktx2_size: u64,
+    psnr: f32,
+    vram_after: u64,
+    before_png: []const u8,
+    after_png: []const u8,
+    /// Source dimensions (what `before_png` shows).
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    /// "ETC1S" / "UASTC" / ... (static, never freed).
+    format_label: []const u8,
+    /// Settings actually used; also echoed in the event payload.
+    mode: core.encode_ktx.Mode,
+    quality: u8,
+    max_size: u32,
+    generate_mips: bool,
+};
 
-/// Load `path`, encode image `index` to KTX2, measure it.
+/// Load `path`, encode image `index` to KTX2, measure it and write the
+/// before/after PNGs.
 fn encodeTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32) error{OutOfMemory}!EncodeOutcome {
     var loaded = core.parse.loadFile(io, a, path) catch |err|
         return .{ .failed = try std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) };
@@ -922,12 +1063,90 @@ fn encodeTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32)
         else => return .{ .failed = try std.fmt.allocPrint(a, "encode {d}: {s}", .{ index, @errorName(err) }) },
     };
     const e = enc orelse return .skipped;
+
+    const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
+    const before_png = writePngFile(io, a, "before", nanos, e.before) catch |err|
+        return .{ .failed = try std.fmt.allocPrint(a, "write before png: {s}", .{@errorName(err)}) };
+    const after_png = writePngFile(io, a, "after", nanos, e.after) catch |err|
+        return .{ .failed = try std.fmt.allocPrint(a, "write after png: {s}", .{@errorName(err)}) };
+
     return .{ .done = .{
-        .index = e.index,
-        .ktx2_size = e.ktx2_bytes,
-        .psnr = e.psnr_db,
-        .vram_after = e.vram_after,
+        .index = e.result.index,
+        .ktx2_size = e.result.ktx2_bytes,
+        .psnr = e.result.psnr_db,
+        .vram_after = e.result.vram_after,
+        .before_png = before_png,
+        .after_png = after_png,
+        .width = e.result.width,
+        .height = e.result.height,
+        .mip_levels = e.result.mip_levels,
+        .format_label = e.result.format_label,
+        .mode = e.mode,
+        .quality = e.quality,
+        .max_size = e.max_size,
+        .generate_mips = e.generate_mips,
     } };
+}
+
+/// Writes `<out_dir>/tex_<ts>_<tag>.png` and returns the absolute path (the
+/// page loads it through the `nanoui://` scheme, which wants a real path).
+fn writePngFile(
+    io: std.Io,
+    a: std.mem.Allocator,
+    tag: []const u8,
+    nanos: u64,
+    px: Pixels,
+) ![]const u8 {
+    std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
+    const rel = try std.fmt.allocPrint(a, "{s}/tex_{d}_{s}.png", .{ out_dir, nanos, tag });
+    const png = try core.decode.encodePngRgba(a, px.rgba, px.width, px.height);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rel, .data = png });
+    return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a);
+}
+
+// ---- texture preview ------------------------------------------------------
+
+const PreviewOutcome = union(enum) {
+    done: Preview,
+    /// Human-readable reason (arena-owned).
+    failed: []const u8,
+};
+
+/// What `texturePreviewDone` reports: a base64 PNG the page can show.
+const Preview = struct { index: u32, b64: []const u8, width: u32, height: u32 };
+
+/// Load `path`, decode image `index` (stb for png/jpeg, basisu for ktx2),
+/// downscale to `preview_max_dim` and return it as base64 PNG.
+fn previewTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32) error{OutOfMemory}!PreviewOutcome {
+    var loaded = core.parse.loadFile(io, a, path) catch |err|
+        return .{ .failed = try std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) };
+    defer loaded.deinit();
+    if (index >= loaded.asset.images.len)
+        return .{ .failed = try std.fmt.allocPrint(a, "image {d} out of range ({d} images)", .{ index, loaded.asset.images.len }) };
+
+    const img = loaded.asset.images[index];
+    const bytes = img.data orelse
+        return .{ .failed = try std.fmt.allocPrint(a, "image {d} has no embedded bytes (external uri)", .{index}) };
+
+    const px: Pixels = if (img.has_ktx2) blk: {
+        const rt = core.encode_ktx.decodeToRgba(a, bytes) catch
+            return .{ .failed = try std.fmt.allocPrint(a, "decode ktx2 {d}: unsupported or corrupt", .{index}) };
+        break :blk .{ .rgba = rt.pixels, .width = rt.width, .height = rt.height };
+    } else blk: {
+        const dec = core.decode.decodeRgba(a, bytes) orelse
+            return .{ .failed = try std.fmt.allocPrint(a, "decode image {d}: unsupported format", .{index}) };
+        break :blk .{ .rgba = dec.pixels, .width = dec.width, .height = dec.height };
+    };
+
+    // The IPC carries one JS string: keep the PNG around a megabyte.
+    const small = core.mips.fitMaxSize(a, px.rgba, px.width, px.height, preview_max_dim) catch
+        return .{ .failed = try std.fmt.allocPrint(a, "downscale image {d}: invalid pixels", .{index}) };
+    const png = core.decode.encodePngRgba(a, small.pixels, small.w, small.h) catch
+        return .{ .failed = try std.fmt.allocPrint(a, "encode png {d}: invalid pixels", .{index}) };
+
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+    _ = std.base64.standard.Encoder.encode(b64, png);
+    return .{ .done = .{ .index = index, .b64 = b64, .width = small.w, .height = small.h } };
 }
 
 /// `{"path":"<abs>"}` or `{"path":null}`: the `openDialog` reply.
@@ -1205,9 +1424,27 @@ fn mipLevelsFor(w: u32, h: u32) u32 {
     return @as(u32, 32 - @clz(m)) + 1;
 }
 
+/// RGBA8 pixels plus their dimensions. Arena-owned in `encodeImage`.
+const Pixels = struct { rgba: []const u8, width: u32, height: u32 };
+
+/// What `encodeImage` hands back: the report numbers plus both pixel buffers,
+/// so the caller can write the before/after PNGs.
+const EncodedPixels = struct {
+    result: json.EncodeResult,
+    /// Source RGBA.
+    before: Pixels,
+    /// RGBA decoded back from the KTX2 (same dimensions unless max_size
+    /// downscaled the encode).
+    after: Pixels,
+    mode: core.encode_ktx.Mode,
+    quality: u8,
+    max_size: u32,
+    generate_mips: bool,
+};
+
 /// Decode image `idx` to RGBA, encode to KTX2, decode back, measure PSNR.
 /// Null when the image is not decodable (external/unsupported).
-fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?json.EncodeResult {
+fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?EncodedPixels {
     const bytes = img.data orelse return null;
     const dec = core.decode.decodeRgba(a, bytes) orelse return null;
 
@@ -1221,21 +1458,29 @@ fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?json.Enc
     const levels = mipLevelsFor(dec.width, dec.height);
     const vram_before = core.formats.mipChainBytes(dec.width, dec.height, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
     return .{
-        .index = idx,
-        .name = img.name,
-        .width = dec.width,
-        .height = dec.height,
+        .result = .{
+            .index = idx,
+            .name = img.name,
+            .width = dec.width,
+            .height = dec.height,
+            .mode = opts.mode,
+            .quality = opts.quality,
+            .srgb = opts.srgb,
+            .normal_map = is_normal,
+            .src_disk_bytes = img.disk_bytes,
+            .ktx2_bytes = out.ktx2.len,
+            .format_label = out.format_label,
+            .mip_levels = out.mip_levels,
+            .vram_before = vram_before,
+            .vram_after = out.ktx2.len,
+            .psnr_db = core.encode_ktx.psnr(dec.pixels, rt.pixels),
+        },
+        .before = .{ .rgba = dec.pixels, .width = dec.width, .height = dec.height },
+        .after = .{ .rgba = rt.pixels, .width = rt.width, .height = rt.height },
         .mode = opts.mode,
         .quality = opts.quality,
-        .srgb = opts.srgb,
-        .normal_map = is_normal,
-        .src_disk_bytes = img.disk_bytes,
-        .ktx2_bytes = out.ktx2.len,
-        .format_label = out.format_label,
-        .mip_levels = out.mip_levels,
-        .vram_before = vram_before,
-        .vram_after = out.ktx2.len,
-        .psnr_db = core.encode_ktx.psnr(dec.pixels, rt.pixels),
+        .max_size = opts.max_size,
+        .generate_mips = opts.generate_mips,
     };
 }
 
@@ -1563,7 +1808,7 @@ const Collector = struct {
         self.ok = job.result != null;
         if (job.result) |res| switch (res) {
             .optimize => |o| self.report = testing.allocator.dupe(u8, o.report) catch null,
-            .texture => {},
+            .texture, .preview => {},
         };
         self.mutex.unlock();
         job.backend.releaseJob(job);
@@ -1609,6 +1854,25 @@ test "optimizeCustom runs on a worker and delivers the report" {
     try testing.expect(std.mem.indexOf(u8, report, "\"output\": \".zig-cache/assetty-app/opt_") != null);
 }
 
+test "texturePreview runs on a worker and delivers a result" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    var got: Collector = .{};
+    b.on_job_done = &Collector.collect;
+    b.on_job_done_ctx = &got;
+    defer b.on_job_done = null;
+
+    const reply = try b.launch(a, .{}, .texture_preview, "test/fixtures/box.glb", null, 0);
+    try testing.expectEqualStrings("{\"started\":true}", reply.text);
+
+    got.wait();
+    try testing.expect(got.ok);
+    try testing.expect(!b.busy());
+}
+
 test "texture encode reports an out-of-range index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1618,6 +1882,101 @@ test "texture encode reports an out-of-range index" {
         .failed => |msg| try testing.expect(std.mem.indexOf(u8, msg, "out of range") != null),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "texture encode writes before/after pngs and reports the settings" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0)) {
+        .done => |e| {
+            // Absolute paths that actually exist and are real PNGs.
+            try testing.expect(std.fs.path.isAbsolute(e.before_png));
+            try testing.expect(std.fs.path.isAbsolute(e.after_png));
+            try testing.expect(std.mem.endsWith(u8, e.before_png, "_before.png"));
+            try testing.expect(std.mem.endsWith(u8, e.after_png, "_after.png"));
+
+            for ([_][]const u8{ e.before_png, e.after_png }) |png_path| {
+                const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, png_path, a, .limited(4 << 20));
+                try testing.expectEqualSlices(
+                    u8,
+                    &[_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A },
+                    bytes[0..8],
+                );
+                const dec = core.decode.decodeRgba(a, bytes) orelse return error.TestUnexpectedResult;
+                try testing.expectEqual(e.width, dec.width);
+                try testing.expectEqual(e.height, dec.height);
+            }
+
+            // The payload echoes the settings the encoder ran with.
+            try testing.expectEqual(core.encode_ktx.Mode.etc1s, e.mode);
+            try testing.expectEqual(@as(u8, 128), e.quality);
+            try testing.expectEqual(@as(u32, 0), e.max_size);
+            try testing.expect(e.generate_mips);
+            try testing.expect(e.format_label.len > 0);
+            try testing.expect(e.mip_levels >= 1);
+            try testing.expectEqual(@as(u32, 1), e.width);
+            try testing.expectEqual(@as(u32, 1), e.height);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "texturePreview renders a fixture image as base64 png" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    switch (try previewTexture(testing.io, a, "test/fixtures/box.glb", 0)) {
+        .done => |p| {
+            try testing.expectEqual(@as(u32, 0), p.index);
+            try testing.expectEqual(@as(u32, 1), p.width);
+            try testing.expectEqual(@as(u32, 1), p.height);
+            // Base64 of the PNG signature.
+            try testing.expect(std.mem.startsWith(u8, p.b64, "iVBORw0KGgo"));
+
+            const n = try std.base64.standard.Decoder.calcSizeForSlice(p.b64);
+            const png = try a.alloc(u8, n);
+            try std.base64.standard.Decoder.decode(png, p.b64);
+            const dec = core.decode.decodeRgba(a, png) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(p.width, dec.width);
+            try testing.expectEqual(p.height, dec.height);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "texturePreview reports an out-of-range index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    switch (try previewTexture(testing.io, a, "test/fixtures/box.glb", 999)) {
+        .failed => |msg| try testing.expect(std.mem.indexOf(u8, msg, "out of range") != null),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "texturePreview downscales to the preview cap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A 2048² source is the case the cap exists for: preview_max_dim/2 halvings.
+    const src = try a.alloc(u8, @as(usize, 2048) * 2048 * 4);
+    @memset(src, 0x7F);
+    var i: usize = 3;
+    while (i < src.len) : (i += 4) src[i] = 0xFF;
+
+    const small = try core.mips.fitMaxSize(a, src, 2048, 2048, preview_max_dim);
+    try testing.expectEqual(@as(u32, preview_max_dim), small.w);
+    try testing.expectEqual(@as(u32, preview_max_dim), small.h);
+
+    // ...and the PNG of that is a few hundred KB, not tens of MB.
+    const png = try core.decode.encodePngRgba(a, small.pixels, small.w, small.h);
+    const b64_len = std.base64.standard.Encoder.calcSize(png.len);
+    try testing.expect(b64_len < 8 << 20);
 }
 
 test "done event payloads carry the documented shapes" {
@@ -1645,9 +2004,19 @@ test "done event payloads carry the documented shapes" {
         .ktx2_size = 1024,
         .psnr = 41.5,
         .vram_after = 2048,
+        .before_png = "/tmp/tex_1_before.png",
+        .after_png = "/tmp/tex_1_after.png",
+        .width = 512,
+        .height = 256,
+        .mip_levels = 10,
+        .format = "ETC1S",
+        .settings = .{ .format = "etc1s", .quality = 128, .max_size = 0, .generate_mips = true },
     }, .{}, &tex_w);
     try testing.expectEqualStrings(
-        "{\"ok\":true,\"index\":2,\"ktx2_size\":1024,\"psnr\":41.50,\"vram_after\":2048}",
+        "{\"ok\":true,\"index\":2,\"ktx2_size\":1024,\"psnr\":41.50,\"vram_after\":2048," ++
+            "\"before_png\":\"/tmp/tex_1_before.png\",\"after_png\":\"/tmp/tex_1_after.png\"," ++
+            "\"width\":512,\"height\":256,\"mip_levels\":10,\"format\":\"ETC1S\"," ++
+            "\"settings\":{\"format\":\"etc1s\",\"quality\":128,\"max_size\":0,\"generate_mips\":true}}",
         tex_w.buffered(),
     );
 
@@ -1660,5 +2029,29 @@ test "done event payloads carry the documented shapes" {
     try testing.expectEqualStrings(
         "{\"ok\":false,\"index\":3,\"error\":\"image 3 out of range\"}",
         tex_err_w.buffered(),
+    );
+
+    var prev_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.TexturePreviewDonePayload{
+        .ok = true,
+        .index = 1,
+        .b64 = "iVBORw0KGgo",
+        .width = 64,
+        .height = 32,
+    }, .{}, &prev_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":true,\"index\":1,\"b64\":\"iVBORw0KGgo\",\"width\":64,\"height\":32}",
+        prev_w.buffered(),
+    );
+
+    var prev_err_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.TexturePreviewDonePayload{
+        .ok = false,
+        .index = 4,
+        .@"error" = "decode image 4: unsupported format",
+    }, .{}, &prev_err_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":false,\"index\":4,\"error\":\"decode image 4: unsupported format\"}",
+        prev_err_w.buffered(),
     );
 }

@@ -55,6 +55,39 @@ export function fmtNum(n: number | undefined | null): string {
   return n.toLocaleString("en-US");
 }
 
+/** Compact integer for the status bar: 948, 15.4K, 1.2M. */
+export function fmtCompact(n: number | undefined | null): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  const trim = (v: number, unit: string) => `${v.toFixed(1).replace(/\.0$/, "")}${unit}`;
+  if (abs >= 1e9) return trim(n / 1e9, "G");
+  if (abs >= 1e6) return trim(n / 1e6, "M");
+  if (abs >= 1e4) return trim(n / 1e3, "K");
+  return String(Math.round(n));
+}
+
+export interface StatChip {
+  el: HTMLElement;
+  value: HTMLElement;
+}
+
+/** Labeled `LABEL value` pair used by the status bar and the texture compare row. */
+export function statChip(label: string, initial = "—", extraClass = ""): StatChip {
+  const value = el("span", { class: "v", text: initial });
+  const node = el(
+    "span",
+    { class: `stat-chip${extraClass ? ` ${extraClass}` : ""}` },
+    el("span", { class: "k", text: label }),
+    value,
+  );
+  return { el: node, value };
+}
+
+/** Same chip but with an arbitrary node (badge, link) as the value. */
+export function statChipNode(label: string, node: Node): HTMLElement {
+  return el("span", { class: "stat-chip" }, el("span", { class: "k", text: label }), node);
+}
+
 export function fmtPct(p: number | null | undefined, digits = 1): string {
   if (p == null || !Number.isFinite(p)) return "—";
   const sign = p > 0 ? "+" : "";

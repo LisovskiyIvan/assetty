@@ -43,23 +43,63 @@ pub const OptimizeDonePayload = struct {
 pub const OptimizeDone = nanoui.Event("optimizeDone", OptimizeDonePayload);
 
 /// A background `textureEncode` finished: `{"ok":true,"index":N,
-/// "ktx2_size":..,"psnr":..,"vram_after":..}` or `{"ok":false,"index":N,
+/// "ktx2_size":..,"psnr":..,"vram_after":..,"before_png":"<abs>.png",
+/// "after_png":"<abs>.png","width":W,"height":H,"mip_levels":N,
+/// "format":"ETC1S","settings":{"format":"etc1s","quality":128,
+/// "max_size":0,"generate_mips":true}}` or `{"ok":false,"index":N,
 /// "error":".."}`.
+///
+/// `before_png`/`after_png` are the source pixels and the pixels decoded back
+/// from the KTX2, both full resolution, written next to `opt_*.glb` in
+/// `.zig-cache/assetty-app/`; `width`/`height` are the source dimensions.
 pub const TextureEncodeDonePayload = struct {
     ok: bool,
     index: u32,
     ktx2_size: u64 = 0,
     psnr: f32 = 0,
     vram_after: u64 = 0,
+    before_png: ?[]const u8 = null,
+    after_png: ?[]const u8 = null,
+    width: u32 = 0,
+    height: u32 = 0,
+    mip_levels: u32 = 0,
+    /// `out.format_label` from basisu: "ETC1S", "UASTC", "BC7", ...
+    format: ?[]const u8 = null,
+    /// The settings the encoder actually ran with.
+    settings: Settings = .{},
     @"error": ?[]const u8 = null,
+
+    pub const Settings = struct {
+        /// "etc1s" or "uastc".
+        format: []const u8 = "etc1s",
+        quality: u8 = 0,
+        /// 0 = keep the source size.
+        max_size: u32 = 0,
+        generate_mips: bool = false,
+    };
 
     pub fn jsonStringify(self: TextureEncodeDonePayload, jws: anytype) !void {
         const w = jws.writer;
         if (self.ok) {
             try w.print(
-                "{{\"ok\":true,\"index\":{d},\"ktx2_size\":{d},\"psnr\":{d:.2},\"vram_after\":{d}}}",
+                "{{\"ok\":true,\"index\":{d},\"ktx2_size\":{d},\"psnr\":{d:.2},\"vram_after\":{d},\"before_png\":",
                 .{ self.index, self.ktx2_size, self.psnr, self.vram_after },
             );
+            try json.jsonStrOpt(w, self.before_png);
+            try w.writeAll(",\"after_png\":");
+            try json.jsonStrOpt(w, self.after_png);
+            try w.print(",\"width\":{d},\"height\":{d},\"mip_levels\":{d},\"format\":", .{
+                self.width, self.height, self.mip_levels,
+            });
+            try json.jsonStr(w, self.format orelse "");
+            try w.writeAll(",\"settings\":{\"format\":");
+            try json.jsonStr(w, self.settings.format);
+            try w.print(",\"quality\":{d},\"max_size\":{d},\"generate_mips\":{s}", .{
+                self.settings.quality,
+                self.settings.max_size,
+                if (self.settings.generate_mips) "true" else "false",
+            });
+            try w.writeAll("}}"); // close settings, close payload
         } else {
             try w.print("{{\"ok\":false,\"index\":{d},\"error\":", .{self.index});
             try json.jsonStr(w, self.@"error" orelse "encode failed");
@@ -68,3 +108,30 @@ pub const TextureEncodeDonePayload = struct {
     }
 };
 pub const TextureEncodeDone = nanoui.Event("textureEncodeDone", TextureEncodeDonePayload);
+
+/// A background `texturePreview` finished: `{"ok":true,"index":N,
+/// "b64":"<base64 PNG>","width":W,"height":H}` or `{"ok":false,"index":N,
+/// "error":".."}`. The preview is downscaled so the long side is at most
+/// `backend.preview_max_dim` (1024) to keep the IPC message small.
+pub const TexturePreviewDonePayload = struct {
+    ok: bool,
+    index: u32,
+    b64: ?[]const u8 = null,
+    width: u32 = 0,
+    height: u32 = 0,
+    @"error": ?[]const u8 = null,
+
+    pub fn jsonStringify(self: TexturePreviewDonePayload, jws: anytype) !void {
+        const w = jws.writer;
+        if (self.ok) {
+            try w.print("{{\"ok\":true,\"index\":{d},\"b64\":", .{self.index});
+            try json.jsonStr(w, self.b64 orelse "");
+            try w.print(",\"width\":{d},\"height\":{d}}}", .{ self.width, self.height });
+        } else {
+            try w.print("{{\"ok\":false,\"index\":{d},\"error\":", .{self.index});
+            try json.jsonStr(w, self.@"error" orelse "preview failed");
+            try w.writeByte('}');
+        }
+    }
+};
+pub const TexturePreviewDone = nanoui.Event("texturePreviewDone", TexturePreviewDonePayload);

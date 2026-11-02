@@ -99,10 +99,35 @@ export interface TexturesResult {
   images: ImageInfo[];
 }
 
+/** Settings the host applied during `textureEncode` (optional, newer hosts). */
+export interface EncodeSettings {
+  format?: string;
+  quality?: number;
+  max_size?: number;
+  generate_mips?: boolean;
+}
+
 export interface EncodeResult {
   ktx2_size: number;
   psnr: number;
   vram_after: number;
+  /** Absolute paths of the before/after PNG renders (newer hosts). */
+  before_png?: string;
+  after_png?: string;
+  width?: number;
+  height?: number;
+  mip_levels?: number;
+  format?: string;
+  settings?: EncodeSettings;
+}
+
+/** One decoded image for the texture preview pane. */
+export interface TexturePreview {
+  index: number;
+  /** base64 PNG, without the `data:` prefix. */
+  b64: string;
+  width: number;
+  height: number;
 }
 
 export interface DiffEntry {

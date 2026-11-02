@@ -30,16 +30,26 @@ Methods called (JSON string in / out, promises or plain values):
 | `loadBytes(path)` | path | `{ b64, size }` or bare base64 |
 | `optimize(path, preset)` | path, preset | `{ out_path, report: { steps, before, after, deltas } }` (CLI `output`/flat shape also accepted) |
 | `textures(path)` | path | `{ images: [...] }` |
-| `textureEncode(path, i)` | path, index | `{ ktx2_size, psnr, vram_after }` |
+| `texturePreview(path, i)` | path, index | `{ started: true }` → `texturePreviewDone` |
+| `textureEncode(path, i)` | path, index | `{ started: true }` → `textureEncodeDone` (legacy hosts may still return the encode result directly) |
 | `diff(a, b)` | paths | diff report (`nodes`/`meshes`/… categories) |
 | `lint(path, budgetJson)` | path, JSON text | `{ violations, total }` (array of per-file results also accepted) |
 | `presets()` | — | `["desktop", …]` |
 | `presetLoad(name)` | name | zon text |
 | `presetSave(name, zon)` | name, text | anything |
 
-Events: `progress` (`{ step, pct }`) and `log` (`{ line }`). Subscribed via
-`backend.on(event, cb)` / `addEventListener` / `subscribe`, falling back to DOM
-events `nanoui:<event>` and `<event>`.
+Events:
+
+- `progress` `{ step, pct }`, `log` `{ line }`
+- `optimizeDone` `{ ok, out_path, report }`
+- `texturePreviewDone` `{ ok, index, b64, width, height }`
+- `textureEncodeDone` `{ ok, index, ktx2_size, psnr, vram_after, before_png, after_png,
+  width, height, mip_levels, format, settings: { format, quality, max_size, generate_mips } }`
+
+Subscribed via `backend.on(event, cb)` / `addEventListener` / `subscribe`, falling
+back to DOM events `nanoui:<event>` and `<event>`. `texturePreview` and
+`textureEncode` are feature-detected: a host without them still lists images and
+shows a toast instead of breaking the tab.
 
 If nothing is found the UI runs in demo mode: banner, static fixtures, backend
 actions disabled.

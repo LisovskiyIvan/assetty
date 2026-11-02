@@ -55,6 +55,45 @@ pub fn decodeRgba(gpa: std.mem.Allocator, bytes: []const u8) ?Decoded {
     return .{ .width = @intCast(w), .height = @intCast(h), .pixels = pixels };
 }
 
+// ---- PNG encode -----------------------------------------------------------
+
+pub const EncodeError = error{InvalidImage} || std.mem.Allocator.Error;
+
+extern fn basset_png_encode(
+    rgba: [*]const u8,
+    w: c_int,
+    h: c_int,
+    comp: c_int,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int;
+extern fn basset_png_free(p: [*]u8) void;
+
+/// Encode `w*h` RGBA8 pixels to a PNG memory buffer owned by `gpa`.
+/// The stb buffer is freed here, so the caller only ever sees a Zig slice.
+pub fn encodePngRgba(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) EncodeError![]u8 {
+    if (w == 0 or h == 0) return error.InvalidImage;
+    const need = @as(usize, w) * h * 4;
+    if (rgba.len < need) return error.InvalidImage;
+
+    var c_out: ?[*]u8 = null;
+    var c_len: usize = 0;
+    if (basset_png_encode(
+        rgba.ptr,
+        @intCast(w),
+        @intCast(h),
+        4,
+        &c_out,
+        &c_len,
+    ) == 0) return error.InvalidImage;
+    const raw = c_out orelse return error.InvalidImage;
+    defer basset_png_free(raw);
+
+    const png = try gpa.alloc(u8, c_len);
+    @memcpy(png, raw[0..c_len]);
+    return png;
+}
+
 test "infoFromMemory invalid" {
     try std.testing.expect(infoFromMemory("nope") == null);
 }
@@ -73,4 +112,39 @@ test "decodeRgba 1x1" {
     defer dec.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 1), dec.width);
     try std.testing.expectEqual(@as(u32, 4), dec.pixels.len);
+}
+
+test "encodePngRgba 2x2 round-trips through decodeRgba" {
+    const gpa = std.testing.allocator;
+    const src = [_]u8{
+        255, 0, 0, 255, // red
+        0, 255, 0, 128, // green, half alpha
+        0, 0, 255, 255, // blue
+        17, 34, 51, 255, // dark grey
+    };
+
+    const png = try encodePngRgba(gpa, &src, 2, 2);
+    defer gpa.free(png);
+
+    // PNG signature.
+    try std.testing.expect(png.len > 8);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A }, png[0..8]);
+
+    // Header probe agrees.
+    const info = infoFromMemory(png) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 2), info.width);
+    try std.testing.expectEqual(@as(u32, 2), info.height);
+
+    // Lossless: the pixels come back byte for byte.
+    var dec = decodeRgba(gpa, png) orelse return error.TestUnexpectedResult;
+    defer dec.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), dec.width);
+    try std.testing.expectEqual(@as(u32, 2), dec.height);
+    try std.testing.expectEqualSlices(u8, &src, dec.pixels);
+}
+
+test "encodePngRgba rejects a short buffer and empty dimensions" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidImage, encodePngRgba(gpa, &.{ 1, 2, 3 }, 2, 2));
+    try std.testing.expectError(error.InvalidImage, encodePngRgba(gpa, &.{}, 0, 0));
 }
