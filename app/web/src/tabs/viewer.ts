@@ -99,6 +99,9 @@ export function mountViewer(): TabHandle {
         }
       } else {
         viewer.resume();
+        // The canvas was hidden while another tab was active; the observer's
+        // 0×0 reports were ignored, so force a re-sync now that it is visible.
+        viewer.forceResize();
       }
     },
     deactivate: () => viewer?.pause(),

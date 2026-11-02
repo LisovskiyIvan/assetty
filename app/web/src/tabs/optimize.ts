@@ -792,6 +792,12 @@ export function mountOptimize(): TabHandle {
             linked = true;
             linkCameras(left, right);
           }
+          // Headless checks need both panes (the shared hook only exposes the
+          // Viewer tab's scene).
+          const dbg = (window as unknown as Record<string, unknown>)["__assetty"] as
+            | Record<string, unknown>
+            | undefined;
+          if (dbg) dbg["panes"] = () => ({ left, right });
           if (app.pathA) void loadSource(app.pathA);
           else if (!app.bridge.live) {
             left.loadDemo();
@@ -806,6 +812,11 @@ export function mountOptimize(): TabHandle {
         left.resume();
         right?.resume();
       }
+      // The canvas was `display: none` while the tab was hidden: the observer's
+      // 0×0 notifications were (correctly) ignored, so re-sync once the pane
+      // actually has a box again.
+      left?.forceResize();
+      right?.forceResize();
       void loadPresets();
       runBtn.disabled = running || !app.bridge.live || !app.pathA;
     },

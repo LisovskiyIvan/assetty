@@ -124,6 +124,11 @@ export class ViewerScene {
     // parent misses dock-driven layout changes.
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(canvas);
+    // …and the pane: grid/flex cells can change size without the canvas box
+    // changing on the same frame (result panel appearing, dock toggling), and a
+    // hidden pane reports 0×0 which `resize()` deliberately ignores.
+    const pane = canvas.parentElement;
+    if (pane) this.resizeObserver.observe(pane);
     window.addEventListener("resize", this.resize);
   }
 
@@ -180,6 +185,27 @@ export class ViewerScene {
     const rect = this.canvas.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     this.engine.resize();
+    // While paused (hidden tab) no frame is scheduled, so the corrected
+    // drawing buffer would only show up on the next resume. Paint it now.
+    if (!this.running) this.scene.render();
+  };
+
+  /**
+   * Re-syncs the drawing buffer with the CSS box immediately and again after
+   * the next two animation frames. Panes are mounted/labelled asynchronously
+   * (result panel, inspector dock, label overlays), so the box we can measure
+   * right after a model load is often not the final one.
+   */
+  forceResize = (): void => {
+    this.resize();
+    requestAnimationFrame(() => {
+      if (this.disposed) return;
+      this.resize();
+      requestAnimationFrame(() => {
+        if (this.disposed) return;
+        this.resize();
+      });
+    });
   };
 
   private renderLoop = (): void => {
@@ -197,7 +223,7 @@ export class ViewerScene {
 
   resume(): void {
     if (this.disposed) return;
-    this.engine.resize();
+    this.resize();
     if (this.running) return;
     this.engine.runRenderLoop(this.renderLoop);
     this.running = true;
@@ -217,6 +243,7 @@ export class ViewerScene {
     container.addAllToScene();
     container.animationGroups.forEach((g) => g.stop());
     this.frameAll();
+    this.forceResize();
     this.onProgress?.(undefined as unknown as string);
     this.scheduleTextureAudit();
   }
@@ -293,6 +320,7 @@ export class ViewerScene {
     }
 
     this.frameAll();
+    this.forceResize();
   }
 
   clearScene(): void {
@@ -300,12 +328,18 @@ export class ViewerScene {
     this.scene.animationGroups.slice().forEach((g) => g.stop());
     this.scene.meshes.slice().forEach((m) => m.dispose());
     this.scene.materials.slice().forEach((m) => m.dispose());
-    // The IBL map is scene-level and survives model swaps; disposing it here
-    // would leave `environmentTexture` pointing at a dead texture and the whole
-    // scene would stop rendering (PBR materials wait for it forever).
-    const env = this.scene.environmentTexture;
+    // Scene-level textures survive model swaps. The IBL map is set explicitly;
+    // the BRDF lookup tables are created lazily by the PBR materials and cached
+    // on the scene, so disposing them leaves the scene property pointing at a
+    // dead texture that never becomes ready again: every PBR material then
+    // waits forever and the next loaded model never renders.
+    const keep = new Set<BaseTexture | null>([
+      this.scene.environmentTexture,
+      this.scene.environmentBRDFTexture,
+      this.scene.environmentFuzzBRDFTexture,
+    ]);
     this.scene.textures
-      .filter((t) => t !== env)
+      .filter((t) => !keep.has(t))
       .slice()
       .forEach((t) => t.dispose());
     this.scene.transformNodes.slice().forEach((n) => n.dispose());
@@ -315,6 +349,27 @@ export class ViewerScene {
   /** Frames the whole scene; deferred one frame so bounds reflect uploaded geometry. */
   frameAll(): void {
     this.scene.onAfterRenderObservable.addOnce(() => this.frameNow());
+  }
+
+  /**
+   * Camera state written by the last automatic framing. A camera write only
+   * fires `onViewMatrixChangedObservable` inside the next `scene.render()`, so
+   * a flag set here would already be stale by then; comparing the values
+   * instead tells a mirrored scene "this was not user input".
+   */
+  private autoFrame: { alpha: number; beta: number; radius: number; target: Vector3 } | null = null;
+
+  /** True when the camera still sits exactly where `frameNow()` left it. */
+  get isAutoFraming(): boolean {
+    const s = this.autoFrame;
+    if (!s) return false;
+    const eps = 1e-6;
+    return (
+      Math.abs(this.camera.alpha - s.alpha) < eps &&
+      Math.abs(this.camera.beta - s.beta) < eps &&
+      Math.abs(this.camera.radius - s.radius) < eps &&
+      Vector3.DistanceSquared(this.camera.target, s.target) < 1e-8
+    );
   }
 
   private frameNow(): void {
@@ -337,6 +392,12 @@ export class ViewerScene {
     this.camera.upperRadiusLimit = Math.max(20, size * 12);
     this.camera.minZ = Math.max(0.0001, size * 0.002);
     this.camera.maxZ = Math.max(100, size * 100);
+    this.autoFrame = {
+      alpha: this.camera.alpha,
+      beta: this.camera.beta,
+      radius: this.camera.radius,
+      target: this.camera.target.clone(),
+    };
   }
 
   getStats(): ViewerStats {
@@ -421,6 +482,11 @@ export function linkCameras(a: ViewerScene, b: ViewerScene): void {
   let busy = false;
   const mirror = (from: ViewerScene, to: ViewerScene) => {
     if (busy) return;
+    // Automatic framing is per-model: mirroring it would replace the other
+    // pane's (differently sized) model framing with this one's camera, which
+    // looks like a sudden zoom / stretch right after a run. User input still
+    // mirrors in both directions.
+    if (from.isAutoFraming) return;
     busy = true;
     try {
       to.applyCameraFrom(from.camera);
