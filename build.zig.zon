@@ -1,6 +1,6 @@
 .{
     .name = .assetty,
-    .fingerprint = 0x3073a2b3468a4472,
+    .fingerprint = 0xbee3cf8875db2e00,
     .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .paths = .{""},
