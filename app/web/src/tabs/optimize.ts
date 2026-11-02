@@ -14,7 +14,7 @@ import {
   emptyState,
   OPEN_HINT,
 } from "../ui";
-import { notify, onLog } from "../notify";
+import { isMissingMethodError, notify, onLog } from "../notify";
 import { ViewerScene, linkCameras } from "../viewer";
 import type { OptimizeResult, Stats } from "../types";
 import type { TabHandle } from "./types";
@@ -179,6 +179,10 @@ export function mountOptimize(): TabHandle {
   let lastResult: OptimizeResult | null = null;
   /** True while a background job owns the backend (Run stays disabled). */
   let running = false;
+  /** True while an exportTo copy is in flight (Save as… stays disabled). */
+  let exporting = false;
+  /** `dst` of the in-flight export; only the matching exportDone notifies. */
+  let pendingDst: string | null = null;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
 
@@ -244,6 +248,12 @@ export function mountOptimize(): TabHandle {
     el("div", { class: "empty", text: "run an optimization to see before/after" }),
   );
   side.append(reportPanel);
+  side.append(
+    el("div", {
+      class: "hint",
+      text: "Results are written to .zig-cache/…; the source file is never modified. Use Save as… to place a copy.",
+    }),
+  );
 
   function setProgress(step: string, pct: number): void {
     progressStep.textContent = step || "working…";
@@ -261,8 +271,60 @@ export function mountOptimize(): TabHandle {
     running = on;
     runBtn.textContent = on ? "Running…" : "Run optimize";
     runBtn.disabled = on || !app.bridge.live || !app.pathA;
-    exportBtn.disabled = on || !lastResult;
+    exportBtn.disabled = on || exporting || !lastResult;
     progressBar.classList.toggle("running", on);
+  }
+
+  function setExporting(on: boolean): void {
+    exporting = on;
+    exportBtn.textContent = on ? "Exporting…" : "Export";
+    exportBtn.disabled = running || on || !lastResult;
+  }
+
+  /** Last segment of a path (the save panel's suggested file name). */
+  function basename(path: string): string {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : path;
+  }
+
+  /**
+   * Explicit export: the pipeline always starts from the source model and
+   * writes into `.zig-cache/…` (the source is never modified) — this copies
+   * the finished file wherever the user wants it.
+   */
+  async function saveAs(outPath: string): Promise<void> {
+    if (exporting) {
+      notify("export already running — wait for it to finish", "error");
+      return;
+    }
+    let pick: { path: string | null };
+    try {
+      pick = await app.bridge.pickSavePath(basename(outPath));
+    } catch (err) {
+      notify(`save dialog failed: ${(err as Error).message}`, "error");
+      return;
+    }
+    if (!pick.path) return; // cancel
+    if (!app.bridge.live) {
+      notify("demo mode — export needs the assetty binary", "error");
+      return;
+    }
+    setExporting(true);
+    pendingDst = pick.path;
+    setLog(`exporting to ${pick.path}…`);
+    try {
+      await app.bridge.exportTo(outPath, pick.path);
+    } catch (err) {
+      pendingDst = null;
+      setExporting(false);
+      if (isBusyError(err)) {
+        notify("export already running — wait for it to finish", "error");
+      } else if (isMissingMethodError(err)) {
+        notify("export unavailable — rebuild the assetty binary", "error");
+      } else {
+        notify(`export failed: ${(err as Error).message}`, "error");
+      }
+    }
   }
 
   function stopJob(): void {
@@ -350,6 +412,16 @@ export function mountOptimize(): TabHandle {
           notify(ok ? `copied ${res.out_path}` : res.out_path, ok ? "ok" : "info");
         },
       }),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          class: "small primary",
+          text: "Save as…",
+          title: "Copy this result wherever you want it (the source model is never modified)",
+          onclick: () => void saveAs(res.out_path),
+        }),
+      ),
     );
 
     reportPanel.replaceChildren(
@@ -399,6 +471,23 @@ export function mountOptimize(): TabHandle {
     renderReport(event.result);
     void loadOptimized(event.result.out_path);
     notify("optimization finished", "ok");
+  });
+
+  // The copy this tab asked for (matched by dst so the Textures tab's exports
+  // don't double-notify here). `notify` fans out to the toast + status bar.
+  const offExport = app.bridge.onExportDone((event) => {
+    if (exporting && pendingDst != null) {
+      if (event.ok && event.dst === pendingDst) {
+        pendingDst = null;
+        setExporting(false);
+        setLog(`saved to ${event.dst}`);
+        notify(`saved to ${event.dst}`, "ok");
+      } else if (!event.ok) {
+        pendingDst = null;
+        setExporting(false);
+        notify(`export failed: ${event.error}`, "error");
+      }
+    }
   });
 
   /* --------------------------------------------------------------------- run */
@@ -513,13 +602,8 @@ export function mountOptimize(): TabHandle {
     }
   });
 
-  exportBtn.addEventListener("click", async () => {
-    if (!lastResult) return;
-    const ok = await copyText(lastResult.out_path);
-    notify(
-      ok ? `copied path: ${lastResult.out_path}` : `output: ${lastResult.out_path}`,
-      ok ? "ok" : "info",
-    );
+  exportBtn.addEventListener("click", () => {
+    if (lastResult) void saveAs(lastResult.out_path);
   });
 
   const offPath = app.on("path", (d) => {
@@ -580,6 +664,7 @@ export function mountOptimize(): TabHandle {
       offLog();
       offSettings();
       offDone();
+      offExport();
       stopJob();
       left?.dispose();
       right?.dispose();

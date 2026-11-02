@@ -8,6 +8,8 @@
  *
  * Backend methods we call (JSON strings in / out):
  *   openDialog()            -> { path } | "/abs/file.glb" | null (cancel)
+ *   pickSavePath(name)      -> { path } | "/abs/out.glb" | null (cancel)
+ *   exportTo(src, dst)      -> { started: true } — result arrives as "exportDone"
  *   info(path)              -> Info
  *   loadBytes(path)         -> { b64, size } | string (base64)
  *   optimize(path, preset)  -> { started: true } — result arrives as "optimizeDone"
@@ -30,6 +32,7 @@
  *
  * Events: "progress" { step, pct }, "log" { line },
  *         "optimizeDone" { ok: true, out_path, report } | { ok: false, error },
+ *         "exportDone" { ok: true, src, dst } | { ok: false, error },
  *         "texturePreviewDone" { ok: true, index, b64, width, height } | { ok: false, index, error },
  *         "textureEncodeDone" { ok: true, index, ktx2_size, psnr, vram_after, before_png, after_png,
  *                               width, height, mip_levels, format, settings }
@@ -75,6 +78,8 @@ export type OptimizeInvocation =
 
 export type OptimizeDoneEvent = { ok: true; result: OptimizeResult } | { ok: false; error: string };
 
+export type ExportDoneEvent = { ok: true; src: string; dst: string } | { ok: false; error: string };
+
 /** What `textureEncode()` resolves to (async on new hosts, immediate on old ones). */
 export type EncodeInvocation = { started: true } | { started: false; result: EncodeResult };
 
@@ -91,6 +96,8 @@ export type TexturePreviewDoneEvent =
 
 const METHOD_NAMES = [
   "openDialog",
+  "pickSavePath",
+  "exportTo",
   "info",
   "loadBytes",
   "optimize",
@@ -332,6 +339,13 @@ function normalizeOptimizeDone(raw: unknown): OptimizeDoneEvent {
   const payload =
     r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
   return { ok: true, result: normalizeOptimize(payload) };
+}
+
+function normalizeExportDone(raw: unknown): ExportDoneEvent {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
+  if (!ok) return { ok: false, error: String(r.error ?? "export failed") };
+  return { ok: true, src: String(r.src ?? ""), dst: String(r.dst ?? "") };
 }
 
 function normalizeEncodeDone(raw: unknown): TextureEncodeDoneEvent {
@@ -814,6 +828,41 @@ export class Bridge {
   }
 
   /**
+   * Native save panel. `name` seeds the file name field (defaults to
+   * "model.opt.glb" when omitted). Resolves `{ path }` on pick and
+   * `{ path: null }` on cancel.
+   */
+  async pickSavePath(name?: string): Promise<OpenDialogResult> {
+    if (!this.live) {
+      toast("run via assetty binary", "error");
+      return { path: null };
+    }
+    if (!this.native || !this.native.methods.includes("pickSavePath")) {
+      toast("pickSavePath not available — rebuild the assetty binary", "error");
+      return { path: null };
+    }
+    const suggestion = name?.trim() ? name : "model.opt.glb";
+    const res = parseMaybeJson<unknown>(await this.raw("pickSavePath", [suggestion]));
+    if (res == null) return { path: null };
+    if (typeof res === "string") return { path: res.trim() || null };
+    const obj = res as Record<string, unknown>;
+    const p = obj.path ?? obj.file;
+    return { path: p == null || String(p).trim() === "" ? null : String(p) };
+  }
+
+  /**
+   * Copies `src` to `dst` (missing parents created, overwrite allowed — the
+   * caller confirms). New hosts answer `{ started: true }` and report through
+   * `exportDone`; rejects when another pipeline job owns the gate.
+   */
+  async exportTo(src: string, dst: string): Promise<{ started: true }> {
+    if (!this.live) throw new Error("demo mode — export needs the assetty binary");
+    const res = parseMaybeJson<unknown>(await this.raw("exportTo", [src, dst]));
+    if (isStartedAck(res)) return { started: true };
+    throw new Error("export not acknowledged by the host");
+  }
+
+  /**
    * Final result of a background `optimize()` / `optimizeCustom()` run.
    * Fires once per job, after the call already resolved with `{ started: true }`.
    */
@@ -824,6 +873,11 @@ export class Bridge {
   /** Final result of a background `textureEncode()` run. */
   onTextureEncodeDone(cb: (event: TextureEncodeDoneEvent) => void): () => void {
     return this.on("textureEncodeDone", (payload) => cb(normalizeEncodeDone(payload)));
+  }
+
+  /** Final result of a background `exportTo()` copy. */
+  onExportDone(cb: (event: ExportDoneEvent) => void): () => void {
+    return this.on("exportDone", (payload) => cb(normalizeExportDone(payload)));
   }
 
   /** One decoded image for the texture preview pane. */

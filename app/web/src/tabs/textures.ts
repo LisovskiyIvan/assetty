@@ -695,6 +695,9 @@ export function mountTextures(): TabHandle {
   let applySeq = 0;
   let applyTimer: ReturnType<typeof setTimeout> | null = null;
   let stopApplyProgress: (() => void) | null = null;
+  /** True while an exportTo copy is in flight; `pendingDst` matches its event. */
+  let exporting = false;
+  let pendingDst: string | null = null;
 
   /** Texture step from the shared optimize defaults, optionally overridden
    *  by a preview's applied settings (the compare-pane shortcut). */
@@ -773,6 +776,12 @@ export function mountTextures(): TabHandle {
         }),
         el("button", {
           class: "small",
+          text: "Save as…",
+          title: "Copy this result wherever you want it (the source model is never modified)",
+          onclick: () => void saveAs(res.out_path),
+        }),
+        el("button", {
+          class: "small",
           text: "Reveal path",
           title: res.out_path,
           onclick: async () => {
@@ -789,6 +798,53 @@ export function mountTextures(): TabHandle {
     setApplyStatus("done");
     renderApplyResult(res);
     notify(`KTX2 written to ${res.out_path}`, "ok");
+  }
+
+  /** Last segment of a path (the save panel's suggested file name). */
+  function basename(path: string): string {
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : path;
+  }
+
+  /**
+   * Explicit export of an apply result: the apply always starts from the
+   * source model and writes into `.zig-cache/…` — this copies the finished
+   * file wherever the user wants it.
+   */
+  async function saveAs(outPath: string): Promise<void> {
+    if (exporting) {
+      notify("export already running — wait for it to finish", "error");
+      return;
+    }
+    let pick: { path: string | null };
+    try {
+      pick = await app.bridge.pickSavePath(basename(outPath));
+    } catch (err) {
+      notify(`save dialog failed: ${(err as Error).message}`, "error");
+      return;
+    }
+    if (!pick.path) return; // cancel
+    if (!app.bridge.live) {
+      notify("demo mode — export needs the assetty binary", "error");
+      return;
+    }
+    exporting = true;
+    pendingDst = pick.path;
+    setApplyStatus(`exporting to ${pick.path}…`);
+    try {
+      await app.bridge.exportTo(outPath, pick.path);
+    } catch (err) {
+      pendingDst = null;
+      exporting = false;
+      setApplyStatus("failed");
+      if (isBusyError(err)) {
+        notify("export already running — wait for it to finish", "error");
+      } else if (isMissingMethodError(err)) {
+        notify("export unavailable — rebuild the assetty binary", "error");
+      } else {
+        notify(`export failed: ${(err as Error).message}`, "error");
+      }
+    }
   }
 
   async function startApply(override?: EncodeSettings): Promise<void> {
@@ -853,6 +909,24 @@ export function mountTextures(): TabHandle {
     finishApply(event.result);
   });
 
+  // The copy this tab asked for (matched by dst so the Optimize tab's exports
+  // don't double-notify here). `notify` fans out to the toast + status bar.
+  const offExportDone = app.bridge.onExportDone((event) => {
+    if (exporting && pendingDst != null) {
+      if (event.ok && event.dst === pendingDst) {
+        pendingDst = null;
+        exporting = false;
+        setApplyStatus("done");
+        notify(`saved to ${event.dst}`, "ok");
+      } else if (!event.ok) {
+        pendingDst = null;
+        exporting = false;
+        setApplyStatus("failed");
+        notify(`export failed: ${event.error}`, "error");
+      }
+    }
+  });
+
   const offApplySettings = onSettingsChange(() => syncApplyBar());
 
   /* ------------------------------------------------------------------ reload */
@@ -878,6 +952,8 @@ export function mountTextures(): TabHandle {
     stopApplyProgress?.();
     stopApplyProgress = null;
     applyRunning = false;
+    exporting = false;
+    pendingDst = null;
     clear(applyResultHost);
     setApplyStatus("idle");
     syncApplyBar();
@@ -915,6 +991,7 @@ export function mountTextures(): TabHandle {
       offDone();
       offPreviewDone();
       offApplyDone();
+      offExportDone();
       offApplySettings();
       clearEncodeState();
       clearPreviewTimer();

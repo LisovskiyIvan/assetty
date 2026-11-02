@@ -135,3 +135,29 @@ pub const TexturePreviewDonePayload = struct {
     }
 };
 pub const TexturePreviewDone = nanoui.Event("texturePreviewDone", TexturePreviewDonePayload);
+
+/// A background `exportTo` finished: `{"ok":true,"src":"..","dst":".."}` or
+/// `{"ok":false,"error":".."}`. The copy is byte-identical; the source the
+/// pipeline ran on is never modified.
+pub const ExportDonePayload = struct {
+    ok: bool,
+    src: ?[]const u8 = null,
+    dst: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ExportDonePayload, jws: anytype) !void {
+        const w = jws.writer;
+        if (self.ok) {
+            try w.writeAll("{\"ok\":true,\"src\":");
+            try json.jsonStr(w, self.src orelse "");
+            try w.writeAll(",\"dst\":");
+            try json.jsonStr(w, self.dst orelse "");
+            try w.writeByte('}');
+        } else {
+            try w.writeAll("{\"ok\":false,\"error\":");
+            try json.jsonStr(w, self.@"error" orelse "export failed");
+            try w.writeByte('}');
+        }
+    }
+};
+pub const ExportDone = nanoui.Event("exportDone", ExportDonePayload);

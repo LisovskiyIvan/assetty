@@ -43,6 +43,9 @@ const preview_max_dim: u32 = 1024;
 /// Where the app drops its outputs, relative to the working directory.
 const out_dir = ".zig-cache/assetty-app";
 
+/// File name the save panel starts with when the caller suggests none.
+const default_save_name = "model.opt.glb";
+
 /// Opaque, frontend-owned settings file. The backend never interprets the
 /// JSON inside: any object the UI wants (theme, optimize defaults, ...) goes
 /// here, and loading/saving is all this file does.
@@ -63,6 +66,8 @@ pub const Backend = struct {
 
     pub const nanoui_params = .{
         .openDialog = .{},
+        .pickSavePath = .{"name"},
+        .exportTo = .{ "src", "dst" },
         .listDir = .{"path"},
         .info = .{"path"},
         .loadBytes = .{"path"},
@@ -85,6 +90,25 @@ pub const Backend = struct {
     /// cancel. Runs modally on the main thread, like every bound method.
     pub fn openDialog(self: *Backend, call: *nanoui.Call) !json.Raw {
         return self.openDialogImpl(call.arena);
+    }
+
+    /// Native save panel: `{"path":"<abs>"}` on a pick, `{"path":null}` on
+    /// cancel. `name` is the file name the panel starts with (the caller's
+    /// basename, or `default_save_name` when null/blank). Runs modally on the
+    /// main thread, like every bound method. Headless testing is impossible
+    /// (it blocks on the user), so tests cover `saveFileName` + `pathResultRaw`.
+    pub fn pickSavePath(self: *Backend, call: *nanoui.Call, name: ?[]const u8) !json.Raw {
+        return self.pickSavePathImpl(call.arena, name);
+    }
+
+    /// Copies the file `src` to `dst` in the background: answers
+    /// `{"started":true}` at once, then `exportDone`. Missing parents of
+    /// `dst` are created; `dst == src` is refused; overwriting is allowed (the
+    /// page confirms first). Shares the pipeline gate: short, but keeps one
+    /// writer at a time.
+    pub fn exportTo(self: *Backend, call: *nanoui.Call, src: []const u8, dst: []const u8) !json.Raw {
+        if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
+        return self.launch(call.arena, Target.of(call.window), .export_file, src, null, 0, dst);
     }
 
     /// Lists a directory: `{"path":..,"entries":[{"name","dir","size"}]}`.
@@ -118,7 +142,7 @@ pub const Backend = struct {
             .preset => |p2| p2,
             .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
         };
-        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0);
+        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0, null);
     }
 
     /// Same as `optimize`, but the steps come from the frontend's per-step UI
@@ -131,7 +155,7 @@ pub const Backend = struct {
             .preset => |p2| p2,
             .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
         };
-        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0);
+        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0, null);
     }
 
     // ---- textures ---------------------------------------------------------
@@ -146,7 +170,7 @@ pub const Backend = struct {
     /// PSNR, the VRAM it now needs and paths to the before/after PNGs.
     pub fn textureEncode(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
-        return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index);
+        return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index, null);
     }
 
     /// Renders image `index` as a PNG the page can show: answers
@@ -158,7 +182,7 @@ pub const Backend = struct {
     /// thread.
     pub fn texturePreview(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
         if (self.previewBusy()) return json.errorRaw(call.arena, "busy", .{});
-        return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index);
+        return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index, null);
     }
 
     // ---- report -----------------------------------------------------------
@@ -218,6 +242,21 @@ pub const Backend = struct {
             if (paths) |p| nanoui.dialog.freePaths(self.gpa, p);
         }
         const picked: ?[]const u8 = if (paths) |p| (if (p.len > 0) p[0] else null) else null;
+        return pathResultRaw(a, picked);
+    }
+
+    fn pickSavePathImpl(self: *Backend, a: std.mem.Allocator, name: ?[]const u8) !json.Raw {
+        // Same ownership as `openDialogImpl`: the dialog allocates with
+        // `self.gpa`, the reply is rendered into the call's arena.
+        const picked: ?[]const u8 = blk: {
+            const p = nanoui.dialog.save(self.gpa, .{
+                .title = "Export model",
+                .name = saveFileName(name),
+                .extensions = &.{"glb"},
+            }) catch break :blk null;
+            break :blk p;
+        };
+        defer if (picked) |p| self.gpa.free(p);
         return pathResultRaw(a, picked);
     }
 
@@ -523,6 +562,7 @@ pub const Backend = struct {
         path: []const u8,
         p: ?core.preset.Preset,
         index: u32,
+        extra: ?[]const u8,
     ) !json.Raw {
         if (self.busy() and kind != .texture_preview) return json.errorRaw(a, "busy", .{});
         if (kind == .texture_preview and self.previewBusy()) return json.errorRaw(a, "busy", .{});
@@ -530,7 +570,7 @@ pub const Backend = struct {
         // `{"error":..}` instead of an event a second later.
         _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
             return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        _ = self.spawn(target, kind, path, p, index) catch |err| switch (err) {
+        _ = self.spawn(target, kind, path, p, index, extra) catch |err| switch (err) {
             error.Busy => return json.errorRaw(a, "busy", .{}),
             error.OutOfMemory => return error.OutOfMemory,
             error.SpawnFailed => return json.errorRaw(a, "cannot start a worker thread", .{}),
@@ -559,6 +599,7 @@ pub const Backend = struct {
         path: []const u8,
         p: ?core.preset.Preset,
         index: u32,
+        extra: ?[]const u8,
     ) SpawnError!*Job {
         self.job_lock.lock();
         defer self.job_lock.unlock();
@@ -575,6 +616,11 @@ pub const Backend = struct {
         errdefer {
             if (preset_copy) |copy| freePreset(gpa, copy);
         }
+        // `export_file`'s destination; null for every other kind.
+        const extra_copy: ?[]u8 = if (extra) |e| try gpa.dupe(u8, e) else null;
+        errdefer {
+            if (extra_copy) |copy| gpa.free(copy);
+        }
 
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
@@ -587,6 +633,7 @@ pub const Backend = struct {
             .target = target,
             .path = path_copy,
             .preset = preset_copy,
+            .arg = extra_copy,
         };
 
         // The gate is closed before the worker exists: a job that finishes
@@ -635,7 +682,7 @@ pub const Backend = struct {
 /// The `{"started":true}` reply of every background method.
 const started_reply = "{\"started\":true}";
 
-const JobKind = enum { optimize, texture_encode, texture_preview };
+const JobKind = enum { optimize, texture_encode, texture_preview, export_file };
 
 /// Guards `Backend.job`. Critical sections are a pointer compare, so a spin
 /// lock is plenty (and `std.Io.Mutex` would need an `Io` in a `.c` callback).
@@ -762,6 +809,8 @@ const Job = struct {
     path: []u8,
     /// Deep copy of the resolved preset; null for `texture_encode`.
     preset: ?core.preset.Preset = null,
+    /// Second path argument; the `export_file` destination, else null.
+    arg: ?[]u8 = null,
     /// Set by the worker before it posts: null means it failed, see `err`.
     result: ?Result = null,
     /// Failure message, formatted in place: the error path never allocates.
@@ -771,6 +820,8 @@ const Job = struct {
     const Result = union(enum) {
         /// `{"out_path","report"}`: the written file and its report JSON.
         optimize: struct { out_path: []u8, report: []u8 },
+        /// `{"src","dst"}`: the copied file and where it landed.
+        exported: struct { src: []u8, dst: []u8 },
         /// The numbers `textureEncodeDone` carries.
         texture: Encoded,
         /// The base64 PNG `texturePreviewDone` carries.
@@ -783,6 +834,7 @@ const Job = struct {
             .optimize => self.runOptimize(),
             .texture_encode => self.runTextureEncode(),
             .texture_preview => self.runTexturePreview(),
+            .export_file => self.runExport(),
         }
         self.backend.deliver(self);
     }
@@ -854,6 +906,23 @@ const Job = struct {
         }
     }
 
+    /// Copies `path` to `arg`: short, but still off the main thread so a big
+    /// model cannot stall the page, and behind the pipeline gate so an export
+    /// cannot race a run writing the same cache file.
+    fn runExport(self: *Job) void {
+        const dst = self.arg orelse return self.fail("no destination", .{});
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        if (copyExport(self.io, arena.allocator(), self.path, dst)) |msg|
+            return self.fail("{s}", .{msg});
+        const src_copy = self.gpa.dupe(u8, self.path) catch return self.fail("out of memory", .{});
+        const dst_copy = self.gpa.dupe(u8, dst) catch {
+            self.gpa.free(src_copy);
+            return self.fail("out of memory", .{});
+        };
+        self.result = .{ .exported = .{ .src = src_copy, .dst = dst_copy } };
+    }
+
     fn sinks(self: *Job) Sinks {
         return .{
             .progress = &onProgress,
@@ -917,10 +986,15 @@ const Job = struct {
         const gpa = self.gpa;
         if (self.preset) |p| freePreset(gpa, p);
         gpa.free(self.path);
+        if (self.arg) |extra| gpa.free(extra);
         if (self.result) |res| switch (res) {
             .optimize => |o| {
                 gpa.free(o.out_path);
                 gpa.free(o.report);
+            },
+            .exported => |e| {
+                gpa.free(e.src);
+                gpa.free(e.dst);
             },
             .texture => |t| {
                 gpa.free(t.before_png);
@@ -1018,6 +1092,11 @@ fn delivered(ctx: ?*anyopaque) callconv(.c) void {
                 .width = p.width,
                 .height = p.height,
             }),
+            .exported => |e| events.ExportDone.emit(window, .{
+                .ok = true,
+                .src = e.src,
+                .dst = e.dst,
+            }),
         }
     } else {
         emitFailure(job, window);
@@ -1039,6 +1118,10 @@ fn emitFailure(job: *Job, window: *nanoui.Window) void {
             .ok = false,
             .index = job.index,
             .@"error" = if (job.err_len > 0) job.err() else "preview failed",
+        }),
+        .export_file => events.ExportDone.emit(window, .{
+            .ok = false,
+            .@"error" = if (job.err_len > 0) job.err() else "export failed",
         }),
     }
 }
@@ -1207,7 +1290,7 @@ fn previewTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32
     return .{ .done = .{ .index = index, .b64 = b64, .width = small.w, .height = small.h } };
 }
 
-/// `{"path":"<abs>"}` or `{"path":null}`: the `openDialog` reply.
+/// `{"path":"<abs>"}` or `{"path":null}`: the `openDialog`/`pickSavePath` reply.
 fn pathResultRaw(a: std.mem.Allocator, path: ?[]const u8) !json.Raw {
     var aw: std.Io.Writer.Allocating = .init(a);
     errdefer aw.deinit();
@@ -1215,6 +1298,29 @@ fn pathResultRaw(a: std.mem.Allocator, path: ?[]const u8) !json.Raw {
     try json.jsonStrOpt(&aw.writer, path);
     try aw.writer.writeByte('}');
     return json.raw(try aw.toOwnedSlice());
+}
+
+/// Suggested file name for the save panel: the caller's (base)name, or
+/// `default_save_name` when it suggests nothing.
+fn saveFileName(name: ?[]const u8) []const u8 {
+    if (name) |n| {
+        const trimmed = std.mem.trim(u8, n, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return default_save_name;
+}
+
+/// Copies `src` to `dst` for `exportTo`: missing parents of `dst` are
+/// created, overwriting is allowed, `dst == src` is refused. Null on success,
+/// otherwise an arena-owned reason. Reads only: `src` is opened read-only and
+/// never modified (every pipeline output lands in `out_dir` instead).
+fn copyExport(io: std.Io, a: std.mem.Allocator, src: []const u8, dst: []const u8) ?[]const u8 {
+    if (src.len == 0 or dst.len == 0) return a.dupe(u8, "empty path") catch "out of memory";
+    if (std.mem.eql(u8, src, dst)) return a.dupe(u8, "source and destination are the same file") catch "out of memory";
+    _ = std.Io.Dir.cwd().updateFile(io, src, std.Io.Dir.cwd(), dst, .{ .make_path = true, .replace = true }) catch |err| {
+        return std.fmt.allocPrint(a, "{s} -> {s}: {s}", .{ src, dst, @errorName(err) }) catch "out of memory";
+    };
+    return null;
 }
 
 fn validPresetName(name: []const u8) bool {
@@ -1715,6 +1821,69 @@ test "openDialog json shape for pick and cancel" {
     try testing.expectEqualStrings("{\"path\":\"/tmp/a\\\"b.glb\"}", weird.text);
 }
 
+test "saveFileName blanks fall back to the default" {
+    try testing.expectEqualStrings("model.opt.glb", saveFileName(null));
+    try testing.expectEqualStrings("model.opt.glb", saveFileName(""));
+    try testing.expectEqualStrings("model.opt.glb", saveFileName("   "));
+    try testing.expectEqualStrings("box.opt.glb", saveFileName("box.opt.glb"));
+    try testing.expectEqualStrings("box.opt.glb", saveFileName("  box.opt.glb\n"));
+}
+
+/// Seeds `.zig-cache/tmp/<tmp>/in/box.glb` with the fixture bytes.
+fn seedExportSrc(a: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]const u8 {
+    const src = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/in/box.glb", .{tmp.sub_path[0..]});
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    const parent = std.fs.path.dirname(src) orelse return error.TestUnexpectedResult;
+    try std.Io.Dir.cwd().createDirPath(testing.io, parent);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = src, .data = fixture });
+    return src;
+}
+
+test "export copies bytes and creates missing parents" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try seedExportSrc(a, &tmp);
+    const dst = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/deep/nested/model.opt.glb", .{tmp.sub_path[0..]});
+
+    try testing.expect(copyExport(testing.io, a, src, dst) == null);
+
+    const want = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, dst, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, want, got);
+    // The source is untouched by the copy.
+    const src_after = try std.Io.Dir.cwd().readFileAlloc(testing.io, src, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, want, src_after);
+}
+
+test "export refuses a self-copy and reports a missing source" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try seedExportSrc(a, &tmp);
+
+    const self_msg = copyExport(testing.io, a, src, src) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, self_msg, "same file") != null);
+    // Nothing was clobbered: the source still holds the fixture bytes.
+    const want = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    const src_after = try std.Io.Dir.cwd().readFileAlloc(testing.io, src, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, want, src_after);
+
+    const dst = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/out/model.opt.glb", .{tmp.sub_path[0..]});
+    const missing_src = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/in/nope.glb", .{tmp.sub_path[0..]});
+    const missing_msg = copyExport(testing.io, a, missing_src, dst) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, missing_msg, "nope.glb") != null);
+
+    const empty_msg = copyExport(testing.io, a, "", dst) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, empty_msg, "empty path") != null);
+}
+
 // ---- custom step specs ----------------------------------------------------
 
 fn specKinds(p: core.preset.Preset, buf: *[16]core.preset.StepKind) []const core.preset.StepKind {
@@ -1923,7 +2092,7 @@ test "a second job answers busy instead of spawning" {
     b.job = &occupied;
     defer b.job = null;
 
-    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/box.glb", null, 0);
+    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/box.glb", null, 0, null);
     try testing.expectEqualStrings("{\"error\":\"busy\"}", r.text);
     try testing.expect(b.busy());
 }
@@ -1934,7 +2103,7 @@ test "launch rejects an unreadable path without spawning" {
     const a = arena.allocator();
 
     var b = testBackend();
-    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/nope.glb", null, 0);
+    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/nope.glb", null, 0, null);
     try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") != null);
     try testing.expect(std.mem.indexOf(u8, r.text, "nope.glb") != null);
     try testing.expect(!b.busy());
@@ -1953,7 +2122,7 @@ const Collector = struct {
         self.ok = job.result != null;
         if (job.result) |res| switch (res) {
             .optimize => |o| self.report = testing.allocator.dupe(u8, o.report) catch null,
-            .texture, .preview => {},
+            .texture, .preview, .exported => {},
         };
         self.mutex.unlock();
         job.backend.releaseJob(job);
@@ -1987,7 +2156,7 @@ test "optimizeCustom runs on a worker and delivers the report" {
         },
     };
 
-    const reply = try b.launch(a, .{}, .optimize, "test/fixtures/box.glb", p, 0);
+    const reply = try b.launch(a, .{}, .optimize, "test/fixtures/box.glb", p, 0, null);
     try testing.expectEqualStrings("{\"started\":true}", reply.text);
 
     got.wait();
@@ -2010,12 +2179,50 @@ test "texturePreview runs on a worker and delivers a result" {
     b.on_job_done_ctx = &got;
     defer b.on_job_done = null;
 
-    const reply = try b.launch(a, .{}, .texture_preview, "test/fixtures/box.glb", null, 0);
+    const reply = try b.launch(a, .{}, .texture_preview, "test/fixtures/box.glb", null, 0, null);
     try testing.expectEqualStrings("{\"started\":true}", reply.text);
 
     got.wait();
     try testing.expect(got.ok);
     try testing.expect(!b.busy());
+}
+
+test "exportTo shares the pipeline gate and delivers on a worker" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Occupied gate: the export answers busy instead of spawning.
+    var b = testBackend();
+    var occupied: Job = undefined;
+    b.job = &occupied;
+    defer b.job = null;
+    const busy_reply = try b.launch(a, .{}, .export_file, "test/fixtures/box.glb", null, 0, "/tmp/nope.glb");
+    try testing.expectEqualStrings("{\"error\":\"busy\"}", busy_reply.text);
+    try testing.expect(b.busy());
+    b.job = null;
+
+    // Free gate: the copy runs on a worker and the gate reopens after.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try seedExportSrc(a, &tmp);
+    const dst = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/out/model.opt.glb", .{tmp.sub_path[0..]});
+
+    var got: Collector = .{};
+    b.on_job_done = &Collector.collect;
+    b.on_job_done_ctx = &got;
+    defer b.on_job_done = null;
+
+    const reply = try b.launch(a, .{}, .export_file, src, null, 0, dst);
+    try testing.expectEqualStrings("{\"started\":true}", reply.text);
+
+    got.wait();
+    try testing.expect(got.ok);
+    try testing.expect(!b.busy());
+
+    const want = try std.Io.Dir.cwd().readFileAlloc(testing.io, src, a, .limited(64 << 20));
+    const got_bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, dst, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, want, got_bytes);
 }
 
 test "texture encode reports an out-of-range index" {
@@ -2198,5 +2405,26 @@ test "done event payloads carry the documented shapes" {
     try testing.expectEqualStrings(
         "{\"ok\":false,\"index\":4,\"error\":\"decode image 4: unsupported format\"}",
         prev_err_w.buffered(),
+    );
+
+    var exp_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.ExportDonePayload{
+        .ok = true,
+        .src = ".zig-cache/assetty-app/opt_1.glb",
+        .dst = "/tmp/model.opt.glb",
+    }, .{}, &exp_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":true,\"src\":\".zig-cache/assetty-app/opt_1.glb\",\"dst\":\"/tmp/model.opt.glb\"}",
+        exp_w.buffered(),
+    );
+
+    var exp_err_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.ExportDonePayload{
+        .ok = false,
+        .@"error" = "source and destination are the same file",
+    }, .{}, &exp_err_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":false,\"error\":\"source and destination are the same file\"}",
+        exp_err_w.buffered(),
     );
 }
