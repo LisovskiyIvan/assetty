@@ -11,7 +11,7 @@ const backend_mod = @import("backend.zig");
 const events = @import("events.zig");
 const assets = @import("assets.zig");
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init) !u8 {
     const app = try nanoui.App.create(init, .{ .name = "assetty" });
     defer app.destroy();
 
@@ -35,4 +35,5 @@ pub fn main(init: std.process.Init) !void {
     });
 
     try app.run();
+    return 0;
 }

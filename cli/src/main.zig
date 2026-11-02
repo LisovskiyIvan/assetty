@@ -5,6 +5,8 @@ const usage =
     \\assetty — glTF/GLB asset toolkit
     \\
     \\Usage:
+    \\  assetty                    (no args) — open the desktop app
+    \\  assetty app | --app        — open the desktop app
     \\  assetty info <file.glb> [--json]
     \\  assetty diff <old.glb> <new.glb> [--json]
     \\  assetty lint <file-or-dir> --budget <budget.json> [--json]
@@ -45,7 +47,7 @@ fn idxList(w: anytype, list: []const u32) !void {
     try w.writeByte(']');
 }
 
-pub fn main(init: std.process.Init) !u8 {
+pub fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
@@ -58,7 +60,6 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}\n", .{usage});
         return 2;
     }
-
     const code: u8 = switch (cmdId(args[0])) {
         .info => try cmdInfo(init, args[1..]),
         .diff => try cmdDiff(init, args[1..]),

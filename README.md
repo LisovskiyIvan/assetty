@@ -5,10 +5,10 @@ glTF/GLB asset toolkit: CLI + desktop app (nanoui + Babylon webview).
 ## Build
 
 ```sh
-zig build --summary none            # zig-out/bin/assetty (CLI) + assetty-app (GUI)
+zig build --summary none            # zig-out/bin/assetty — CLI + app в одном бинаре
 zig build test                      # core + app tests
 cd app/web && bun install && bun run build   # frontend → app/web/dist (GUI)
-./zig-out/bin/assetty-app           # окно (macOS WKWebView)
+./zig-out/bin/assetty               # без аргументов — окно приложения (macOS WKWebView)
 ```
 
 ## CLI
