@@ -10,12 +10,20 @@ import {
   psnrBadge,
   section,
   clear,
+  copyText,
   emptyState,
   OPEN_HINT,
   statChip,
   statChipNode,
 } from "../ui";
-import type { EncodeResult, ImageInfo, TexturePreview } from "../types";
+import { getSettings, onSettingsChange } from "../settings";
+import type {
+  EncodeResult,
+  EncodeSettings,
+  ImageInfo,
+  OptimizeResult,
+  TexturePreview,
+} from "../types";
 import type { TabHandle } from "./types";
 
 const ENCODE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -45,7 +53,28 @@ export function mountTextures(): TabHandle {
   const listHost = el("div", { class: "texture-list" });
   const detailHost = el("div", { class: "texture-detail" });
   detailHost.hidden = true;
-  main.append(head, listHost, detailHost);
+
+  /* Apply-to-model toolbar: sits above the list, next to the preview hint. */
+  const applyBtn = el("button", { class: "primary", text: "Apply to model…" });
+  const applyParams = el("span", { class: "muted mono" });
+  const applyStatus = el("span", { class: "muted mono", text: "idle" });
+  const applyResultHost = el("div");
+  const applyBar = el(
+    "div",
+    { class: "panel-body" },
+    el("div", {
+      class: "hint",
+      text: "Preview = dry run. The model file is not modified. To write KTX2 into a new file use Apply to model.",
+    }),
+    el("div", { class: "row" }, applyBtn, applyParams),
+    el("div", {
+      class: "hint",
+      text: "First run on 7×2048² textures takes ~30–40s; re-running on KTX2 is fast (skipped).",
+    }),
+    el("div", { class: "hint" }, applyStatus),
+    applyResultHost,
+  );
+  main.append(head, applyBar, listHost, detailHost);
 
   const side = el("div", { class: "tab-side" });
   root.append(main, side);
@@ -76,7 +105,7 @@ export function mountTextures(): TabHandle {
 
   const encodeBtn = el("button", {
     class: "primary",
-    text: "Encode to KTX2",
+    text: "Preview KTX2",
     disabled: true,
   });
 
@@ -231,7 +260,30 @@ export function mountTextures(): TabHandle {
     const loaded = compares.get(img.index);
     const beforeUrl = loaded?.before ?? previewUrl(img.index);
     const afterUrl = loaded?.after ?? null;
-    const block = el("div", { class: "detail-block" }, detailHead("Compare", img));
+    const block = el(
+      "div",
+      { class: "detail-block" },
+      el(
+        "div",
+        { class: "detail-head" },
+        el("span", { class: "detail-title", text: "Preview (dry run) — not written anywhere" }),
+        el("span", {
+          class: "muted mono",
+          text: `image ${img.index}${img.name ? ` — ${img.name}` : ""}`,
+        }),
+      ),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          class: "small",
+          text: "Apply to model…",
+          title: "Write KTX2 with these preview settings into a new file",
+          onclick: () => void startApply(res.settings),
+        }),
+        el("div", { class: "hint", text: "writes KTX2 with these settings" }),
+      ),
+    );
     if (beforeUrl || afterUrl) {
       block.append(
         el(
@@ -294,7 +346,7 @@ export function mountTextures(): TabHandle {
 
   function rowBadge(img: ImageInfo): HTMLElement {
     if (activeEncode?.index === img.index) {
-      return el("span", { class: "badge yellow", text: "encoding…" });
+      return el("span", { class: "badge yellow", text: "previewing…" });
     }
     if (previewing === img.index) {
       return el("span", { class: "badge dim", text: "loading…" });
@@ -367,8 +419,8 @@ export function mountTextures(): TabHandle {
       side.append(section("Image", el("div", { class: "empty", text: "select an image" })));
       side.append(
         section(
-          "Encode",
-          el("div", { class: "muted", text: "pick an image, then encode with basisu" }),
+          "Preview",
+          el("div", { class: "muted", text: "pick an image, then preview basisu" }),
         ),
       );
       encodeBtn.disabled = true;
@@ -393,12 +445,12 @@ export function mountTextures(): TabHandle {
       el("div", { class: "row" }, encodeBtn),
       el("div", {
         class: "hint",
-        text: "basisu transcode → .ktx2; PSNR > 35 dB is visually lossless-ish",
+        text: "dry run — the model file is not modified",
       }),
     ];
     const result = results.get(img.index);
     if (activeEncode?.index === img.index) {
-      body.push(el("span", { class: "badge yellow", text: "encoding…" }));
+      body.push(el("span", { class: "badge yellow", text: "previewing…" }));
     } else if (result) {
       body.push(
         el(
@@ -418,9 +470,9 @@ export function mountTextures(): TabHandle {
     } else {
       body.push(el("div", { class: "muted", text: "not encoded yet" }));
     }
-    encodeBtn.textContent = activeEncode === null ? "Encode to KTX2" : "encoding…";
+    encodeBtn.textContent = activeEncode === null ? "Preview KTX2" : "previewing…";
     encodeBtn.disabled = !app.bridge.live || activeEncode !== null;
-    side.append(section("Encode", ...body));
+    side.append(section("Preview (dry run)", ...body));
   }
 
   /* --------------------------------------------------------------- preview run */
@@ -635,6 +687,174 @@ export function mountTextures(): TabHandle {
 
   encodeBtn.addEventListener("click", () => void startEncode());
 
+  /* ------------------------------------------------------------ apply to model */
+
+  const APPLY_TIMEOUT_MS = 10 * 60 * 1000;
+
+  let applyRunning = false;
+  let applySeq = 0;
+  let applyTimer: ReturnType<typeof setTimeout> | null = null;
+  let stopApplyProgress: (() => void) | null = null;
+
+  /** Texture step from the shared optimize defaults, optionally overridden
+   *  by a preview's applied settings (the compare-pane shortcut). */
+  function textureStep(override?: EncodeSettings): Record<string, unknown> {
+    const t = getSettings().optimize.steps.textures;
+    return {
+      format: override?.format ?? t.format,
+      quality: override?.quality ?? t.quality,
+      rdo_lambda: 1,
+      generate_mips: override?.generate_mips ?? t.generate_mips,
+      max_size: override?.max_size ?? t.max_size,
+    };
+  }
+
+  function describeTextureParams(): string {
+    const t = getSettings().optimize.steps.textures;
+    const size = t.max_size === 0 ? "orig" : String(t.max_size);
+    return `${t.format} · q${t.quality} · ${size} · mips ${t.generate_mips ? "on" : "off"}`;
+  }
+
+  function fmtSecs(secs: number | undefined): string {
+    if (secs == null || !Number.isFinite(secs)) return "—";
+    return secs < 1 ? `${Math.round(secs * 1000)} ms` : `${secs.toFixed(2)} s`;
+  }
+
+  function setApplyStatus(text: string): void {
+    applyStatus.textContent = text;
+  }
+
+  function syncApplyBar(): void {
+    applyParams.textContent = describeTextureParams();
+    applyBtn.disabled = applyRunning;
+    if (!applyRunning) applyBtn.textContent = "Apply to model…";
+  }
+
+  function stopApplyJob(): void {
+    if (applyTimer) {
+      clearTimeout(applyTimer);
+      applyTimer = null;
+    }
+    stopApplyProgress?.();
+    stopApplyProgress = null;
+    applyRunning = false;
+    syncApplyBar();
+  }
+
+  function finishApplyError(message: string): void {
+    stopApplyJob();
+    setApplyStatus("failed");
+    notify(message, "error");
+  }
+
+  function renderApplyResult(res: OptimizeResult): void {
+    clear(applyResultHost);
+    const before = res.report.before.disk_total ?? res.report.before.disk_bytes;
+    const after = res.report.after.disk_total ?? res.report.after.disk_bytes;
+    const metrics =
+      before != null && after != null ? `disk ${fmtBytes(before)} → ${fmtBytes(after)}` : "done";
+    const secs = fmtSecs(res.report.total_secs);
+    applyResultHost.append(
+      el(
+        "div",
+        { class: "row" },
+        el("span", { class: "badge green", text: "KTX2 written" }),
+        el("span", { class: "mono wrap", text: res.out_path, title: res.out_path }),
+      ),
+      el("div", { class: "hint", text: `${metrics} · total ${secs}` }),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          class: "small primary",
+          text: "Open result",
+          title: "Load the KTX2 file like Open… does",
+          onclick: () => app.setPath(res.out_path),
+        }),
+        el("button", {
+          class: "small",
+          text: "Reveal path",
+          title: res.out_path,
+          onclick: async () => {
+            const ok = await copyText(res.out_path);
+            notify(ok ? `copied ${res.out_path}` : res.out_path, ok ? "ok" : "info");
+          },
+        }),
+      ),
+    );
+  }
+
+  function finishApply(res: OptimizeResult): void {
+    stopApplyJob();
+    setApplyStatus("done");
+    renderApplyResult(res);
+    notify(`KTX2 written to ${res.out_path}`, "ok");
+  }
+
+  async function startApply(override?: EncodeSettings): Promise<void> {
+    if (!app.bridge.live) {
+      notify("demo mode — apply needs the assetty binary", "error");
+      return;
+    }
+    const path = app.pathA;
+    if (!path) {
+      notify("open a model first", "error");
+      return;
+    }
+    if (applyRunning) {
+      notify("apply already running — wait for it to finish", "error");
+      return;
+    }
+    const token = ++applySeq;
+    applyRunning = true;
+    applyBtn.disabled = true;
+    applyBtn.textContent = "Applying…";
+    setApplyStatus("starting…");
+    clear(applyResultHost);
+    const specJson = JSON.stringify({ steps: [{ textures: textureStep(override) }] });
+    try {
+      const call = await app.bridge.optimizeCustom(path, specJson, "desktop", (p) => {
+        if (token === applySeq && applyRunning) setApplyStatus(`${p.step || "running…"} ${p.pct}%`);
+      });
+      if (token !== applySeq || !applyRunning) return; // superseded while awaiting
+      if (call.started) {
+        stopApplyProgress = call.stopProgress;
+        setApplyStatus("running…");
+        applyTimer = setTimeout(() => {
+          applyTimer = null;
+          if (token !== applySeq) return;
+          finishApplyError("apply timed out — no completion event within 10 minutes");
+        }, APPLY_TIMEOUT_MS);
+        return;
+      }
+      // Older hosts: the call itself returned the finished report.
+      finishApply(call.result);
+    } catch (err) {
+      if (token !== applySeq) return;
+      stopApplyJob();
+      setApplyStatus("failed");
+      notify(
+        isBusyError(err)
+          ? "apply already running — wait for it to finish"
+          : `apply failed: ${(err as Error).message}`,
+        "error",
+      );
+    }
+  }
+
+  applyBtn.addEventListener("click", () => void startApply());
+
+  const offApplyDone = app.bridge.onOptimizeDone((event) => {
+    if (!applyRunning) return;
+    if (!event.ok) {
+      finishApplyError(`apply failed: ${event.error}`);
+      return;
+    }
+    finishApply(event.result);
+  });
+
+  const offApplySettings = onSettingsChange(() => syncApplyBar());
+
   /* ------------------------------------------------------------------ reload */
 
   async function reload(): Promise<void> {
@@ -650,6 +870,17 @@ export function mountTextures(): TabHandle {
     compareGen++;
     encodeSeq++;
     clearEncodeState();
+    applySeq++;
+    if (applyTimer) {
+      clearTimeout(applyTimer);
+      applyTimer = null;
+    }
+    stopApplyProgress?.();
+    stopApplyProgress = null;
+    applyRunning = false;
+    clear(applyResultHost);
+    setApplyStatus("idle");
+    syncApplyBar();
     results.clear();
     compares.clear();
     renderList();
@@ -683,10 +914,20 @@ export function mountTextures(): TabHandle {
       offPath();
       offDone();
       offPreviewDone();
+      offApplyDone();
+      offApplySettings();
       clearEncodeState();
       clearPreviewTimer();
+      if (applyTimer) {
+        clearTimeout(applyTimer);
+        applyTimer = null;
+      }
+      stopApplyProgress?.();
+      stopApplyProgress = null;
+      applyRunning = false;
       previewSeq++;
       encodeSeq++;
+      applySeq++;
       compareGen++;
     },
   };
