@@ -15,6 +15,15 @@ export function mountLint(): TabHandle {
     placeholder: "/path/to/model.glb",
     value: app.pathA ?? "",
   });
+  const pickBtn = el("button", {
+    class: "small",
+    text: "Pick…",
+    title: "Pick a model",
+    onclick: async () => {
+      const path = await app.pickPath();
+      if (path) input.value = path;
+    },
+  });
   const runBtn = el("button", { class: "primary", text: "Run lint", disabled: !app.bridge.live });
   const summary = el("div", { class: "panel-body" });
   const list = el("div", { style: { overflow: "auto", flex: "1" } });
@@ -24,7 +33,13 @@ export function mountLint(): TabHandle {
     el(
       "div",
       { class: "panel-body" },
-      el("div", { class: "row" }, el("span", { class: "muted mono", text: "path" }), input),
+      el(
+        "div",
+        { class: "row" },
+        el("span", { class: "muted mono", text: "path" }),
+        input,
+        pickBtn,
+      ),
       el("div", { class: "row" }, runBtn),
     ),
     el("div", { class: "panel" }, summary),
@@ -170,7 +185,7 @@ export function mountLint(): TabHandle {
   });
 
   const off = app.on("path", (d) => {
-    if (d.slot === "a") input.value = d.path;
+    input.value = d.path;
   });
 
   return {

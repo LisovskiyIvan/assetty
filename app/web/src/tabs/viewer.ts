@@ -1,5 +1,5 @@
 import { app } from "../app";
-import { el, fmtBytes, fmtNum, kv, section, clear } from "../ui";
+import { el, fmtBytes, fmtNum, kv, section, clear, emptyState, OPEN_HINT } from "../ui";
 import type { Info } from "../types";
 import { ViewerScene } from "../viewer";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
@@ -13,11 +13,13 @@ export function mountViewer(): TabHandle {
   const canvas = el("canvas", { id: "viewer-canvas" });
   const label = el("div", { class: "canvas-label", text: "no file loaded" });
   const loading = el("div", { class: "loading", text: "loading…" });
-  wrap.append(canvas, label, loading);
+  const openHint = emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() });
+  openHint.classList.add("overlay");
+  openHint.hidden = true;
+  wrap.append(canvas, label, loading, openHint);
   main.append(wrap);
 
   const side = el("div", { class: "tab-side" });
-  side.append(el("div", { class: "empty", text: "select a .glb in the sidebar" }));
   root.append(main, side);
 
   let viewer: ViewerScene | null = null;
@@ -193,8 +195,11 @@ export function mountViewer(): TabHandle {
 
   function renderSide(info: Info | null, v: ViewerScene | null): void {
     clear(side);
-    if (info) for (const panel of infoPanels(info)) side.append(panel);
-    else side.append(el("div", { class: "empty", text: "no file loaded" }));
+    if (info) {
+      for (const panel of infoPanels(info)) side.append(panel);
+    } else {
+      side.append(emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() }));
+    }
     if (v) side.append(explorerPanel(v), animationsPanel(v));
   }
 
@@ -210,10 +215,12 @@ export function mountViewer(): TabHandle {
       } else {
         v.loadDemo();
       }
+      openHint.hidden = true;
       label.textContent = app.bridge.live ? path : `${path} — demo scene (no nanoui)`;
     } catch (err) {
       app.toast(`load failed: ${(err as Error).message}`, "error");
       label.textContent = "load failed";
+      openHint.hidden = false;
     } finally {
       showLoading(false);
     }
@@ -236,7 +243,6 @@ export function mountViewer(): TabHandle {
   }
 
   const offPath = app.on("path", (d) => {
-    if (d.slot !== "a") return;
     pendingPath = d.path;
     if (viewer) void loadPath(d.path);
   });
@@ -248,13 +254,15 @@ export function mountViewer(): TabHandle {
         try {
           viewer = new ViewerScene(canvas, "viewer");
           app.setViewer(viewer);
-          if (pendingPath) void loadPath(pendingPath);
-          else {
-            if (!app.bridge.live) {
-              viewer.loadDemo();
-              label.textContent = "demo scene (no nanoui)";
-            }
+          if (pendingPath) {
+            void loadPath(pendingPath);
+          } else if (!app.bridge.live) {
+            viewer.loadDemo();
+            label.textContent = "demo scene (no nanoui)";
             renderSide(null, viewer);
+          } else {
+            openHint.hidden = false;
+            renderSide(null, null);
           }
         } catch (err) {
           const reason = (err as Error).message;

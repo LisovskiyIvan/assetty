@@ -1,1 +1,0 @@
-import{S as e}from"./index-14bN2E_8.js";const r="kernelBlurVaryingDeclaration",a="varying vec2 sampleCoord{X};";e.IncludesShadersStore[r]||(e.IncludesShadersStore[r]=a);const o={name:r,shader:a};export{o as k};

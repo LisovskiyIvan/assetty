@@ -1,24 +1,12 @@
 /** Static fixtures so the whole layout is inspectable in a plain browser (no nanoui). */
 import type {
   DiffReport,
-  DirEntry,
   EncodeResult,
   Info,
   LintResult,
   OptimizeResult,
   TexturesResult,
 } from "./types";
-
-export function demoTree(): DirEntry[] {
-  return [
-    { name: "DamagedHelmet.glb", path: "/demo/DamagedHelmet.glb", is_dir: false, size: 3_601_172 },
-    { name: "BoomBox.glb", path: "/demo/BoomBox.glb", is_dir: false, size: 2_955_348 },
-    { name: "CesiumMan.glb", path: "/demo/CesiumMan.glb", is_dir: false, size: 481_476 },
-    { name: "Fox.glb", path: "/demo/Fox.glb", is_dir: false, size: 265_208 },
-    { name: "BoxTextured.glb", path: "/demo/BoxTextured.glb", is_dir: false, size: 9_120 },
-    { name: "optimized.glb", path: "/demo/optimized.glb", is_dir: false, size: 1_204_233 },
-  ];
-}
 
 const helmetImages = [
   {

@@ -143,11 +143,3 @@ export interface LintResult {
   violations: LintViolation[];
   total: number;
 }
-
-/** One entry of the sidebar file tree. */
-export interface DirEntry {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  size?: number;
-}

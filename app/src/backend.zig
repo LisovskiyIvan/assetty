@@ -19,6 +19,7 @@ pub const Backend = struct {
     io: std.Io,
 
     pub const nanoui_params = .{
+        .openDialog = .{},
         .listDir = .{"path"},
         .info = .{"path"},
         .loadBytes = .{"path"},
@@ -32,6 +33,12 @@ pub const Backend = struct {
     };
 
     // ---- browse -----------------------------------------------------------
+
+    /// Native open panel: `{"path":"<abs>"}` on a pick, `{"path":null}` on
+    /// cancel. Runs modally on the main thread, like every bound method.
+    pub fn openDialog(self: *Backend, call: *nanoui.Call) !json.Raw {
+        return self.openDialogImpl(call.arena);
+    }
 
     /// Lists a directory: `{"path":..,"entries":[{"name","dir","size"}]}`.
     pub fn listDir(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
@@ -101,6 +108,21 @@ pub const Backend = struct {
     }
 
     // ---- implementations --------------------------------------------------
+
+    fn openDialogImpl(self: *Backend, a: std.mem.Allocator) !json.Raw {
+        // nanoui's dialog module owns the NSOpenPanel: NSOpenPanel on macOS,
+        // the desktop portal on Linux, the common item dialog on Windows. It
+        // is documented for use from a bound method (main thread, runModal).
+        const paths = nanoui.dialog.open(self.gpa, .{
+            .title = "Open model",
+            .extensions = &.{ "glb", "gltf" },
+        }) catch null;
+        defer {
+            if (paths) |p| nanoui.dialog.freePaths(self.gpa, p);
+        }
+        const picked: ?[]const u8 = if (paths) |p| (if (p.len > 0) p[0] else null) else null;
+        return pathResultRaw(a, picked);
+    }
 
     fn listDirImpl(self: *Backend, a: std.mem.Allocator, path: []const u8) !json.Raw {
         const dir_path = if (path.len == 0) "." else path;
@@ -337,6 +359,16 @@ pub const Backend = struct {
     }
 };
 
+/// `{"path":"<abs>"}` or `{"path":null}`: the `openDialog` reply.
+fn pathResultRaw(a: std.mem.Allocator, path: ?[]const u8) !json.Raw {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    try aw.writer.writeAll("{\"path\":");
+    try json.jsonStrOpt(&aw.writer, path);
+    try aw.writer.writeByte('}');
+    return json.raw(try aw.toOwnedSlice());
+}
+
 fn validPresetName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
     for (name) |ch| {
@@ -507,4 +539,20 @@ test "loadBytes impl returns base64" {
     const r = try b.loadBytesImpl(arena.allocator(), "test/fixtures/box.glb");
     try testing.expect(std.mem.indexOf(u8, r.text, "\"size\":") != null);
     try testing.expect(std.mem.indexOf(u8, r.text, "\"b64\":\"") != null);
+}
+
+test "openDialog json shape for pick and cancel" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const picked = try pathResultRaw(a, "/tmp/models/box.glb");
+    try testing.expectEqualStrings("{\"path\":\"/tmp/models/box.glb\"}", picked.text);
+
+    const canceled = try pathResultRaw(a, null);
+    try testing.expectEqualStrings("{\"path\":null}", canceled.text);
+
+    // Escapes go through json.jsonStrOpt.
+    const weird = try pathResultRaw(a, "/tmp/a\"b.glb");
+    try testing.expectEqualStrings("{\"path\":\"/tmp/a\\\"b.glb\"}", weird.text);
 }

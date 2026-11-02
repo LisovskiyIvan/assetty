@@ -1,5 +1,15 @@
 import { app } from "../app";
-import { el, fmtBytes, fmtNum, fmtPct, deltaClass, section, copyText } from "../ui";
+import {
+  el,
+  fmtBytes,
+  fmtNum,
+  fmtPct,
+  deltaClass,
+  section,
+  copyText,
+  emptyState,
+  OPEN_HINT,
+} from "../ui";
 import { ViewerScene, linkCameras } from "../viewer";
 import type { OptimizeResult, Stats } from "../types";
 import type { TabHandle } from "./types";
@@ -38,6 +48,11 @@ export function mountOptimize(): TabHandle {
   };
   const leftPane = mkPane("original");
   const rightPane = mkPane("optimized");
+
+  const openHint = emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() });
+  openHint.classList.add("overlay");
+  openHint.hidden = true;
+  main.append(openHint);
 
   // progress overlay for the run
   const progressWrap = el("div", { class: "panel-body" });
@@ -94,8 +109,10 @@ export function mountOptimize(): TabHandle {
     try {
       if (app.bridge.live) await left.loadBase64(await app.bridge.loadBytes(path));
       else left.loadDemo();
+      openHint.hidden = true;
     } catch (err) {
       app.toast(`load failed: ${(err as Error).message}`, "error");
+      openHint.hidden = false;
     }
     runBtn.disabled = busy || !app.bridge.live;
   }
@@ -221,7 +238,6 @@ export function mountOptimize(): TabHandle {
   });
 
   const offPath = app.on("path", (d) => {
-    if (d.slot !== "a") return;
     void loadSource(d.path);
   });
 
@@ -237,9 +253,11 @@ export function mountOptimize(): TabHandle {
             linkCameras(left, right);
           }
           if (app.pathA) void loadSource(app.pathA);
-          else {
+          else if (!app.bridge.live) {
             left.loadDemo();
             right.loadDemo();
+          } else {
+            openHint.hidden = false;
           }
           void loadPresets();
         } catch (err) {

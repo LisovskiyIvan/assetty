@@ -26,17 +26,34 @@ export function mountDiff(): TabHandle {
   const inputB = el("input", {
     type: "text",
     placeholder: "/path/to/new.glb",
-    value: app.pathB ?? "",
   });
   const runBtn = el("button", { class: "primary", text: "Run diff", disabled: !app.bridge.live });
 
+  async function pickInto(input: HTMLInputElement): Promise<void> {
+    const path = await app.pickPath();
+    if (path) input.value = path;
+  }
+
+  const pickA = el("button", {
+    class: "small",
+    text: "Pick…",
+    title: "Pick file A",
+    onclick: () => void pickInto(inputA),
+  });
+  const pickB = el("button", {
+    class: "small",
+    text: "Pick…",
+    title: "Pick file B",
+    onclick: () => void pickInto(inputB),
+  });
+
   controls.append(
-    el("div", { class: "row" }, el("span", { class: "muted mono", text: "A" }), inputA),
-    el("div", { class: "row" }, el("span", { class: "muted mono", text: "B" }), inputB),
+    el("div", { class: "row" }, el("span", { class: "muted mono", text: "A" }), inputA, pickA),
+    el("div", { class: "row" }, el("span", { class: "muted mono", text: "B" }), inputB, pickB),
     el(
       "div",
       { class: "row spread" },
-      el("span", { class: "hint", text: "shift-click in the sidebar fills B" }),
+      el("span", { class: "hint", text: "compare two glb files · ⌘O loads a model in the viewer" }),
       runBtn,
     ),
   );
@@ -174,15 +191,13 @@ export function mountDiff(): TabHandle {
   });
 
   const off = app.on("path", (d) => {
-    if (d.slot === "a") inputA.value = d.path;
-    else inputB.value = d.path;
+    inputA.value = d.path;
   });
 
   return {
     el: root,
     activate: () => {
       if (app.pathA && !inputA.value) inputA.value = app.pathA;
-      if (app.pathB && !inputB.value) inputB.value = app.pathB;
     },
     dispose: () => off(),
   };

@@ -7,8 +7,7 @@
  * demo mode when nothing is found (plain `vite dev` in a browser).
  *
  * Backend methods we call (JSON strings in / out):
- *   openDialog()            -> string path
- *   listDir(path)           -> { entries: [{ name, path, is_dir, size }] }
+ *   openDialog()            -> { path } | "/abs/file.glb" | null (cancel)
  *   info(path)              -> Info
  *   loadBytes(path)         -> { b64, size } | string (base64)
  *   optimize(path, preset)  -> { out_path, report }
@@ -23,9 +22,9 @@
  */
 
 import * as demo from "./demo";
+import { toast } from "./ui";
 import type {
   DiffReport,
-  DirEntry,
   EncodeResult,
   Info,
   LintResult,
@@ -41,9 +40,13 @@ export interface ProgressEvent {
   pct: number;
 }
 
+/** Result of the native file picker. `path` is null when the user cancels. */
+export interface OpenDialogResult {
+  path: string | null;
+}
+
 const METHOD_NAMES = [
   "openDialog",
-  "listDir",
   "info",
   "loadBytes",
   "optimize",
@@ -137,7 +140,7 @@ function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|listDir|info|loadBytes|optimize|textures|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|textures|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
         key,
       );
     if (!m) continue;
@@ -265,46 +268,12 @@ function normalizeImages(raw: unknown): TexturesResult {
   return { images: images as TexturesResult["images"] };
 }
 
-function normalizeEntries(raw: unknown, base: string): DirEntry[] {
-  const obj = raw as unknown;
-  const list: unknown[] = Array.isArray(obj)
-    ? obj
-    : Array.isArray((obj as Record<string, unknown>)?.entries)
-      ? ((obj as Record<string, unknown>).entries as unknown[])
-      : Array.isArray((obj as Record<string, unknown>)?.items)
-        ? ((obj as Record<string, unknown>).items as unknown[])
-        : [];
-  const baseClean = base.endsWith("/") ? base.slice(0, -1) : base;
-  return list.map((item) => {
-    const e = (typeof item === "string" ? { name: item } : item) as Record<string, unknown>;
-    const name = String(e.name ?? e.file ?? e.path ?? "");
-    const isDir = Boolean(e.is_dir ?? e.isDir ?? e.dir ?? e.directory);
-    const path = String(e.path ?? `${baseClean}/${name}`);
-    return {
-      name,
-      path,
-      is_dir: isDir,
-      size: e.size == null ? undefined : asNumber(e.size),
-    };
-  });
-}
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 class DemoBackend {
   async info(path: string): Promise<Info> {
     await sleep(120);
     return { ...demo.demoInfo, file: path };
-  }
-
-  async listDir(path: string): Promise<DirEntry[]> {
-    await sleep(80);
-    return demo.demoTree().map((e) => ({ ...e, path: path.replace(/\/$/, "") + "/" + e.name }));
-  }
-
-  async openDialog(): Promise<string | null> {
-    await sleep(50);
-    return "/demo/DamagedHelmet.glb";
   }
 
   async optimize(
@@ -469,18 +438,25 @@ export class Bridge {
     await this.raw("presetSave", [name, zon]);
   }
 
-  async listDir(path: string): Promise<DirEntry[]> {
-    if (!this.live) return this.demo.listDir(path);
-    return normalizeEntries(parseMaybeJson(await this.raw("listDir", [path])), path);
-  }
-
-  async openDialog(): Promise<string | null> {
-    if (!this.live) return this.demo.openDialog();
+  /**
+   * Native file picker. Resolves `{ path }` on pick and `{ path: null }` on cancel.
+   * Tolerates a bare path string, `null`, or a missing backend method.
+   */
+  async openDialog(): Promise<OpenDialogResult> {
+    if (!this.live) {
+      toast("run via assetty binary", "error");
+      return { path: null };
+    }
+    if (!this.native || !this.native.methods.includes("openDialog")) {
+      toast("openDialog not available — rebuild the assetty binary", "error");
+      return { path: null };
+    }
     const res = parseMaybeJson<unknown>(await this.raw("openDialog", []));
-    if (typeof res === "string") return res || null;
-    const obj = (res ?? {}) as Record<string, unknown>;
+    if (res == null) return { path: null };
+    if (typeof res === "string") return { path: res.trim() || null };
+    const obj = res as Record<string, unknown>;
     const p = obj.path ?? obj.file;
-    return p == null ? null : String(p);
+    return { path: p == null || String(p).trim() === "" ? null : String(p) };
   }
 
   /** Subscribe to a backend event ("progress" | "log"). Returns an unsubscribe fn. */

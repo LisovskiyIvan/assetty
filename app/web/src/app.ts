@@ -4,13 +4,9 @@ import { toast } from "./ui";
 import type { Info } from "./types";
 import type { ViewerScene } from "./viewer";
 
-export type Slot = "a" | "b";
-
 export interface BusEvents {
-  /** active file changed (slot a = primary, slot b = comparison target) */
-  path: { path: string; slot: Slot };
-  /** filesystem tree should be reloaded */
-  tree: void;
+  /** active model changed */
+  path: { path: string };
   /** tabs should refresh from app.info / app.pathA */
   context: void;
 }
@@ -18,7 +14,6 @@ export interface BusEvents {
 export class App {
   readonly bridge = new Bridge();
   pathA: string | null = null;
-  pathB: string | null = null;
   info: Info | null = null;
   viewer: ViewerScene | null = null;
   private listeners = new Map<string, Set<(detail: unknown) => void>>();
@@ -36,10 +31,28 @@ export class App {
 
   toast = toast;
 
-  setPath(path: string, slot: Slot = "a"): void {
-    if (slot === "a") this.pathA = path;
-    else this.pathB = path;
-    this.emit("path", { path, slot });
+  /** Opens the native picker and returns the chosen path (null on cancel/failure). */
+  async pickPath(): Promise<string | null> {
+    try {
+      const res = await this.bridge.openDialog();
+      return res.path;
+    } catch (err) {
+      toast(`open failed: ${(err as Error).message}`, "error");
+      return null;
+    }
+  }
+
+  /** Native picker + the shared "model opened" state update. */
+  async pickAndOpen(): Promise<string | null> {
+    const path = await this.pickPath();
+    if (!path) return null;
+    this.setPath(path);
+    return path;
+  }
+
+  setPath(path: string): void {
+    this.pathA = path;
+    this.emit("path", { path });
   }
 
   setViewer(viewer: ViewerScene | null): void {

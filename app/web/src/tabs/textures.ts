@@ -1,5 +1,5 @@
 import { app } from "../app";
-import { el, fmtBytes, kv, psnrBadge, section, clear } from "../ui";
+import { el, fmtBytes, kv, psnrBadge, section, clear, emptyState, OPEN_HINT } from "../ui";
 import type { EncodeResult, ImageInfo } from "../types";
 import type { TabHandle } from "./types";
 
@@ -92,12 +92,13 @@ export function mountTextures(): TabHandle {
   function renderList(): void {
     clear(listHost);
     if (images.length === 0) {
-      listHost.append(
-        el("div", {
-          class: "empty",
-          text: app.pathA ? "no images in this asset" : "select a .glb in the sidebar",
-        }),
-      );
+      if (app.pathA) {
+        listHost.append(el("div", { class: "empty", text: "no images in this asset" }));
+      } else {
+        listHost.append(
+          emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() }),
+        );
+      }
       return;
     }
     const rows = images.map((img) =>
@@ -157,9 +158,9 @@ export function mountTextures(): TabHandle {
     images = [];
     selected = -1;
     last = null;
-    if (path) {
+    if (path || !app.bridge.live) {
       try {
-        const res = await app.bridge.textures(path);
+        const res = await app.bridge.textures(path ?? "/demo/DamagedHelmet.glb");
         images = res.images.slice().sort((a, b) => a.index - b.index);
       } catch (err) {
         app.toast(`textures failed: ${(err as Error).message}`, "error");
@@ -194,8 +195,7 @@ export function mountTextures(): TabHandle {
     }
   });
 
-  const offPath = app.on("path", (d) => {
-    if (d.slot !== "a") return;
+  const offPath = app.on("path", () => {
     void reload();
   });
 

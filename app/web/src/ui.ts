@@ -72,6 +72,25 @@ export function psnrBadge(psnr: number): HTMLElement {
   return el("span", { class: `badge ${cls}`, text: `${psnr.toFixed(2)} dB` });
 }
 
+/** Hint shown by tabs that need a model before they can do anything. */
+export const OPEN_HINT = "Open a model first (⌘O)";
+
+/** Centered empty state with an optional call-to-action button. */
+export function emptyState(
+  message: string,
+  action?: { label: string; onClick: () => void },
+): HTMLElement {
+  const node = el(
+    "div",
+    { class: "empty-state" },
+    el("div", { class: "empty-state-text", text: message }),
+  );
+  if (action) {
+    node.append(el("button", { class: "primary", text: action.label, onclick: action.onClick }));
+  }
+  return node;
+}
+
 export function section(title: string, ...children: Array<Node | string | null>): HTMLElement {
   return el(
     "div",
