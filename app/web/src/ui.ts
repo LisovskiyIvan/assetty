@@ -1,0 +1,130 @@
+/** Tiny DOM helpers — keeps the tab modules readable without a framework. */
+
+type Attrs = Record<string, unknown>;
+
+export function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  attrs?: Attrs | null,
+  ...children: Array<Node | string | number | null | undefined | false>
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  if (attrs) {
+    for (const [key, value] of Object.entries(attrs)) {
+      if (value == null || value === false) continue;
+      if (key === "class") node.className = String(value);
+      else if (key === "text") node.textContent = String(value);
+      else if (key === "html") node.innerHTML = String(value);
+      else if (key === "dataset") Object.assign(node.dataset, value as object);
+      else if (key.startsWith("on") && typeof value === "function") {
+        node.addEventListener(key.slice(2).toLowerCase(), value as EventListener);
+      } else if (key === "style" && typeof value === "object") {
+        Object.assign(node.style, value as object);
+      } else if (key in node) {
+        (node as unknown as Record<string, unknown>)[key] = value;
+      } else {
+        node.setAttribute(key, String(value));
+      }
+    }
+  }
+  for (const child of children) {
+    if (child == null || child === false) continue;
+    node.append(typeof child === "string" || typeof child === "number" ? String(child) : child);
+  }
+  return node;
+}
+
+export function clear(node: HTMLElement): void {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+export function fmtBytes(n: number | undefined | null): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)} ${units[i]}`;
+}
+
+export function fmtNum(n: number | undefined | null): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return n.toLocaleString("en-US");
+}
+
+export function fmtPct(p: number | null | undefined, digits = 1): string {
+  if (p == null || !Number.isFinite(p)) return "—";
+  const sign = p > 0 ? "+" : "";
+  return `${sign}${p.toFixed(digits)}%`;
+}
+
+export function deltaClass(p: number | null | undefined, lowerIsBetter = true): string {
+  if (p == null || !Number.isFinite(p) || Math.abs(p) < 0.05) return "delta-flat";
+  const good = lowerIsBetter ? p < 0 : p > 0;
+  return good ? "delta-good" : "delta-bad";
+}
+
+export function psnrBadge(psnr: number): HTMLElement {
+  const cls = psnr > 35 ? "green" : psnr > 28 ? "yellow" : "red";
+  return el("span", { class: `badge ${cls}`, text: `${psnr.toFixed(2)} dB` });
+}
+
+export function section(title: string, ...children: Array<Node | string | null>): HTMLElement {
+  return el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, el("span", { text: title })),
+    el("div", { class: "panel-body" }, ...children),
+  );
+}
+
+export function kv(pairs: Array<[string, string | HTMLElement]>): HTMLElement {
+  const dl = el("dl", { class: "kv" });
+  for (const [k, v] of pairs) {
+    dl.append(el("dt", { text: k }), el("dd", null, typeof v === "string" ? v : v));
+  }
+  return dl;
+}
+
+let toastHost: HTMLElement | null = null;
+
+export function toast(message: string, kind: "info" | "ok" | "error" = "info", ms = 3600): void {
+  if (!toastHost) {
+    toastHost = el("div", { class: "toasts" });
+    document.body.append(toastHost);
+  }
+  const node = el("div", { class: `toast ${kind === "info" ? "" : kind}`, text: message });
+  toastHost.append(node);
+  const remove = () => node.remove();
+  setTimeout(remove, ms);
+  node.addEventListener("click", remove);
+}
+
+export function spinner(label: string): HTMLElement {
+  return el("div", { class: "loading show", text: label });
+}
+
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function makeTable(headers: Array<[string, boolean?]>, rows: HTMLElement[]): HTMLElement {
+  const thead = el(
+    "thead",
+    null,
+    el(
+      "tr",
+      null,
+      ...headers.map(([label, num]) => el("th", { class: num ? "num" : "", text: label })),
+    ),
+  );
+  return el("table", null, thead, el("tbody", null, ...rows));
+}

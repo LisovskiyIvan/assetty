@@ -1,0 +1,55 @@
+# assetty-app web UI
+
+Vite + vanilla TypeScript + Babylon.js frontend for the nanoui (Zig) desktop window.
+
+```sh
+bun install
+bun run dev      # plain browser → demo mode (fake data, actions disabled)
+bun run build    # → dist/ (index.html + hashed assets + vendored transcoders)
+bun run preview  # serve the built dist/ for a browser smoke test
+```
+
+The Zig app serves the contents of `dist/`; `base: "./"` keeps every URL relative.
+
+## Bridge contract
+
+`src/bridge.ts` probes for the backend at boot:
+
+1. `window.nanoui.invoke(method, ...args)` if present
+2. `window.nanoui` with the methods directly
+3. a bound backend object on the global scope (`window.backend`, `window.assetty`, …)
+4. flat globals `window.<prefix>_<method>`
+
+Methods called (JSON string in / out, promises or plain values):
+
+| method | args | returns |
+| --- | --- | --- |
+| `openDialog()` | — | path string |
+| `listDir(path)` | path | `{ entries: [{ name, path, is_dir, size }] }` |
+| `info(path)` | path | same JSON as `assetty info --json` |
+| `loadBytes(path)` | path | `{ b64, size }` or bare base64 |
+| `optimize(path, preset)` | path, preset | `{ out_path, report: { steps, before, after, deltas } }` (CLI `output`/flat shape also accepted) |
+| `textures(path)` | path | `{ images: [...] }` |
+| `textureEncode(path, i)` | path, index | `{ ktx2_size, psnr, vram_after }` |
+| `diff(a, b)` | paths | diff report (`nodes`/`meshes`/… categories) |
+| `lint(path, budgetJson)` | path, JSON text | `{ violations, total }` (array of per-file results also accepted) |
+| `presets()` | — | `["desktop", …]` |
+| `presetLoad(name)` | name | zon text |
+| `presetSave(name, zon)` | name, text | anything |
+
+Events: `progress` (`{ step, pct }`) and `log` (`{ line }`). Subscribed via
+`backend.on(event, cb)` / `addEventListener` / `subscribe`, falling back to DOM
+events `nanoui:<event>` and `<event>`.
+
+If nothing is found the UI runs in demo mode: banner, static fixtures, backend
+actions disabled.
+
+## KTX2
+
+All decoder payloads are vendored (no network at runtime):
+
+- `public/ktx2/` — Babylon 9 decoder + wasm transcoders (UASTC→ASTC/BC7/RGBA, ETC1S via MSC, zstd)
+- `public/basis/` — classic `basis_transcoder.js/.wasm` (`.basis` files)
+
+`src/ktx2.ts` points `KhronosTextureContainer2.URLConfig` at those files,
+resolved against `document.baseURI`.

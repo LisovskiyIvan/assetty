@@ -440,7 +440,52 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     for (rewrites.items) |r| {
         r.at.data = data.accessors + r.new_index;
     }
+
+    // normalized integer POSITION/UV attributes require KHR_mesh_quantization
+    if (res.quantized_positions > 0 or res.quantized_uvs > 0 or res.quantized_normals > 0) {
+        try ensureExtension(data, "KHR_mesh_quantization", true);
+        try ensureExtension(data, "KHR_mesh_quantization", false);
+    }
     return res;
+}
+
+/// append `name` to extensions_used (required=true) or extensions_required;
+/// strings and the grown array are cgltf-memory owned (cgltf_free frees them)
+fn ensureExtension(data: *c.cgltf_data, name: []const u8, required: bool) !void {
+    const mem = data.memory;
+    const count_ptr = if (required) &data.extensions_required_count else &data.extensions_used_count;
+    const list_ptr = if (required) &data.extensions_required else &data.extensions_used;
+
+    var old_list: [*][*c]u8 = undefined;
+    var old_n: usize = 0;
+    if (@intFromPtr(list_ptr.*) != 0) {
+        old_list = @ptrCast(@alignCast(list_ptr.*));
+        old_n = @intCast(count_ptr.*);
+    }
+    var i: usize = 0;
+    while (i < old_n) : (i += 1) {
+        const s = std.mem.span(old_list[i]);
+        if (std.mem.eql(u8, s, name)) return;
+    }
+
+    const new_n = old_n + 1;
+    const allocf = mem.alloc_func orelse return error.OutOfMemory;
+    const new_list_raw = allocf(mem.user_data, new_n * @sizeOf([*c]u8)) orelse return error.OutOfMemory;
+    const new_list: [*][*c]u8 = @ptrCast(@alignCast(new_list_raw));
+    if (old_n > 0) @memcpy(new_list[0..old_n], old_list[0..old_n]);
+
+    const s_raw = allocf(mem.user_data, name.len + 1) orelse return error.OutOfMemory;
+    const s: [*]u8 = @ptrCast(s_raw);
+    @memcpy(s[0..name.len], name);
+    s[name.len] = 0;
+    new_list[old_n] = @ptrCast(s);
+
+    // release the old array (the strings it pointed at are owned individually)
+    if (old_n > 0) {
+        if (mem.free_func) |ff| ff(mem.user_data, @ptrCast(list_ptr.*));
+    }
+    list_ptr.* = @ptrCast(new_list);
+    count_ptr.* = new_n;
 }
 
 // ---------------------------------------------------------------------------
@@ -559,4 +604,24 @@ test "quantize: damaged helmet becomes normalized u16/s16" {
 
 test "quantize: box fixture round-trips" {
     try quantizeRoundTrip("test/fixtures/box.glb", "quantize-box.glb");
+}
+
+test "quantize declares KHR_mesh_quantization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var loaded = try parse_mod.loadFile(std.testing.io, al, "test/fixtures/box.glb");
+    defer loaded.deinit();
+    const res = try run(al, loaded.cdata, loaded.map, .{});
+    try std.testing.expect(res.quantized_positions > 0);
+    var found_used = false;
+    var found_req = false;
+    for (loaded.cdata.extensions_used[0..loaded.cdata.extensions_used_count]) |e| {
+        if (std.mem.eql(u8, std.mem.span(e), "KHR_mesh_quantization")) found_used = true;
+    }
+    for (loaded.cdata.extensions_required[0..loaded.cdata.extensions_required_count]) |e| {
+        if (std.mem.eql(u8, std.mem.span(e), "KHR_mesh_quantization")) found_req = true;
+    }
+    try std.testing.expect(found_used);
+    try std.testing.expect(found_req);
 }

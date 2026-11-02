@@ -2,6 +2,12 @@
     .name = .assetty,
     .fingerprint = 0xbee3cf8875db2e00,
     .version = "0.1.0",
+    .dependencies = .{
+        .nanoui = .{
+            .url = "git+https://github.com/justrach/nanoui?ref=v0.5.0#bae24d08097f6503958e5eee8531232de851b601",
+            .hash = "nanoui-0.5.0-we0KMcvyDQBLUpWVorREdjpiySA0-MH-x8hh_xVXkhoS",
+        },
+    },
     .minimum_zig_version = "0.17.0",
     .paths = .{""},
 }

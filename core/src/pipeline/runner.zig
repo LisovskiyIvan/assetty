@@ -332,7 +332,8 @@ fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureP
     return res;
 }
 
-fn notify(opts: Options, step: []const u8, pct: f32) void {    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct);
+fn notify(opts: Options, step: []const u8, pct: f32) void {
+    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct);
 }
 
 /// `Stats.image_stats[].name` points into the loader's arena. Copy any names
