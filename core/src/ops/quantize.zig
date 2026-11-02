@@ -5,13 +5,38 @@
 //! attribute gets a fresh accessor + buffer view; the original accessors are
 //! left in the pool and dropped by the writer's reachability GC on output.
 //!
-//! Caveat / design note: core glTF (without `KHR_mesh_quantization`) requires
-//! float vertex attributes, and a normalized integer attribute cannot carry the
-//! original value range on its own.  We therefore keep the *original* float
-//! POSITION `min`/`max` on the accessor and store the quantized values as
-//! normalized codes (range-relative to those bounds).  A renderer needs the
-//! `min`/`max` to dequantize, which is exactly the contract that a future
-//! `KHR_mesh_quantization` / `EXT_meshopt_compression` step will formalize.
+//! # Dequantization is baked into the node graph (gltfpack-style)
+//!
+//! A normalized integer POSITION accessor decodes to `code / 65535`, so the
+//! decoded range is always `[0, 1]` no matter what `min`/`max` claim.  The
+//! glTF spec forbids a renderer from dequantizing through the accessor bounds,
+//! so keeping them is not a fix: the model collapses to a unit cube.  The
+//! missing offset/scale has to be supplied by the node transform instead.
+//!
+//! For every node that references a position-quantized mesh we bake exactly
+//! that map into the node TRS (`v` = original mesh-space position):
+//!
+//!     q = (v - mn) / (mx - mn)             // what the accessor stores
+//!     node' = node * T(mn) * S(mx - mn)    // so node' * q == node * v
+//!     translation' = translation + R(rotation) * (scale ⊙ mn)
+//!     scale'       = scale ⊙ (mx - mn)     // per component, 0-range axis -> 1
+//!     rotation     unchanged
+//!
+//! Nodes with a MATRIX transform cannot be rewritten without changing what
+//! their matrix means, so their meshes keep float POSITION accessors.  Skinned
+//! meshes are joint-driven (the node transform is ignored by the shader) and
+//! morph targets store offsets in mesh space, so those keep floats too.
+//!
+//! `min`/`max` on a quantized POSITION accessor keep the ORIGINAL float bounds
+//! (gltfpack convention: viewers use them as the mesh-space bbox even though
+//! the payload is normalized).
+//!
+//! A mesh referenced by several nodes is duplicated (one mesh per node, shallow
+//! primitive copies on the first mesh and a deep clone for the rest) so every
+//! node carries exactly one baked dequant transform.  When a mesh's primitives
+//! have different position bounds the mesh is split, one mesh per distinct
+//! bounds group, with a sibling node per extra group (a *child* node would be
+//! transformed twice).
 //!
 //! `normal_oct` is accepted for API stability: octahedral encoding would require
 //! emitting NORMAL as a 2-component attribute, which core glTF forbids, so we
@@ -34,6 +59,8 @@ pub const Result = struct {
     quantized_positions: u32 = 0,
     quantized_uvs: u32 = 0,
     quantized_normals: u32 = 0,
+    /// nodes whose TRS got a dequant map baked in
+    dequantized_nodes: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +116,21 @@ fn freeRaw(data: *const c.cgltf_data, p: anytype) void {
     } else {
         std.c.free(@ptrCast(@constCast(p)));
     }
+}
+
+/// Allocate an array owned by cgltf (freed by `cgltf_free` with its hooks).
+fn cgltfAllocSlice(comptime T: type, data: *const c.cgltf_data, n: usize) ![*c]T {
+    if (n == 0) return null;
+    const bytes = allocRaw(data, n * @sizeOf(T)) orelse return error.OutOfMemory;
+    return @ptrCast(@alignCast(bytes));
+}
+
+fn dupStr(data: *const c.cgltf_data, s: [*c]const u8) ![*c]u8 {
+    const src = std.mem.span(s);
+    const raw = allocRaw(data, src.len + 1) orelse return error.OutOfMemory;
+    @memcpy(raw[0..src.len], src);
+    raw[src.len] = 0;
+    return @ptrCast(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +292,322 @@ fn commitPools(data: *c.cgltf_data, pool: *Pool) !void {
 }
 
 // ---------------------------------------------------------------------------
+// mesh / node pool growth
+// ---------------------------------------------------------------------------
+
+fn commitMeshes(data: *c.cgltf_data, extra: []const c.cgltf_mesh) !void {
+    if (extra.len == 0) return;
+    const old = data.meshes;
+    const old_n: usize = data.meshes_count;
+    const n = old_n + extra.len;
+    const bytes = allocRaw(data, n * @sizeOf(c.cgltf_mesh)) orelse return error.OutOfMemory;
+    const new: [*c]c.cgltf_mesh = @ptrCast(@alignCast(bytes));
+    if (old_n != 0) @memcpy(new[0..old_n], old[0..old_n]);
+    @memcpy(new[old_n..n], extra);
+
+    // meshes are only referenced from nodes
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
+        if (ptrIndex(c.cgltf_mesh, old, old_n, nd.mesh)) |i| nd.mesh = new + i;
+    }
+
+    data.meshes = new;
+    data.meshes_count = n;
+    if (old_n != 0 and @intFromPtr(old) != 0) freeRaw(data, old);
+}
+
+fn remapNodePtr(
+    slot: *[*c]c.cgltf_node,
+    old: [*c]c.cgltf_node,
+    old_n: usize,
+    new: [*c]c.cgltf_node,
+) void {
+    if (ptrIndex(c.cgltf_node, old, old_n, slot.*)) |i| slot.* = new + i;
+}
+
+fn commitNodes(data: *c.cgltf_data, extra: []const c.cgltf_node) !void {
+    if (extra.len == 0) return;
+    const old = data.nodes;
+    const old_n: usize = data.nodes_count;
+    const n = old_n + extra.len;
+    const bytes = allocRaw(data, n * @sizeOf(c.cgltf_node)) orelse return error.OutOfMemory;
+    const new: [*c]c.cgltf_node = @ptrCast(@alignCast(bytes));
+    if (old_n != 0) @memcpy(new[0..old_n], old[0..old_n]);
+    @memcpy(new[old_n..n], extra);
+
+    data.nodes = new;
+    data.nodes_count = n;
+
+    for (sl(c.cgltf_node, new, n)) |*nd| {
+        remapNodePtr(&nd.parent, old, old_n, new);
+        for (sl([*c]c.cgltf_node, nd.children, nd.children_count)) |*cp| {
+            remapNodePtr(cp, old, old_n, new);
+        }
+    }
+    for (sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
+        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |*cp| {
+            remapNodePtr(cp, old, old_n, new);
+        }
+    }
+    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+        remapNodePtr(&sk.skeleton, old, old_n, new);
+        for (sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |*jp| {
+            remapNodePtr(jp, old, old_n, new);
+        }
+    }
+    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+            remapNodePtr(&ch.target_node, old, old_n, new);
+        }
+    }
+
+    if (old_n != 0 and @intFromPtr(old) != 0) freeRaw(data, old);
+}
+
+fn appendNodeRef(
+    data: *const c.cgltf_data,
+    arr: *[*c][*c]c.cgltf_node,
+    count: anytype,
+    node: [*c]c.cgltf_node,
+) !void {
+    const n: usize = count.*;
+    const out = try cgltfAllocSlice([*c]c.cgltf_node, data, n + 1);
+    if (n != 0) @memcpy(out[0..n], arr.*[0..n]);
+    out[n] = node;
+    if (n != 0 and @intFromPtr(arr.*) != 0) freeRaw(data, arr.*);
+    arr.* = out;
+    count.* = n + 1;
+}
+
+fn appendChild(data: *c.cgltf_data, parent: [*c]c.cgltf_node, child: [*c]c.cgltf_node) !void {
+    const arr: *[*c][*c]c.cgltf_node = @ptrCast(&parent[0].children);
+    try appendNodeRef(data, arr, &parent[0].children_count, child);
+    child[0].parent = parent;
+}
+
+/// Add `np` to every scene that lists `src` (root nodes have no parent).
+fn addToScenes(data: *c.cgltf_data, src: [*c]c.cgltf_node, np: [*c]c.cgltf_node) !void {
+    for (sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
+        var found = false;
+        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |cand| {
+            if (@intFromPtr(cand) == @intFromPtr(src)) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            const arr: *[*c][*c]c.cgltf_node = @ptrCast(&s.nodes);
+            try appendNodeRef(data, arr, &s.nodes_count, np);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dequant transform math (no external deps)
+// ---------------------------------------------------------------------------
+
+const Bounds = struct {
+    mn: [3]f32,
+    mx: [3]f32,
+};
+
+fn boundsEql(x: Bounds, y: Bounds) bool {
+    return std.mem.eql(u8, std.mem.asBytes(&x), std.mem.asBytes(&y));
+}
+
+const Trs = struct {
+    t: [3]f32 = .{ 0, 0, 0 },
+    r: [4]f32 = .{ 0, 0, 0, 1 },
+    s: [3]f32 = .{ 1, 1, 1 },
+};
+
+fn readTrs(n: *const c.cgltf_node) Trs {
+    var out: Trs = .{};
+    if (n.has_translation != 0) out.t = n.translation;
+    if (n.has_rotation != 0) out.r = n.rotation;
+    if (n.has_scale != 0) out.s = n.scale;
+    return out;
+}
+
+fn cross(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+/// Rotate `v` by the quaternion `q` (xyz, w).  glTF rotations are unit
+/// quaternions; the formula below is the standard unit-quaternion rotation.
+fn quatRotate(q: [4]f32, v: [3]f32) [3]f32 {
+    const u = [3]f32{ q[0], q[1], q[2] };
+    const t = cross(u, v);
+    const scaled = [3]f32{ t[0] * 2.0, t[1] * 2.0, t[2] * 2.0 };
+    const c2 = cross(u, scaled);
+    return .{
+        v[0] + scaled[0] * q[3] + c2[0],
+        v[1] + scaled[1] * q[3] + c2[1],
+        v[2] + scaled[2] * q[3] + c2[2],
+    };
+}
+
+/// `node' = node * T(mn) * S(mx - mn)`, keeping the rotation untouched.
+fn bakeDequant(trs: Trs, b: Bounds) Trs {
+    const mn = [3]f32{ b.mn[0], b.mn[1], b.mn[2] };
+    const off = quatRotate(trs.r, .{
+        trs.s[0] * mn[0],
+        trs.s[1] * mn[1],
+        trs.s[2] * mn[2],
+    });
+    var s: [3]f32 = .{ 1, 1, 1 };
+    for (0..3) |k| {
+        const range = b.mx[k] - b.mn[k];
+        // a flat axis quantizes to code 0 everywhere; any scale reproduces
+        // `mn`, and 1 keeps the composed matrix invertible
+        s[k] = trs.s[k] * (if (range != 0) range else 1.0);
+    }
+    return .{
+        .t = .{ trs.t[0] + off[0], trs.t[1] + off[1], trs.t[2] + off[2] },
+        .r = trs.r,
+        .s = s,
+    };
+}
+
+fn applyTrs(n: *c.cgltf_node, trs: Trs) void {
+    n.has_translation = 1;
+    n.translation = trs.t;
+    n.has_scale = 1;
+    n.scale = trs.s;
+    // rotation is copied verbatim; only emit it when the source had one
+    if (n.has_rotation != 0) n.rotation = trs.r;
+}
+
+// ---------------------------------------------------------------------------
+// mesh / node cloning (deep, because cgltf owns every nested array)
+// ---------------------------------------------------------------------------
+
+fn cloneAttributes(
+    data: *const c.cgltf_data,
+    attrs: [*c]c.cgltf_attribute,
+    n: usize,
+) ![*c]c.cgltf_attribute {
+    if (n == 0) return null;
+    const out = try cgltfAllocSlice(c.cgltf_attribute, data, n);
+    for (0..n) |k| {
+        out[k] = attrs[k];
+        if (@intFromPtr(attrs[k].name) != 0) {
+            out[k].name = try dupStr(data, attrs[k].name);
+        }
+    }
+    return out;
+}
+
+fn cloneMesh(data: *const c.cgltf_data, src: *const c.cgltf_mesh) !c.cgltf_mesh {
+    var m = std.mem.zeroes(c.cgltf_mesh);
+    if (@intFromPtr(src.name) != 0) {
+        m.name = try dupStr(data, src.name);
+    }
+
+    const pn: usize = src.primitives_count;
+    m.primitives_count = pn;
+    if (pn != 0) {
+        const prims = try cgltfAllocSlice(c.cgltf_primitive, data, pn);
+        for (0..pn) |k| {
+            const sp = &src.primitives[k];
+            prims[k] = sp.*;
+            prims[k].attributes = try cloneAttributes(data, sp.attributes, sp.attributes_count);
+            // extras / raw extensions are not deep-cloned: their storage is
+            // owned by the source mesh and cgltf_free would double-free it
+            prims[k].extras = std.mem.zeroes(c.cgltf_extras);
+            prims[k].extensions = null;
+            prims[k].extensions_count = 0;
+
+            if (sp.targets_count != 0) {
+                const ts = try cgltfAllocSlice(c.cgltf_morph_target, data, sp.targets_count);
+                for (0..sp.targets_count) |t| {
+                    ts[t] = sp.targets[t];
+                    ts[t].attributes = try cloneAttributes(
+                        data,
+                        sp.targets[t].attributes,
+                        sp.targets[t].attributes_count,
+                    );
+                }
+                prims[k].targets = ts;
+            }
+            if (sp.mappings_count != 0) {
+                const ms = try cgltfAllocSlice(c.cgltf_material_mapping, data, sp.mappings_count);
+                for (0..sp.mappings_count) |t| {
+                    ms[t] = sp.mappings[t];
+                    ms[t].extras = std.mem.zeroes(c.cgltf_extras);
+                }
+                prims[k].mappings = ms;
+            }
+            if (sp.has_draco_mesh_compression != 0) {
+                prims[k].draco_mesh_compression.attributes = try cloneAttributes(
+                    data,
+                    sp.draco_mesh_compression.attributes,
+                    sp.draco_mesh_compression.attributes_count,
+                );
+            }
+        }
+        m.primitives = prims;
+    }
+
+    if (src.weights_count != 0) {
+        const ws = try cgltfAllocSlice(c.cgltf_float, data, src.weights_count);
+        @memcpy(ws[0..src.weights_count], src.weights[0..src.weights_count]);
+        m.weights = ws;
+        m.weights_count = src.weights_count;
+    }
+    if (src.target_names_count != 0) {
+        const tn = try cgltfAllocSlice([*c]u8, data, src.target_names_count);
+        for (0..src.target_names_count) |k| {
+            tn[k] = if (@intFromPtr(src.target_names[k]) != 0)
+                try dupStr(data, src.target_names[k])
+            else
+                null;
+        }
+        m.target_names = tn;
+        m.target_names_count = src.target_names_count;
+    }
+    return m;
+}
+
+fn cloneNodeForGroup(
+    data: *const c.cgltf_data,
+    src: *const c.cgltf_node,
+    b: Bounds,
+) !c.cgltf_node {
+    var n = std.mem.zeroes(c.cgltf_node);
+    n.rotation = .{ 0, 0, 0, 1 };
+    n.scale = .{ 1, 1, 1 };
+
+    const baked = bakeDequant(readTrs(src), b);
+    n.has_translation = 1;
+    n.translation = baked.t;
+    n.has_rotation = src.has_rotation;
+    n.rotation = baked.r;
+    n.has_scale = 1;
+    n.scale = baked.s;
+
+    if (src.has_mesh_gpu_instancing != 0) {
+        n.has_mesh_gpu_instancing = 1;
+        n.mesh_gpu_instancing.attributes = try cloneAttributes(
+            data,
+            src.mesh_gpu_instancing.attributes,
+            src.mesh_gpu_instancing.attributes_count,
+        );
+        n.mesh_gpu_instancing.attributes_count = src.mesh_gpu_instancing.attributes_count;
+    }
+    if (src.weights_count != 0) {
+        const ws = try cgltfAllocSlice(c.cgltf_float, data, src.weights_count);
+        @memcpy(ws[0..src.weights_count], src.weights[0..src.weights_count]);
+        n.weights = ws;
+        n.weights_count = src.weights_count;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // quantization
 // ---------------------------------------------------------------------------
 
@@ -276,8 +634,51 @@ fn clampSnorm(v: f32) f32 {
     return if (v < -1) -1 else if (v > 1) 1 else v;
 }
 
+fn findAttr(p: *const c.cgltf_primitive, at_type: c_int) ?[*c]c.cgltf_accessor {
+    for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+        if (at.type == at_type) return at.data;
+    }
+    return null;
+}
+
+/// Bounds of a VEC3 position accessor (dequantized floats; sparse-aware).
+fn computeBounds(a: std.mem.Allocator, acc: [*c]const c.cgltf_accessor) !?Bounds {
+    const src = acc.*;
+    if (numComponents(src.type) != 3 or src.count == 0) return null;
+
+    const total: usize = src.count * 3;
+    const tmp = try a.alloc(f32, total);
+    defer a.free(tmp);
+
+    var acc2 = src;
+    if (acc2.stride == 0) acc2.stride = c.cgltf_calc_size(acc2.type, acc2.component_type);
+    const got = c.cgltf_accessor_unpack_floats(&acc2, tmp.ptr, total);
+    if (got < total) return null;
+
+    var b = Bounds{
+        .mn = .{ tmp[0], tmp[1], tmp[2] },
+        .mx = .{ tmp[0], tmp[1], tmp[2] },
+    };
+    var e: usize = 1;
+    while (e < src.count) : (e += 1) {
+        for (0..3) |k| {
+            const v = tmp[e * 3 + k];
+            if (v < b.mn[k]) b.mn[k] = v;
+            if (v > b.mx[k]) b.mx[k] = v;
+        }
+    }
+    return b;
+}
+
 /// Build the quantized accessor + buffer view for one source accessor.
-fn build(a: std.mem.Allocator, data: *const c.cgltf_data, kind: Kind, acc: [*c]const c.cgltf_accessor, opts: Options) !?Built {
+fn build(
+    a: std.mem.Allocator,
+    data: *const c.cgltf_data,
+    kind: Kind,
+    acc: [*c]const c.cgltf_accessor,
+    opts: Options,
+    pos_bounds: ?Bounds,
+) !?Built {
     const src = acc.*;
     const ncomp = numComponents(src.type);
     if (ncomp != expectedComponents(kind)) return null;
@@ -306,6 +707,17 @@ fn build(a: std.mem.Allocator, data: *const c.cgltf_data, kind: Kind, acc: [*c]c
             const v = tmp[e * ncomp + k];
             if (v < mn[k]) mn[k] = v;
             if (v > mx[k]) mx[k] = v;
+        }
+    }
+
+    if (kind == .position) {
+        // the mesh plan already computed these; use them so encode, accessor
+        // bounds and the baked node transform are guaranteed to agree
+        if (pos_bounds) |pb| {
+            for (0..3) |k| {
+                mn[k] = pb.mn[k];
+                mx[k] = pb.mx[k];
+            }
         }
     }
 
@@ -351,6 +763,7 @@ fn build(a: std.mem.Allocator, data: *const c.cgltf_data, kind: Kind, acc: [*c]c
     na.offset = 0;
     if (kind == .position) {
         // POSITION must carry min/max: keep the pre-quantization float bounds
+        // (gltfpack convention; the dequant lives in the node transform)
         na.has_min = 1;
         na.has_max = 1;
         for (0..ncomp) |k| {
@@ -386,6 +799,109 @@ const Rewrite = struct {
     new_index: u32,
 };
 
+// ---------------------------------------------------------------------------
+// mesh planning
+// ---------------------------------------------------------------------------
+
+const Group = struct {
+    bounds: Bounds,
+    prims: std.ArrayListUnmanaged(usize) = .empty,
+};
+
+const MeshPlan = struct {
+    /// positions of every primitive may be quantized and dequantized via the
+    /// transforms of all referencing nodes
+    eligible: bool = false,
+    groups: std.ArrayListUnmanaged(Group) = .empty,
+
+    fn deinit(self: *MeshPlan, a: std.mem.Allocator) void {
+        for (self.groups.items) |*g| g.prims.deinit(a);
+        self.groups.deinit(a);
+    }
+
+    fn clearGroups(self: *MeshPlan, a: std.mem.Allocator) void {
+        for (self.groups.items) |*g| g.prims.deinit(a);
+        self.groups.clearRetainingCapacity();
+    }
+};
+
+/// Node-transform / attribute level preconditions for quantizing positions.
+fn baseEligible(
+    data: *const c.cgltf_data,
+    mesh: *const c.cgltf_mesh,
+    refs: []const *c.cgltf_node,
+    anim_trs: []const bool,
+) bool {
+    if (refs.len == 0) return false;
+    for (refs) |n| {
+        if (n.has_matrix != 0) return false;
+        if (@intFromPtr(n.skin) != 0) return false;
+        // animations on translation/scale would overwrite the baked dequant
+        const ni = ptrIndex(c.cgltf_node, data.nodes, anim_trs.len, n) orelse return false;
+        if (anim_trs[ni]) return false;
+    }
+    if (mesh.primitives_count == 0) return false;
+
+    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+        // morph target deltas are mesh-space offsets: the baked node scale
+        // would scale them as well, so keep the whole mesh in float space
+        if (p.targets_count != 0) return false;
+
+        var has_pos = false;
+        for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+            if (at.type == c.cgltf_attribute_type_joints) return false; // skinned
+            if (at.type == c.cgltf_attribute_type_position) {
+                if (@intFromPtr(at.data) == 0) return false;
+                if (numComponents(at.data.*.type) != 3 or at.data.*.count == 0) return false;
+                has_pos = true;
+            }
+        }
+        if (!has_pos) return false;
+    }
+    return true;
+}
+
+/// Fill `plan.groups`: primitives grouped by identical position bounds.
+/// Returns false when the mesh cannot be position-quantized after all.
+fn planGroups(
+    a: std.mem.Allocator,
+    acc_base: [*c]c.cgltf_accessor,
+    acc_n: usize,
+    mesh: *const c.cgltf_mesh,
+    plan: *MeshPlan,
+    cache: []?Bounds,
+    done: []bool,
+) !bool {
+    plan.clearGroups(a);
+    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count), 0..) |*p, pi| {
+        const acc = findAttr(p, c.cgltf_attribute_type_position) orelse return false;
+        const ai = ptrIndex(c.cgltf_accessor, acc_base, acc_n, acc) orelse return false;
+        if (!done[ai]) {
+            cache[ai] = try computeBounds(a, acc_base + ai);
+            done[ai] = true;
+        }
+        const b = cache[ai] orelse return false;
+
+        var placed = false;
+        for (plan.groups.items) |*g| {
+            if (boundsEql(g.bounds, b)) {
+                try g.prims.append(a, pi);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            try plan.groups.append(a, .{ .bounds = b });
+            try plan.groups.items[plan.groups.items.len - 1].prims.append(a, pi);
+        }
+    }
+    return plan.groups.items.len > 0;
+}
+
+// ---------------------------------------------------------------------------
+// entry point
+// ---------------------------------------------------------------------------
+
 pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, opts: Options) !Result {
     _ = file_bytes;
     // `in_place` is the only supported mode for now (accessor rewrite);
@@ -394,8 +910,251 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
 
     var res: Result = .{};
     const base_acc_n: usize = data.accessors_count;
+    const mesh_n: usize = data.meshes_count;
+    if (mesh_n == 0) return res;
 
-    // original accessor index -> new accessor index
+    // --- which nodes reference which mesh --------------------------------
+    const refs = try a.alloc(std.ArrayListUnmanaged(*c.cgltf_node), mesh_n);
+    defer {
+        for (refs) |*r| r.deinit(a);
+        a.free(refs);
+    }
+    for (refs) |*r| r.* = .empty;
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        if (ptrIndex(c.cgltf_mesh, data.meshes, mesh_n, n.mesh)) |mi| {
+            try refs[mi].append(a, n);
+        }
+    }
+
+    // --- per mesh position plan ------------------------------------------
+    // nodes whose translation/scale are animated cannot carry a baked dequant
+    // (the animation would overwrite it on the first frame)
+    const anim_trs = try a.alloc(bool, data.nodes_count);
+    defer a.free(anim_trs);
+    @memset(anim_trs, false);
+    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+            if (@intFromPtr(ch.target_node) == 0) continue;
+            if (ch.target_path != c.cgltf_animation_path_type_translation and
+                ch.target_path != c.cgltf_animation_path_type_scale) continue;
+            if (ptrIndex(c.cgltf_node, data.nodes, data.nodes_count, ch.target_node)) |ni| {
+                anim_trs[ni] = true;
+            }
+        }
+    }
+
+    const plans = try a.alloc(MeshPlan, mesh_n);
+    defer {
+        for (plans) |*p| p.deinit(a);
+        a.free(plans);
+    }
+    for (plans) |*p| p.* = .{};
+
+    const bounds_cache = try a.alloc(?Bounds, base_acc_n);
+    defer a.free(bounds_cache);
+    const bounds_done = try a.alloc(bool, base_acc_n);
+    defer a.free(bounds_done);
+    for (0..base_acc_n) |i| {
+        bounds_cache[i] = null;
+        bounds_done[i] = false;
+    }
+
+    // position accessor -> meshes that use it (shared accessors must keep a
+    // single quantized payload, so *every* user has to be transform-bakeable)
+    var pos_use: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    defer {
+        var it = pos_use.valueIterator();
+        while (it.next()) |v| v.deinit(a);
+        pos_use.deinit(a);
+    }
+    for (0..mesh_n) |mi| {
+        // meshes without node references are dropped by the writer's GC; they
+        // must not veto quantizing an accessor they happen to share
+        if (refs[mi].items.len == 0) continue;
+        const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+        for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+            const acc = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
+            const ai = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
+            const gop = try pos_use.getOrPut(a, ai);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(a, @intCast(mi));
+        }
+    }
+
+    for (plans, 0..) |*plan, mi| {
+        const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+        plan.eligible = baseEligible(data, mesh, refs[mi].items, anim_trs);
+    }
+
+    // Revoke eligibility until stable: a shared position accessor may only be
+    // quantized when *all* of its users bake a dequant transform, and a mesh
+    // can only be quantized when every primitive has usable float bounds.
+    var stable = false;
+    while (!stable) {
+        stable = true;
+        for (plans, 0..) |*plan, mi| {
+            if (!plan.eligible) continue;
+            const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+
+            outer: for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+                const acc = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
+                const ai = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
+                if (pos_use.get(ai)) |users| {
+                    for (users.items) |mj| {
+                        if (!plans[mj].eligible) {
+                            plan.eligible = false;
+                            stable = false;
+                            break :outer;
+                        }
+                    }
+                }
+            }
+            if (!plan.eligible) continue;
+
+            if (!try planGroups(a, data.accessors, base_acc_n, mesh, plan, bounds_cache, bounds_done)) {
+                plan.eligible = false;
+                stable = false;
+            }
+        }
+        for (plans) |*plan| {
+            if (!plan.eligible) plan.clearGroups(a);
+        }
+    }
+
+    // --- structural changes: split / duplicate meshes, bake node TRS ------
+    var new_meshes: std.ArrayListUnmanaged(c.cgltf_mesh) = .empty;
+    defer new_meshes.deinit(a);
+    var new_bounds: std.ArrayListUnmanaged(?Bounds) = .empty;
+    defer new_bounds.deinit(a);
+
+    const SiblingJob = struct {
+        src_index: u32,
+        parent_index: ?u32,
+        mesh_index: usize,
+        bounds: Bounds,
+    };
+    var jobs: std.ArrayListUnmanaged(SiblingJob) = .empty;
+    defer jobs.deinit(a);
+
+    const NodeAssignment = struct {
+        node: *c.cgltf_node,
+        mesh_index: usize,
+        bounds: Bounds,
+    };
+    var assignments: std.ArrayListUnmanaged(NodeAssignment) = .empty;
+    defer assignments.deinit(a);
+
+    const old_node_n: usize = data.nodes_count;
+
+    for (0..mesh_n) |mi| {
+        const plan = &plans[mi];
+        if (!plan.eligible) continue;
+        const meshes = sl(c.cgltf_mesh, data.meshes, mesh_n);
+        const mesh = &meshes[mi];
+        const groups = plan.groups.items;
+
+        const group_mesh = try a.alloc(usize, groups.len);
+        defer a.free(group_mesh);
+        group_mesh[0] = mi;
+
+        // one mesh per additional bounds group; primitive structs are copied
+        // (their nested arrays change ownership exactly once)
+        for (groups[1..], 1..) |grp, g| {
+            var nm = std.mem.zeroes(c.cgltf_mesh);
+            const prims = try cgltfAllocSlice(c.cgltf_primitive, data, grp.prims.items.len);
+            for (grp.prims.items, 0..) |pi, k| prims[k] = mesh.primitives[pi];
+            nm.primitives = prims;
+            nm.primitives_count = grp.prims.items.len;
+            group_mesh[g] = mesh_n + new_meshes.items.len;
+            try new_meshes.append(a, nm);
+            try new_bounds.append(a, grp.bounds);
+        }
+        if (groups.len > 1) {
+            // the original mesh keeps only group 0's primitives
+            for (groups[0].prims.items, 0..) |pi, k| mesh.primitives[k] = mesh.primitives[pi];
+            mesh.primitives_count = groups[0].prims.items.len;
+        }
+
+        // one mesh per referencing node (gltfpack dups instanced meshes)
+        for (refs[mi].items, 0..) |node, ri| {
+            for (groups, 0..) |grp, g| {
+                var mindex = group_mesh[g];
+                if (ri > 0) {
+                    const src_mesh = if (mindex < mesh_n)
+                        &meshes[mindex]
+                    else
+                        &new_meshes.items[mindex - mesh_n];
+                    const clone = try cloneMesh(data, src_mesh);
+                    mindex = mesh_n + new_meshes.items.len;
+                    try new_meshes.append(a, clone);
+                    try new_bounds.append(a, grp.bounds);
+                }
+                if (g == 0) {
+                    // the referencing node itself takes this mesh
+                    try assignments.append(a, .{ .node = node, .mesh_index = mindex, .bounds = grp.bounds });
+                } else {
+                    // extra bounds group: needs a sibling leaf node
+                    const src_index = ptrIndex(c.cgltf_node, data.nodes, old_node_n, node) orelse continue;
+                    const parent_index: ?u32 = if (@intFromPtr(node.parent) != 0)
+                        ptrIndex(c.cgltf_node, data.nodes, old_node_n, node.parent)
+                    else
+                        null;
+                    try jobs.append(a, .{
+                        .src_index = src_index,
+                        .parent_index = parent_index,
+                        .mesh_index = mindex,
+                        .bounds = grp.bounds,
+                    });
+                }
+            }
+        }
+    }
+
+    // --- grow the mesh pool, then bake the original nodes -----------------
+    const total_meshes = mesh_n + new_meshes.items.len;
+    const final_bounds = try a.alloc(?Bounds, total_meshes);
+    defer a.free(final_bounds);
+    for (0..mesh_n) |mi| {
+        final_bounds[mi] = if (plans[mi].eligible) plans[mi].groups.items[0].bounds else null;
+    }
+    for (new_bounds.items, 0..) |b, k| final_bounds[mesh_n + k] = b;
+
+    try commitMeshes(data, new_meshes.items);
+
+    // sibling nodes are derived from the *original* (still unbaked) TRS, so
+    // build them before the assignments rewrite translation/scale in place
+    var extra: std.ArrayListUnmanaged(c.cgltf_node) = .empty;
+    defer extra.deinit(a);
+    for (jobs.items) |job| {
+        const src = &sl(c.cgltf_node, data.nodes, old_node_n)[job.src_index];
+        var nn = try cloneNodeForGroup(data, src, job.bounds);
+        nn.mesh = data.meshes + job.mesh_index;
+        try extra.append(a, nn);
+    }
+
+    for (assignments.items) |asg| {
+        const trs = bakeDequant(readTrs(asg.node), asg.bounds);
+        applyTrs(asg.node, trs);
+        asg.node.mesh = data.meshes + asg.mesh_index;
+        res.dequantized_nodes += 1;
+    }
+
+    // --- grow the node pool, then attach the sibling nodes ----------------
+    if (extra.items.len != 0) {
+        try commitNodes(data, extra.items);
+
+        for (jobs.items, 0..) |job, k| {
+            const np: [*c]c.cgltf_node = data.nodes + (old_node_n + k);
+            if (job.parent_index) |pi| {
+                try appendChild(data, data.nodes + pi, np);
+            } else {
+                try addToScenes(data, data.nodes + job.src_index, np);
+            }
+        }
+        res.dequantized_nodes += @intCast(jobs.items.len);
+    }
+
+    // --- quantize the attributes of the final mesh pool -------------------
     const mapping = try a.alloc(?u32, base_acc_n);
     defer a.free(mapping);
     @memset(mapping, null);
@@ -405,14 +1164,24 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     var rewrites: std.ArrayListUnmanaged(Rewrite) = .empty;
     defer rewrites.deinit(a);
 
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, mi| {
+        const pos_bounds: ?Bounds = final_bounds[mi];
         for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             // vertex-only attribute rewrite; morph targets keep their floats
             for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 const kind = kindOf(at) orelse continue;
+                // no baked dequant for this mesh: keep float POSITION
+                if (kind == .position and pos_bounds == null) continue;
                 const old_index = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, at.data) orelse continue;
                 if (mapping[old_index] == null) {
-                    const built = try build(a, data, kind, data.accessors + old_index, opts);
+                    const built = try build(
+                        a,
+                        data,
+                        kind,
+                        data.accessors + old_index,
+                        opts,
+                        if (kind == .position) pos_bounds else null,
+                    );
                     if (built) |b| {
                         const new_index: u32 = @intCast(base_acc_n + pool.acc.items.len);
                         try pool.view.append(a, b.view);
@@ -495,18 +1264,27 @@ fn ensureExtension(data: *c.cgltf_data, name: []const u8, required: bool) !void 
 const parse_mod = @import("../gltf/parse.zig");
 const write_mod = @import("../gltf/write.zig");
 
-fn countTriangles(data: *const c.cgltf_data) u64 {
+fn countMeshTriangles(m: *const c.cgltf_mesh) u64 {
     var tris: u64 = 0;
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
-            if (p.type != c.cgltf_primitive_type_triangles) continue;
-            if (@intFromPtr(p.indices) != 0) {
-                tris += p.indices.*.count / 3;
-            } else {
-                const pos = c.cgltf_find_accessor(p, c.cgltf_attribute_type_position, 0);
-                if (@intFromPtr(pos) != 0) tris += pos.*.count / 3;
-            }
+    for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+        if (p.type != c.cgltf_primitive_type_triangles) continue;
+        if (@intFromPtr(p.indices) != 0) {
+            tris += p.indices.*.count / 3;
+        } else {
+            const pos = c.cgltf_find_accessor(p, c.cgltf_attribute_type_position, 0);
+            if (@intFromPtr(pos) != 0) tris += pos.*.count / 3;
         }
+    }
+    return tris;
+}
+
+/// Triangles actually drawn: a mesh referenced by two nodes counts twice, so
+/// mesh duplication (one mesh per node) stays invisible to this metric.
+fn instancedTriangles(data: *const c.cgltf_data) u64 {
+    var tris: u64 = 0;
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        const mi = ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, n.mesh) orelse continue;
+        tris += countMeshTriangles(&sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi]);
     }
     return tris;
 }
@@ -524,6 +1302,121 @@ fn firstAttrAcc(data: *const c.cgltf_data, kind: c_int) ?*const c.cgltf_accessor
     return null;
 }
 
+fn findNode(data: *const c.cgltf_data, name: []const u8) ?*c.cgltf_node {
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        if (@intFromPtr(n.name) == 0) continue;
+        if (std.mem.eql(u8, std.mem.span(n.name), name)) return n;
+    }
+    return null;
+}
+
+fn meshPosBounds(m: *const c.cgltf_mesh) ?Bounds {
+    for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+        const pos = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
+        if (pos[0].has_min == 0 or pos[0].has_max == 0) continue;
+        return .{
+            .mn = .{ pos[0].min[0], pos[0].min[1], pos[0].min[2] },
+            .mx = .{ pos[0].max[0], pos[0].max[1], pos[0].max[2] },
+        };
+    }
+    return null;
+}
+
+const Aabb = struct {
+    mn: [3]f32 = .{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) },
+    mx: [3]f32 = .{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) },
+    valid: bool = false,
+
+    fn add(self: *Aabb, p: [3]f32) void {
+        self.valid = true;
+        for (0..3) |k| {
+            if (p[k] < self.mn[k]) self.mn[k] = p[k];
+            if (p[k] > self.mx[k]) self.mx[k] = p[k];
+        }
+    }
+
+    fn merge(self: *Aabb, o: Aabb) void {
+        if (!o.valid) return;
+        self.add(o.mn);
+        self.add(o.mx);
+    }
+};
+
+fn transformPoint(m: *const [16]f32, v: [3]f32) [3]f32 {
+    // cgltf matrices are column-major
+    return .{
+        m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12],
+        m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13],
+        m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14],
+    };
+}
+
+/// World-space AABB of one node's mesh, using the *decoded* accessor values
+/// (normalized integers included), i.e. exactly what a renderer sees.
+fn nodeWorldAabb(
+    data: *const c.cgltf_data,
+    a: std.mem.Allocator,
+    node: *const c.cgltf_node,
+) !Aabb {
+    var out = Aabb{};
+    const mi = ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, node.mesh) orelse return out;
+    var m: [16]f32 = undefined;
+    c.cgltf_node_transform_world(node, &m);
+
+    const mesh = &sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi];
+    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+        const pos = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
+        const ncomp = numComponents(pos[0].type);
+        if (ncomp < 3 or pos[0].count == 0) continue;
+        const total = pos[0].count * ncomp;
+        const tmp = try a.alloc(f32, total);
+        defer a.free(tmp);
+        var acc2 = pos[0];
+        if (acc2.stride == 0) acc2.stride = c.cgltf_calc_size(acc2.type, acc2.component_type);
+        if (c.cgltf_accessor_unpack_floats(&acc2, tmp.ptr, total) < total) continue;
+        for (0..pos[0].count) |v| {
+            out.add(transformPoint(&m, .{
+                tmp[v * ncomp + 0],
+                tmp[v * ncomp + 1],
+                tmp[v * ncomp + 2],
+            }));
+        }
+    }
+    return out;
+}
+
+fn worldAabb(data: *const c.cgltf_data, a: std.mem.Allocator) !Aabb {
+    var out = Aabb{};
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        out.merge(try nodeWorldAabb(data, a, n));
+    }
+    return out;
+}
+
+fn expectAabbClose(before: Aabb, after: Aabb) !void {
+    try std.testing.expect(before.valid and after.valid);
+    for (0..3) |k| {
+        const span = @max(before.mx[k] - before.mn[k], 1e-3);
+        const tol = span * 0.02 + 1e-4;
+        try std.testing.expectApproxEqAbs(before.mn[k], after.mn[k], tol);
+        try std.testing.expectApproxEqAbs(before.mx[k], after.mx[k], tol);
+    }
+}
+
+const Reparsed = struct {
+    loaded: parse_mod.Loaded,
+    tmp: std.testing.TmpDir,
+};
+
+fn reparse(a: std.mem.Allocator, tmp_name: []const u8, bytes: []const u8) !Reparsed {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = tmp_name, .data = bytes });
+    const out_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], tmp_name });
+    const loaded = try parse_mod.loadFile(std.testing.io, a, out_path);
+    return .{ .loaded = loaded, .tmp = tmp };
+}
+
 fn quantizeRoundTrip(comptime path: []const u8, tmp_name: []const u8) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -533,38 +1426,41 @@ fn quantizeRoundTrip(comptime path: []const u8, tmp_name: []const u8) !void {
     var loaded = try parse_mod.loadFile(std.testing.io, a, path);
     defer loaded.deinit();
 
-    const tris_before = countTriangles(loaded.cdata);
+    const tris_before = instancedTriangles(loaded.cdata);
     const pos_before = firstAttrAcc(loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
     const min_before = pos_before.min;
     const max_before = pos_before.max;
     const has_bounds = pos_before.has_min != 0 and pos_before.has_max != 0;
+    const aabb_before = try worldAabb(loaded.cdata, aa);
 
     const res = try run(aa, loaded.cdata, loaded.map, .{});
     try std.testing.expect(res.quantized_positions > 0);
     try std.testing.expect(res.quantized_uvs > 0);
     try std.testing.expect(res.quantized_normals > 0);
+    try std.testing.expect(res.dequantized_nodes > 0);
     std.debug.print(
-        "quantize {s}: pos={d} uv={d} nrm={d} tris={d}\n",
-        .{ path, res.quantized_positions, res.quantized_uvs, res.quantized_normals, tris_before },
+        "quantize {s}: pos={d} uv={d} nrm={d} nodes={d} tris={d}\n",
+        .{ path, res.quantized_positions, res.quantized_uvs, res.quantized_normals, res.dequantized_nodes, tris_before },
     );
 
     const out = try write_mod.serialize(aa, loaded.cdata, loaded.map);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = tmp_name, .data = out });
-    const out_path = try std.fmt.allocPrint(aa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path[0..], tmp_name });
-
-    var re = try parse_mod.loadFile(std.testing.io, a, out_path);
-    defer re.deinit();
+    var rp = try reparse(aa, tmp_name, out);
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
     try std.testing.expectEqual(
         @as(c_uint, c.cgltf_result_success),
-        @as(c_uint, c.cgltf_validate(re.cdata)),
+        @as(c_uint, c.cgltf_validate(rp.loaded.cdata)),
     );
 
-    try std.testing.expectEqual(tris_before, countTriangles(re.cdata));
+    try std.testing.expectEqual(tris_before, instancedTriangles(rp.loaded.cdata));
 
-    const pos_after = firstAttrAcc(re.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
+    // the baked node transforms must reproduce the original world-space model
+    try expectAabbClose(aabb_before, try worldAabb(rp.loaded.cdata, aa));
+
+    const pos_after = firstAttrAcc(rp.loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
     try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_16u), pos_after.component_type);
     try std.testing.expect(pos_after.normalized != 0);
     try std.testing.expectEqual(@as(c.cgltf_type, c.cgltf_type_vec3), pos_after.type);
@@ -580,22 +1476,26 @@ fn quantizeRoundTrip(comptime path: []const u8, tmp_name: []const u8) !void {
         }
     }
 
-    const uv_after = firstAttrAcc(re.cdata, c.cgltf_attribute_type_texcoord) orelse return error.NoUv;
+    const uv_after = firstAttrAcc(rp.loaded.cdata, c.cgltf_attribute_type_texcoord) orelse return error.NoUv;
     try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_16u), uv_after.component_type);
     try std.testing.expect(uv_after.normalized != 0);
     try std.testing.expectEqual(@as(c.cgltf_type, c.cgltf_type_vec2), uv_after.type);
 
-    const n_after = firstAttrAcc(re.cdata, c.cgltf_attribute_type_normal) orelse return error.NoNormal;
+    const n_after = firstAttrAcc(rp.loaded.cdata, c.cgltf_attribute_type_normal) orelse return error.NoNormal;
     try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_16), n_after.component_type);
     try std.testing.expect(n_after.normalized != 0);
     try std.testing.expectEqual(@as(c.cgltf_type, c.cgltf_type_vec3), n_after.type);
 
     // the model-level view still matches (attributes survive the writer)
-    for (re.asset.meshes) |m| {
+    for (rp.loaded.asset.meshes) |m| {
         for (m.primitives) |p| {
             try std.testing.expect(p.attributes.len > 0);
         }
     }
+
+    // serialize(parse(serialize(x))) is byte-identical
+    const out2 = try write_mod.serialize(aa, rp.loaded.cdata, rp.loaded.map);
+    try std.testing.expectEqualSlices(u8, out, out2);
 }
 
 test "quantize: damaged helmet becomes normalized u16/s16" {
@@ -624,4 +1524,310 @@ test "quantize declares KHR_mesh_quantization" {
     }
     try std.testing.expect(found_used);
     try std.testing.expect(found_req);
+}
+
+test "quantize: dequant baked into node TRS keeps the cube's world bounds" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+    defer loaded.deinit();
+
+    const aabb_before = try worldAabb(loaded.cdata, aa);
+    const box_a = findNode(loaded.cdata, "BoxA") orelse return error.NoNode;
+    const box_b = findNode(loaded.cdata, "BoxB") orelse return error.NoNode;
+    const aabb_a_before = try nodeWorldAabb(loaded.cdata, aa, box_a);
+    const aabb_b_before = try nodeWorldAabb(loaded.cdata, aa, box_b);
+    const meshes_before: usize = loaded.cdata.meshes_count;
+    try std.testing.expectEqual(@as(usize, 1), meshes_before);
+
+    const res = try run(aa, loaded.cdata, loaded.map, .{});
+    try std.testing.expect(res.quantized_positions > 0);
+    // mesh 0 is used by two nodes -> duplicated, one mesh per node
+    try std.testing.expectEqual(meshes_before + 1, @as(usize, loaded.cdata.meshes_count));
+    try std.testing.expectEqual(@as(u32, 2), res.dequantized_nodes);
+
+    // every mesh-carrying node carries the dequant scale / offset
+    var mesh_nodes: usize = 0;
+    for (sl(c.cgltf_node, loaded.cdata.nodes, loaded.cdata.nodes_count)) |*n| {
+        const mi = ptrIndex(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count, n.mesh) orelse continue;
+        mesh_nodes += 1;
+        const b = meshPosBounds(&sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[mi]) orelse continue;
+        try std.testing.expect(n.has_scale != 0);
+        for (0..3) |k| {
+            const range = b.mx[k] - b.mn[k];
+            if (range != 0) try std.testing.expectApproxEqRel(range, n.scale[k], 1e-5);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), mesh_nodes);
+
+    const out = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+    var rp = try reparse(aa, "quantize-dequant.glb", out);
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(rp.loaded.cdata)),
+    );
+
+    try expectAabbClose(aabb_before, try worldAabb(rp.loaded.cdata, aa));
+    const box_a2 = findNode(rp.loaded.cdata, "BoxA") orelse return error.NoNode;
+    const box_b2 = findNode(rp.loaded.cdata, "BoxB") orelse return error.NoNode;
+    try expectAabbClose(aabb_a_before, try nodeWorldAabb(rp.loaded.cdata, aa, box_a2));
+    try expectAabbClose(aabb_b_before, try nodeWorldAabb(rp.loaded.cdata, aa, box_b2));
+
+    // dequant is scale = original position range, translation = t + mn
+    // (box nodes are rotation-free, so R is the identity)
+    // NB: the node pool was regrown above, so re-resolve the node pointer
+    const box_a_after = findNode(loaded.cdata, "BoxA") orelse return error.NoNode;
+    const scale_a = box_a_after.scale;
+    const trans_a = box_a_after.translation;
+    try std.testing.expect(box_a_after.has_scale != 0 and box_a_after.has_translation != 0);
+    const mesh_a = &sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[0];
+    const b = meshPosBounds(mesh_a) orelse return error.NoBounds;
+    for (0..3) |k| {
+        const range = b.mx[k] - b.mn[k];
+        if (range != 0) try std.testing.expectApproxEqRel(range, scale_a[k], 1e-5);
+        // BoxA's original translation was (-1.2, 0, 0)
+        const expect_t = if (k == 0) -1.2 + b.mn[k] else b.mn[k];
+        try std.testing.expectApproxEqAbs(expect_t, trans_a[k], 1e-5);
+    }
+}
+
+test "quantize: rotated + translated node keeps its world bounds" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+    defer loaded.deinit();
+
+    // single-node fixture: 0.5 on X plus a 90 degree rotation around Y
+    (findNode(loaded.cdata, "BoxB") orelse return error.NoNode).mesh = null;
+    const box = findNode(loaded.cdata, "BoxA") orelse return error.NoNode;
+    box.has_translation = 1;
+    box.translation = .{ 0.5, 0, 0 };
+    box.has_rotation = 1;
+    const s = @sqrt(0.5);
+    box.rotation = .{ 0, s, 0, s };
+
+    const rot_before = box.rotation;
+    const aabb_before = try worldAabb(loaded.cdata, aa);
+
+    const res = try run(aa, loaded.cdata, loaded.map, .{});
+    try std.testing.expect(res.quantized_positions > 0);
+    try std.testing.expectEqual(@as(usize, 1), @as(usize, loaded.cdata.meshes_count));
+
+    const box_after = findNode(loaded.cdata, "BoxA") orelse return error.NoNode;
+    // rotation must be untouched (only translation/scale absorb the dequant)
+    try std.testing.expectEqualSlices(f32, rot_before[0..], box_after.rotation[0..]);
+
+    const out = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+    var rp = try reparse(aa, "quantize-rotated.glb", out);
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
+    try expectAabbClose(aabb_before, try worldAabb(rp.loaded.cdata, aa));
+}
+
+test "quantize: matrix nodes and skinned meshes keep float positions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // MATRIX transform: the dequant cannot be baked into a bare matrix
+    {
+        var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+        defer loaded.deinit();
+        (findNode(loaded.cdata, "BoxB") orelse return error.NoNode).mesh = null;
+        (findNode(loaded.cdata, "BoxA") orelse return error.NoNode).has_matrix = 1;
+
+        const res = try run(aa, loaded.cdata, loaded.map, .{});
+        try std.testing.expectEqual(@as(u32, 0), res.quantized_positions);
+        // uv / normals still quantize: only POSITION needs a node transform
+        try std.testing.expect(res.quantized_uvs > 0 or res.quantized_normals > 0);
+        const pos = firstAttrAcc(loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
+        try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_32f), pos.component_type);
+    }
+
+    // skinned node: the shader ignores the node transform, so positions stay
+    // in joint space.  (A zeroed skin is enough: only its presence matters.)
+    {
+        var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+        defer loaded.deinit();
+        (findNode(loaded.cdata, "BoxB") orelse return error.NoNode).mesh = null;
+        var fake_skin = std.mem.zeroes(c.cgltf_skin);
+        (findNode(loaded.cdata, "BoxA") orelse return error.NoNode).skin = @ptrCast(&fake_skin);
+
+        const res = try run(aa, loaded.cdata, loaded.map, .{});
+        try std.testing.expectEqual(@as(u32, 0), res.quantized_positions);
+        const pos = firstAttrAcc(loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
+        try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_32f), pos.component_type);
+        try std.testing.expectEqual(@as(usize, 1), @as(usize, loaded.cdata.meshes_count));
+    }
+}
+
+test "quantize: serialize -> parse -> serialize is byte-stable" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+    defer loaded.deinit();
+    _ = try run(aa, loaded.cdata, loaded.map, .{});
+
+    const out1 = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+    var rp = try reparse(aa, "quantize-stable.glb", out1);
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
+    const out2 = try write_mod.serialize(aa, rp.loaded.cdata, rp.loaded.map);
+    try std.testing.expectEqualSlices(u8, out1, out2);
+}
+
+fn appendU32(a: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try out.appendSlice(a, &b);
+}
+
+/// Minimal GLB: one node -> one mesh with two primitives whose POSITION
+/// bounds differ (triangles at x in [0,1] and x in [2,4]).
+fn glbTwoPrims(a: std.mem.Allocator, tmp_name: []const u8) !Reparsed {
+    const json =
+        \\{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],
+        \\"nodes":[{"mesh":0}],
+        \\"meshes":[{"primitives":[
+        \\{"attributes":{"POSITION":0},"indices":2},
+        \\{"attributes":{"POSITION":1},"indices":3}]}],
+        \\"buffers":[{"byteLength":88}],
+        \\"bufferViews":[
+        \\{"buffer":0,"byteOffset":0,"byteLength":36},
+        \\{"buffer":0,"byteOffset":36,"byteLength":36},
+        \\{"buffer":0,"byteOffset":72,"byteLength":6},
+        \\{"buffer":0,"byteOffset":80,"byteLength":6}],
+        \\"accessors":[
+        \\{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]},
+        \\{"bufferView":1,"componentType":5126,"count":3,"type":"VEC3","min":[2,2,2],"max":[4,3,2]},
+        \\{"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"},
+        \\{"bufferView":3,"componentType":5123,"count":3,"type":"SCALAR"}]}
+    ;
+
+    var bin: [88]u8 = @splat(0);
+    const pos_a = [9]f32{ 0, 0, 0, 1, 0, 0, 0, 1, 0 };
+    const pos_b = [9]f32{ 2, 2, 2, 4, 2, 2, 2, 3, 2 };
+    for (pos_a, 0..) |v, k| std.mem.writeInt(u32, bin[k * 4 ..][0..4], @bitCast(v), .little);
+    for (pos_b, 0..) |v, k| std.mem.writeInt(u32, bin[36 + k * 4 ..][0..4], @bitCast(v), .little);
+    for (0..3) |k| {
+        std.mem.writeInt(u16, bin[72 + k * 2 ..][0..2], @intCast(k), .little);
+        std.mem.writeInt(u16, bin[80 + k * 2 ..][0..2], @intCast(k), .little);
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "glTF");
+    try appendU32(a, &out, 2);
+    try appendU32(a, &out, 0); // total length, patched below
+    const pad = (4 - (json.len % 4)) % 4;
+    try appendU32(a, &out, @intCast(json.len + pad));
+    try appendU32(a, &out, 0x4E4F534A);
+    try out.appendSlice(a, json);
+    try out.appendNTimes(a, ' ', pad);
+    try appendU32(a, &out, 88);
+    try appendU32(a, &out, 0x004E4942);
+    try out.appendSlice(a, &bin);
+    std.mem.writeInt(u32, out.items[8..12], @intCast(out.items.len), .little);
+
+    return reparse(a, tmp_name, out.items);
+}
+
+test "quantize: multi-primitive mesh splits per bounds group" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var rp = try glbTwoPrims(aa, "quantize-twoprim.glb");
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
+    try std.testing.expectEqual(@as(usize, 1), @as(usize, rp.loaded.cdata.meshes_count));
+
+    const aabb_before = try worldAabb(rp.loaded.cdata, aa);
+
+    const res = try run(aa, rp.loaded.cdata, rp.loaded.map, .{});
+    try std.testing.expectEqual(@as(u32, 2), res.quantized_positions); // one accessor per primitive
+    // two distinct bounds groups -> mesh split, sibling node for group 2
+    try std.testing.expectEqual(@as(usize, 2), @as(usize, rp.loaded.cdata.meshes_count));
+    try std.testing.expectEqual(@as(u32, 2), res.dequantized_nodes);
+
+    var found_a = false;
+    var found_b = false;
+    for (sl(c.cgltf_node, rp.loaded.cdata.nodes, rp.loaded.cdata.nodes_count)) |*n| {
+        if (ptrIndex(c.cgltf_mesh, rp.loaded.cdata.meshes, rp.loaded.cdata.meshes_count, n.mesh) == null) continue;
+        // group A: unit range; group B: x range 2 (0 range axes become 1)
+        if (std.math.approxEqAbs(f32, n.scale[0], 1.0, 1e-5) and
+            std.math.approxEqAbs(f32, n.scale[1], 1.0, 1e-5)) found_a = true;
+        if (std.math.approxEqAbs(f32, n.scale[0], 2.0, 1e-5) and
+            std.math.approxEqAbs(f32, n.scale[1], 1.0, 1e-5)) found_b = true;
+    }
+    try std.testing.expect(found_a and found_b);
+
+    const out = try write_mod.serialize(aa, rp.loaded.cdata, rp.loaded.map);
+    var rp2 = try reparse(aa, "quantize-twoprim-out.glb", out);
+    defer {
+        rp2.loaded.deinit();
+        rp2.tmp.cleanup();
+    }
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(rp2.loaded.cdata)),
+    );
+    try std.testing.expectEqual(@as(usize, 2), @as(usize, rp2.loaded.cdata.meshes_count));
+    try expectAabbClose(aabb_before, try worldAabb(rp2.loaded.cdata, aa));
+}
+
+test "quantize: transform-animated nodes keep float positions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/box.glb");
+    defer loaded.deinit();
+
+    (findNode(loaded.cdata, "BoxB") orelse return error.NoNode).mesh = null;
+    const box = findNode(loaded.cdata, "BoxA") orelse return error.NoNode;
+
+    // one fake channel animating BoxA's translation (cgltf_free owns the two
+    // malloc'd arrays below, so no arena memory leaks into cgltf)
+    const anims: [*]c.cgltf_animation = @ptrCast(@alignCast(
+        std.c.malloc(@sizeOf(c.cgltf_animation)) orelse return error.OutOfMemory,
+    ));
+    anims[0] = std.mem.zeroes(c.cgltf_animation);
+    const chans: [*]c.cgltf_animation_channel = @ptrCast(@alignCast(
+        std.c.malloc(@sizeOf(c.cgltf_animation_channel)) orelse return error.OutOfMemory,
+    ));
+    chans[0] = std.mem.zeroes(c.cgltf_animation_channel);
+    chans[0].target_node = box;
+    chans[0].target_path = c.cgltf_animation_path_type_translation;
+    anims[0].channels = @ptrCast(chans);
+    anims[0].channels_count = 1;
+    loaded.cdata.animations = @ptrCast(anims);
+    loaded.cdata.animations_count = 1;
+
+    const res = try run(aa, loaded.cdata, loaded.map, .{});
+    try std.testing.expectEqual(@as(u32, 0), res.quantized_positions);
+    const pos = firstAttrAcc(loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
+    try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_32f), pos.component_type);
 }
