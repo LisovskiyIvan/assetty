@@ -2,15 +2,15 @@ const std = @import("std");
 const core = @import("core");
 
 const usage =
-    \\basset — glTF/GLB asset toolkit
+    \\assetty — glTF/GLB asset toolkit
     \\
     \\Usage:
-    \\  basset info <file.glb> [--json]
-    \\  basset diff <old.glb> <new.glb> [--json]
-    \\  basset lint <file-or-dir> --budget <budget.json> [--json]
-    \\  basset textures <file.glb> [--encode N] [--json]
-    \\  basset presets
-    \\  basset optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>]
+    \\  assetty info <file.glb> [--json]
+    \\  assetty diff <old.glb> <new.glb> [--json]
+    \\  assetty lint <file-or-dir> --budget <budget.json> [--json]
+    \\  assetty textures <file.glb> [--encode N] [--json]
+    \\  assetty presets
+    \\  assetty optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>]
     \\
     \\Exit codes: 0 ok, 1 lint violations, 2 error
 ;
@@ -548,7 +548,7 @@ fn cmdDiff(init: std.process.Init, args: []const []const u8) !u8 {
         n += 1;
     }
     if (n != 2) {
-        std.debug.print("diff: usage: basset diff <old> <new> [--json]\n", .{});
+        std.debug.print("diff: usage: assetty diff <old> <new> [--json]\n", .{});
         return 2;
     }
     const as_json = hasFlag(args, "--json");

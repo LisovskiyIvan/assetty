@@ -1,11 +1,11 @@
-# basset
+# assetty
 
 glTF/GLB asset toolkit: info, diff, lint, optimize. Zig core + CLI (app UI — later).
 
 ## Build
 
 ```sh
-zig build --summary none          # zig-out/bin/basset
+zig build --summary none          # zig-out/bin/assetty
 zig build test                    # core tests + golden
 python3 test/gen_fixture.py       # синтетическая фикстура (если нет)
 ```
@@ -13,11 +13,11 @@ python3 test/gen_fixture.py       # синтетическая фикстура 
 ## CLI
 
 ```sh
-basset info <file.glb> [--json]                 # статистика: трисы, draw calls, VRAM, мусор
-basset diff a.glb b.glb [--json]                # что добавилось/удалилось/изменилось
-basset lint <dir|file> --budget budgets.json    # лимиты; exit 1 при нарушениях (CI)
-basset optimize f.glb --preset mobile -o out.glb [--report r.json]
-basset presets                                  # список пресетов
+assetty info <file.glb> [--json]                 # статистика: трисы, draw calls, VRAM, мусор
+assetty diff a.glb b.glb [--json]                # что добавилось/удалилось/изменилось
+assetty lint <dir|file> --budget budgets.json    # лимиты; exit 1 при нарушениях (CI)
+assetty optimize f.glb --preset mobile -o out.glb [--report r.json]
+assetty presets                                  # список пресетов
 ```
 
 Exit codes: `0` ok, `1` lint-нарушения, `2` ошибка.
