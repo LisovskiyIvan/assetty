@@ -19,6 +19,12 @@ pub const Options = struct {
     error_tolerance: f32 = 1e-3,
     aggressive: bool = false,
     lock_borders: bool = true,
+    /// Seam-aware simplification: fold NORMAL/TEXCOORD_0 error into the cost.
+    use_attributes: bool = false,
+    /// Per-component weight of the normal stream (position weight is implicit).
+    weight_normal: f32 = 1.0,
+    /// Per-component weight of the TEXCOORD_0 stream.
+    weight_uv: f32 = 1.0,
 };
 
 pub const Result = struct {
@@ -248,6 +254,95 @@ fn readFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !?[]f32 {
     return out[0..total];
 }
 
+/// Interleaved vertex data for `meshopt_simplifyWithAttributes`: one vertex per
+/// stride, `float3` position first, then whichever of the attribute streams
+/// exist (normal xyz, uv xy). `meshopt` wants positions and attributes as
+/// separate pointers, so both point into this one buffer at their offsets.
+const AttrStream = struct {
+    data: []f32,
+    /// bytes per vertex (position + attributes)
+    stride: usize,
+    /// attribute components per vertex (0 = nothing to weight)
+    comps: usize,
+    weights: [5]f32 = .{ 0, 0, 0, 0, 0 },
+
+    fn attrs(self: AttrStream) [*]const f32 {
+        return self.data.ptr + 3;
+    }
+};
+
+/// Build the interleaved position+attribute stream for `p`. Returns null when
+/// `use_attributes` is off, no attribute matches `vertex_count`, or the
+/// attribute data cannot be unpacked — callers then use plain `meshopt_simplify`.
+fn buildAttrStream(
+    a: std.mem.Allocator,
+    p: *const c.cgltf_primitive,
+    positions: []const f32,
+    vertex_count: usize,
+    opts: Options,
+) !?AttrStream {
+    if (!opts.use_attributes) return null;
+
+    const normal = c.cgltf_find_accessor(p, c.cgltf_attribute_type_normal, 0);
+    const uv = c.cgltf_find_accessor(p, c.cgltf_attribute_type_texcoord, 0);
+
+    const have_normal = @intFromPtr(normal) != 0 and
+        normal.*.count == vertex_count and
+        c.cgltf_num_components(normal.*.type) == 3;
+    const have_uv = @intFromPtr(uv) != 0 and
+        uv.*.count == vertex_count and
+        c.cgltf_num_components(uv.*.type) == 2;
+    const comps: usize = (if (have_normal) @as(usize, 3) else 0) + (if (have_uv) @as(usize, 2) else 0);
+    if (comps == 0) return null;
+
+    var normals: ?[]f32 = null;
+    defer if (normals) |n| a.free(n);
+    var uvs: ?[]f32 = null;
+    defer if (uvs) |u| a.free(u);
+    if (have_normal) normals = try readFloats(a, normal);
+    if (have_uv) uvs = try readFloats(a, uv);
+    // A stream that failed to unpack drops out; retry the decision without it.
+    const n_ok = normals != null;
+    const uv_ok = uvs != null;
+    const used: usize = (if (n_ok) @as(usize, 3) else 0) + (if (uv_ok) @as(usize, 2) else 0);
+    if (used == 0) return null;
+
+    const stride_floats = 3 + used;
+    const data = try a.alloc(f32, vertex_count * stride_floats);
+    var weights: [5]f32 = .{ 0, 0, 0, 0, 0 };
+    var w: usize = 0;
+    if (n_ok) {
+        weights[w..][0..3].* = .{ opts.weight_normal, opts.weight_normal, opts.weight_normal };
+        w += 3;
+    }
+    if (uv_ok) {
+        weights[w..][0..2].* = .{ opts.weight_uv, opts.weight_uv };
+        w += 2;
+    }
+    for (0..vertex_count) |v| {
+        const dst = data[v * stride_floats ..][0..stride_floats];
+        @memcpy(dst[0..3], positions[v * 3 ..][0..3]);
+        var o: usize = 3;
+        if (n_ok) {
+            const n = normals.?;
+            @memcpy(dst[o..][0..3], n[v * 3 ..][0..3]);
+            o += 3;
+        }
+        if (uv_ok) {
+            const u = uvs.?;
+            @memcpy(dst[o..][0..2], u[v * 2 ..][0..2]);
+            o += 2;
+        }
+    }
+
+    return .{
+        .data = data,
+        .stride = stride_floats * @sizeOf(f32),
+        .comps = used,
+        .weights = weights,
+    };
+}
+
 const Rewrite = struct {
     prim: *c.cgltf_primitive,
     new_index: u32,
@@ -329,6 +424,11 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
             const dest = try a.alloc(u32, idx_n);
             defer a.free(dest);
 
+            // Seam-aware path: fold normal/UV error into the collapse cost.
+            // Without matching attributes this is null and plain simplify runs.
+            const attr: ?AttrStream = try buildAttrStream(a, p, positions, vertex_count, opts);
+            defer if (attr) |as| a.free(as.data);
+
             var flags: c_uint = 0;
             if (opts.lock_borders) flags |= @intCast(mo.meshopt_SimplifyLockBorder);
             // v0.25+ dropped the "aggressive" flag; the closest knob is pruning
@@ -336,7 +436,23 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
             if (opts.aggressive) flags |= @intCast(mo.meshopt_SimplifyPrune);
 
             var result_error: f32 = 0;
-            const out_n = mo.meshopt_simplify(
+            const out_n = if (attr) |as| mo.meshopt_simplifyWithAttributes(
+                dest.ptr,
+                indices.ptr,
+                idx_n,
+                as.data.ptr,
+                vertex_count,
+                as.stride,
+                as.attrs(),
+                as.stride,
+                as.weights[0..].ptr,
+                as.comps,
+                null,
+                target,
+                opts.error_tolerance,
+                flags,
+                &result_error,
+            ) else mo.meshopt_simplify(
                 dest.ptr,
                 indices.ptr,
                 idx_n,
@@ -531,4 +647,85 @@ test "simplify: box fixture does not crash below the minimum" {
     try std.testing.expect(r.before > 0);
     try std.testing.expect(r.after <= r.before);
     try std.testing.expectEqual(r.after, r.written);
+}
+
+test "simplify: attributes keep seams, helmet still reaches the target" {
+    const r = try simplifyRoundTrip("test/fixtures/real/DamagedHelmet.glb", "simplify-helmet-attrs.glb", .{
+        .target_ratio = 0.5,
+        .error_tolerance = 10.0,
+        .lock_borders = true,
+        .use_attributes = true,
+        .weight_normal = 2.0,
+        .weight_uv = 1.0,
+    });
+
+    const half: f64 = @as(f64, @floatFromInt(r.before)) * 0.5;
+    const got: f64 = @floatFromInt(r.after);
+    try std.testing.expect(got <= half * 1.25);
+    try std.testing.expect(got >= half * 0.75);
+    try std.testing.expectEqual(r.after, r.written);
+    try std.testing.expect(r.after < r.before);
+}
+
+test "simplify: use_attributes falls back when attributes are missing" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/real/DamagedHelmet.glb");
+    defer loaded.deinit();
+
+    // Strip NORMAL/TEXCOORD_* in place: the primitives become positions-only,
+    // which must route through plain meshopt_simplify without failing.
+    var stripped = false;
+    for (sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                if (at.type == c.cgltf_attribute_type_normal or
+                    at.type == c.cgltf_attribute_type_texcoord)
+                {
+                    at.type = c.cgltf_attribute_type_invalid;
+                    stripped = true;
+                }
+            }
+        }
+    }
+    try std.testing.expect(stripped);
+
+    const before = countTriangles(loaded.cdata);
+    const res = try run(aa, loaded.cdata, loaded.map, .{
+        .target_ratio = 0.5,
+        .error_tolerance = 10.0,
+        .use_attributes = true,
+    });
+    try std.testing.expectEqual(before, res.before);
+    try std.testing.expect(res.after < res.before);
+
+    const half: f64 = @as(f64, @floatFromInt(before)) * 0.5;
+    const got: f64 = @floatFromInt(res.after);
+    try std.testing.expect(got <= half * 1.10);
+    try std.testing.expect(got >= half * 0.90);
+}
+
+test "simplify: attribute weights stay close to plain simplify" {
+    const plain = try simplifyRoundTrip("test/fixtures/real/DamagedHelmet.glb", "simplify-helmet-plain.glb", .{
+        .target_ratio = 0.5,
+        .error_tolerance = 10.0,
+    });
+    const attrs = try simplifyRoundTrip("test/fixtures/real/DamagedHelmet.glb", "simplify-helmet-weight.glb", .{
+        .target_ratio = 0.5,
+        .error_tolerance = 10.0,
+        .use_attributes = true,
+        .weight_normal = 2.0,
+        .weight_uv = 0.5,
+    });
+
+    try std.testing.expectEqual(plain.before, attrs.before);
+    // Weights change the collapse order, not the target: both runs must land
+    // inside the same ballpark.
+    const p: f64 = @floatFromInt(plain.after);
+    const g: f64 = @floatFromInt(attrs.after);
+    try std.testing.expect(g <= p * 1.25);
+    try std.testing.expect(g >= p * 0.75);
 }

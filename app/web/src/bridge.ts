@@ -23,6 +23,8 @@
  *   presets()               -> ["desktop", ...] | { presets: [...] }
  *   presetLoad(name)        -> zon text | { zon }
  *   presetSave(name, zon)   -> anything
+ *   settingsLoad()          -> raw JSON text of assetty.settings.json (cwd) or "{}"
+ *   settingsSave(text)      -> {"ok":true} | {"error":"..."} (validated, atomic)
  *
  * A job that is already running answers `{ "error": "busy" }`.
  *
@@ -101,6 +103,8 @@ const METHOD_NAMES = [
   "presets",
   "presetLoad",
   "presetSave",
+  "settingsLoad",
+  "settingsSave",
 ] as const;
 
 type AnyFn = (...args: unknown[]) => unknown;
@@ -184,7 +188,7 @@ function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
         key,
       );
     if (!m) continue;
@@ -250,6 +254,7 @@ function normalizeOptimize(raw: unknown): OptimizeResult {
       kind: String(st.kind ?? st.name ?? "step"),
       applied: Boolean(st.applied),
       note: st.note == null ? undefined : String(st.note),
+      secs: optNumber(st.secs ?? st.seconds ?? st.duration),
     };
   });
   const before = normalizeStats(rep.before ?? r.before);
@@ -257,6 +262,7 @@ function normalizeOptimize(raw: unknown): OptimizeResult {
   const report: OptimizeReport = {
     preset: rep.preset == null ? undefined : String(rep.preset),
     target: rep.target == null ? undefined : String(rep.target),
+    total_secs: optNumber(rep.total_secs ?? rep.total_seconds),
     steps,
     before,
     after,
@@ -407,6 +413,9 @@ export function isBusyError(err: unknown): boolean {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Demo-mode stand-in for `assetty.settings.json`. */
+const DEMO_SETTINGS_KEY = "assetty.settings.json";
+
 class DemoBackend {
   async info(path: string): Promise<Info> {
     await sleep(120);
@@ -517,6 +526,31 @@ class DemoBackend {
 
   async presetSave(): Promise<void> {
     await sleep(80);
+  }
+
+  /**
+   * Demo mode persists settings in localStorage so a plain `vite dev` session
+   * still round-trips them (the real host uses assetty.settings.json).
+   */
+  async settingsLoad(): Promise<string> {
+    try {
+      return window.localStorage.getItem(DEMO_SETTINGS_KEY) ?? "{}";
+    } catch {
+      return "{}";
+    }
+  }
+
+  async settingsSave(text: string): Promise<void> {
+    try {
+      JSON.parse(text);
+    } catch (err) {
+      throw new Error(`invalid settings JSON: ${(err as Error).message}`);
+    }
+    try {
+      window.localStorage.setItem(DEMO_SETTINGS_KEY, text);
+    } catch {
+      throw new Error("localStorage unavailable");
+    }
   }
 }
 
@@ -718,6 +752,44 @@ export class Bridge {
   async presetSave(name: string, zon: string): Promise<void> {
     if (!this.live) return this.demo.presetSave();
     await this.raw("presetSave", [name, zon]);
+  }
+
+  /**
+   * Raw text of `assetty.settings.json` (cwd), `{}` when the file is missing.
+   * New hosts may wrap the text as `{ text }`; older ones answer with the raw
+   * JSON string — both are unwrapped here.
+   */
+  async settingsLoad(): Promise<string> {
+    if (!this.live) return this.demo.settingsLoad();
+    if (!this.native?.methods.includes("settingsLoad")) return "{}";
+    const res = await this.raw("settingsLoad", []);
+    if (typeof res === "string") {
+      const trimmed = res.trim();
+      if (trimmed.startsWith("{")) {
+        try {
+          const obj = JSON.parse(trimmed) as Record<string, unknown>;
+          const wrapped = obj.text ?? obj.json ?? obj.settings;
+          if (typeof wrapped === "string") return wrapped;
+        } catch {
+          // Raw settings text is itself invalid JSON: hand it back untouched so
+          // the strict/tolerant parser can report the problem.
+        }
+      }
+      return res;
+    }
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      const obj = res as Record<string, unknown>;
+      const wrapped = obj.text ?? obj.json ?? obj.settings;
+      if (typeof wrapped === "string") return wrapped;
+      return JSON.stringify(res);
+    }
+    return "{}";
+  }
+
+  /** Validated atomic write on the host; rejects a `{ "error": ... }` reply. */
+  async settingsSave(text: string): Promise<void> {
+    if (!this.live) return this.demo.settingsSave(text);
+    await this.raw("settingsSave", [text]);
   }
 
   /**

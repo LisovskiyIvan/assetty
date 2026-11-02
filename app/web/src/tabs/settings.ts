@@ -1,82 +1,243 @@
 import { app } from "../app";
-import { el, section, clear } from "../ui";
+import { buildOptimizeForm } from "../optimizeForm";
+import {
+  applySettingsText,
+  getSettings,
+  onSettingsChange,
+  onSettingsStatus,
+  reloadSettings,
+  saveSettings,
+  settingsToJson,
+  setTheme,
+  themeMode,
+  updateSettings,
+} from "../settings";
+import type { SettingsStatus, ThemeMode } from "../settings";
+import { clear, el, section } from "../ui";
 import type { TabHandle } from "./types";
+
+/**
+ * Settings tab: a UI-first editor for `assetty.settings.json`.
+ *
+ * - theme (dark/light) and the optimize step defaults apply in-app on every
+ *   change and are debounce-saved (500 ms) through `settingsSave(text)`;
+ * - the JSON textarea is the escape hatch: "Apply JSON" parses the whole file,
+ *   clamps numbers to their UI ranges and reports errors inline;
+ * - "Reload from file" re-reads `settingsLoad()` and replaces the live state.
+ *
+ * The schema itself is documented at the top of `src/settings.ts`.
+ */
+
+const THEME_LABELS: Array<[ThemeMode, string]> = [
+  ["dark", "dark"],
+  ["light", "light"],
+];
+
+const SCHEMA_SAMPLE = `{
+  "theme": "dark",
+  "optimize": {
+    "steps": {
+      "prune":    { "enabled": true, "unused_nodes": true,
+                    "unused_materials": true, "unused_textures": true },
+      "dedup":    { "enabled": true, "accessors": true,
+                    "meshes": true, "materials": true },
+      "weld":     { "enabled": true, "tolerance": 0 },
+      "join":     { "enabled": true },
+      "textures": { "enabled": true, "format": "auto",
+                    "quality": 128, "max_size": 0, "generate_mips": true },
+      "quantize": { "enabled": true, "position_bits": 14,
+                    "uv_bits": 12, "normal_oct": true },
+      "simplify": { "enabled": false, "target_ratio": 0.5,
+                    "error_tolerance": 0.001, "aggressive": false,
+                    "lock_borders": true, "use_attributes": false,
+                    "weight_normal": 1, "weight_uv": 1 }
+    }
+  }
+}
+`;
+
+function statusText(status: SettingsStatus): string {
+  switch (status.state) {
+    case "loading":
+      return "loading assetty.settings.json…";
+    case "saving":
+      return "saving…";
+    case "saved":
+      return status.message ?? "saved";
+    case "error":
+      return `error: ${status.message ?? "save failed"}`;
+    default:
+      return "";
+  }
+}
 
 export function mountSettings(): TabHandle {
   const root = el("div", { class: "tab-body wide-side" });
   const main = el("div", { class: "tab-main" });
+  const scroll = el("div", { class: "settings-scroll" });
 
-  const title = el(
+  const head = el(
     "div",
     { class: "panel-head" },
-    el("span", { text: "preset zon" }),
-    el("span", { class: "muted mono", text: "—" }),
+    el("span", { text: "Settings" }),
+    el("span", { class: "muted mono", text: "assetty.settings.json" }),
   );
-  const zon = el("textarea", {
+  const info = el(
+    "div",
+    { class: "hint settings-info" },
+    el("span", {
+      text: "Persisted to assetty.settings.json in the working directory (demo mode: localStorage). Every change applies immediately and saves after 500 ms. Schema: ",
+    }),
+    el("span", {
+      class: "mono",
+      text: "{ theme, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify } } }",
+    }),
+  );
+
+  /* ---------------------------------------------------------------- theme */
+
+  const themeRow = el("div", { class: "segmented" });
+  const themeButtons: Array<{ mode: ThemeMode; button: HTMLButtonElement }> = [];
+  for (const [mode, label] of THEME_LABELS) {
+    const button = el("button", { class: "small", text: label, onclick: () => setTheme(mode) });
+    themeButtons.push({ mode, button });
+    themeRow.append(button);
+  }
+  function syncTheme(): void {
+    const active = themeMode();
+    for (const entry of themeButtons)
+      entry.button.classList.toggle("active", entry.mode === active);
+  }
+
+  /* ---------------------------------------------------- optimize defaults */
+
+  const defaultsBody = el("div", { class: "form" });
+  const defaultsForm = buildOptimizeForm(defaultsBody, {
+    get: () => getSettings().optimize.steps,
+    edit: (mutate) =>
+      updateSettings((settings) => {
+        mutate(settings.optimize.steps);
+      }),
+  });
+
+  /* ----------------------------------------------------------- JSON editor */
+
+  const json = el("textarea", {
+    class: "settings-json",
     spellcheck: false,
-    style: { minHeight: "0", flex: "1", borderRadius: "0", border: "0" },
+    title: "edit the whole settings file by hand",
   });
-  zon.value = "// select a preset on the right";
-  zon.disabled = true;
+  json.value = settingsToJson();
+  const jsonError = el("div", { class: "settings-error" });
+  const applyBtn = el("button", { class: "primary", text: "Apply JSON", disabled: true });
+  const saveBtn = el("button", { text: "Save now" });
+  const reloadBtn = el("button", { text: "Reload from file" });
+  const statusLine = el("span", { class: "hint muted", text: "" });
 
-  const saveBtn = el("button", { class: "primary", text: "Save preset", disabled: true });
-  const reloadBtn = el("button", { text: "Reload", disabled: true });
-  const status = el("span", { class: "hint", text: "" });
+  let dirty = false;
 
-  const footer = el("div", {
-    class: "panel-body",
-    style: { borderTop: "1px solid var(--border)" },
+  const markDirty = (): void => {
+    dirty = true;
+    applyBtn.disabled = false;
+    jsonError.textContent = "";
+  };
+  json.addEventListener("input", markDirty);
+
+  const resetEditor = (): void => {
+    json.value = settingsToJson();
+    dirty = false;
+    applyBtn.disabled = true;
+    jsonError.textContent = "";
+  };
+
+  applyBtn.addEventListener("click", () => {
+    try {
+      const next = applySettingsText(json.value);
+      json.value = settingsToJson(next);
+      dirty = false;
+      applyBtn.disabled = true;
+      jsonError.textContent = "";
+      defaultsForm.sync();
+    } catch (err) {
+      jsonError.textContent = (err as Error).message;
+    }
   });
-  footer.append(
-    el("div", { class: "row spread" }, el("div", { class: "row" }, saveBtn, reloadBtn), status),
-  );
 
-  main.append(title, zon, footer);
+  saveBtn.addEventListener("click", async () => {
+    const ok = await saveSettings();
+    statusLine.textContent = ok ? "saved" : "save failed (see error above)";
+  });
 
-  const side = el("div", { class: "tab-side" });
-  const listHost = el("div", { class: "panel-body" });
-  side.append(section("Presets", listHost));
-  side.append(
+  reloadBtn.addEventListener("click", async () => {
+    const ok = await reloadSettings();
+    if (ok) defaultsForm.sync();
+    resetEditor();
+  });
+
+  scroll.append(
     section(
-      "zon format",
+      "Theme",
+      themeRow,
       el("div", {
         class: "hint",
-        text: "presets are Zig zon objects: a .name, a .target and an ordered .steps list. Every step is a tagged union, applied in order.",
-      }),
-      el("pre", {
-        class: "mono",
-        style: { margin: "0", whiteSpace: "pre-wrap", fontSize: "11px", color: "var(--text-dim)" },
-        text: `.{
-    .name = "web",
-    .target = .web,
-    .steps = .{
-        .{ .prune = .{ .unused_nodes = true } },
-        .{ .weld = .{ .tolerance = 0.0 } },
-        .{ .textures = .{
-            .format = .ktx2,
-            .quality = 200,
-            .generate_mips = true,
-            .max_size = 1024,
-        } },
-        .{ .quantize = .{
-            .position_bits = 14,
-            .normal_oct = true,
-            .uv_bits = 12,
-            .compress = true,
-        } },
-    },
-}
-`,
+        text: "The UI switches CSS custom properties immediately; the Babylon inspector opens with the matching theme.",
       }),
     ),
     section(
-      "Theme",
+      "Optimize defaults",
+      el("div", {
+        class: "hint",
+        text: "Used to prefill the Optimize tab. Only checked steps are sent, and every edit is saved after 500 ms.",
+      }),
+      defaultsBody,
+    ),
+    section(
+      "Settings JSON",
+      el("div", {
+        class: "hint",
+        text: "Edit the whole file by hand. Apply parses the text, clamps numbers to their UI ranges and reports errors inline.",
+      }),
+      json,
+      jsonError,
       el(
         "div",
         { class: "row spread" },
-        el("span", { text: "dark" }),
-        el("span", { class: "badge dim", text: "only option" }),
+        el("div", { class: "row" }, applyBtn, saveBtn, reloadBtn),
+        statusLine,
       ),
+    ),
+  );
+
+  main.append(head, info, scroll);
+
+  /* ------------------------------------------------------- presets (zon) */
+
+  const side = el("div", { class: "tab-side" });
+  const listHost = el("div", { class: "panel-body" });
+  const presetZon = el("textarea", {
+    spellcheck: false,
+    style: { minHeight: "140px" },
+  });
+  presetZon.value = "// select a preset below";
+  presetZon.disabled = true;
+  const presetSaveBtn = el("button", { class: "small", text: "Save preset", disabled: true });
+  const presetReloadBtn = el("button", { class: "small", text: "Reload preset", disabled: true });
+  const presetStatus = el("span", { class: "hint muted", text: "" });
+
+  side.append(
+    section(
+      "Presets",
+      listHost,
+      presetZon,
+      el("div", { class: "row" }, presetSaveBtn, presetReloadBtn, presetStatus),
+    ),
+    section(
+      "Schema",
+      el("div", {
+        class: "hint",
+        text: "assetty.settings.json — frontend-owned, host validates + writes atomically.",
+      }),
+      el("pre", { class: "mono settings-schema", text: SCHEMA_SAMPLE }),
     ),
   );
 
@@ -84,38 +245,40 @@ export function mountSettings(): TabHandle {
 
   let names: string[] = [];
   let active: string | null = null;
-  let busy = false;
+  let presetBusy = false;
 
-  function setStatus(text: string, kind: "muted" | "warn" = "muted"): void {
-    status.textContent = text;
-    status.className = kind === "warn" ? "hint" : "hint muted";
+  function setPresetStatus(text: string, warn = false): void {
+    presetStatus.textContent = text;
+    presetStatus.className = warn ? "hint settings-bad" : "hint muted";
   }
 
   function renderList(): void {
     clear(listHost);
-    if (names.length === 0)
+    if (names.length === 0) {
       listHost.append(el("div", { class: "muted", text: "no presets found" }));
+    }
     for (const name of names) {
-      const row = el(
-        "div",
-        {
-          class: `item ${name === active ? "selected" : ""}`,
-          style: {
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            padding: "4px 6px",
-            borderRadius: "4px",
-            cursor: "pointer",
-            fontFamily: "var(--mono)",
-            fontSize: "12px",
+      listHost.append(
+        el(
+          "div",
+          {
+            class: `item ${name === active ? "selected" : ""}`,
+            style: {
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "4px 6px",
+              borderRadius: "4px",
+              cursor: "pointer",
+              fontFamily: "var(--mono)",
+              fontSize: "12px",
+            },
+            onclick: () => void selectPreset(name),
           },
-          onclick: () => void select(name),
-        },
-        el("span", { class: "kind", text: "preset" }),
-        el("span", { text: name }),
+          el("span", { class: "kind", text: "preset" }),
+          el("span", { text: name }),
+        ),
       );
-      listHost.append(row);
     }
   }
 
@@ -129,51 +292,66 @@ export function mountSettings(): TabHandle {
     renderList();
   }
 
-  async function select(name: string): Promise<void> {
+  async function selectPreset(name: string): Promise<void> {
     active = name;
     renderList();
-    title.replaceChildren(
-      el("span", { text: `preset: ${name}` }),
-      el("span", { class: "muted mono", text: "zon" }),
-    );
-    zon.disabled = true;
-    zon.value = "// loading…";
+    presetZon.disabled = true;
+    presetZon.value = "// loading…";
     try {
-      zon.value = await app.bridge.presetLoad(name);
+      presetZon.value = await app.bridge.presetLoad(name);
     } catch (err) {
-      zon.value = `// load failed: ${(err as Error).message}`;
+      presetZon.value = `// load failed: ${(err as Error).message}`;
     } finally {
-      zon.disabled = false;
-      saveBtn.disabled = !app.bridge.live || busy;
-      reloadBtn.disabled = !app.bridge.live || busy;
+      presetZon.disabled = false;
+      presetSaveBtn.disabled = !app.bridge.live || presetBusy;
+      presetReloadBtn.disabled = !app.bridge.live || presetBusy;
     }
   }
 
-  saveBtn.addEventListener("click", async () => {
-    if (!active || busy) return;
-    busy = true;
-    saveBtn.disabled = true;
+  presetSaveBtn.addEventListener("click", async () => {
+    if (!active || presetBusy) return;
+    presetBusy = true;
+    presetSaveBtn.disabled = true;
     try {
-      await app.bridge.presetSave(active, zon.value);
-      setStatus(`saved ${active}.zon`);
-      app.toast(`saved preset ${active}`, "ok");
+      await app.bridge.presetSave(active, presetZon.value);
+      setPresetStatus(`saved ${active}.zon`);
     } catch (err) {
-      setStatus(`save failed: ${(err as Error).message}`, "warn");
-      app.toast(`save failed: ${(err as Error).message}`, "error");
+      setPresetStatus(`save failed: ${(err as Error).message}`, true);
     } finally {
-      busy = false;
-      saveBtn.disabled = !app.bridge.live;
+      presetBusy = false;
+      presetSaveBtn.disabled = !app.bridge.live;
     }
   });
 
-  reloadBtn.addEventListener("click", () => {
-    if (active) void select(active);
+  presetReloadBtn.addEventListener("click", () => {
+    if (active) void selectPreset(active);
   });
+
+  /* -------------------------------------------------------------- wiring */
+
+  const offChange = onSettingsChange(() => {
+    syncTheme();
+    // Keep the textarea in sync unless the user is editing it right now.
+    if (!dirty && document.activeElement !== json) json.value = settingsToJson();
+  });
+  const offStatus = onSettingsStatus((status) => {
+    statusLine.textContent = statusText(status);
+    statusLine.className = status.state === "error" ? "hint settings-bad" : "hint muted";
+  });
+
+  syncTheme();
 
   return {
     el: root,
     activate: () => {
+      syncTheme();
+      defaultsForm.sync();
+      if (!dirty) json.value = settingsToJson();
       if (names.length === 0) void loadNames();
+    },
+    dispose: () => {
+      offChange();
+      offStatus();
     },
   };
 }

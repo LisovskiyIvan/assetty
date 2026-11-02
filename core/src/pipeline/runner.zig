@@ -44,12 +44,16 @@ pub const StepStatus = struct {
     kind: []const u8, // "prune", "dedup", ...
     applied: bool,
     note: []const u8 = "", // e.g. "not implemented, skipped"
+    /// Wall time spent inside this step's dispatch, in seconds.
+    secs: f32 = 0,
 };
 
 pub const Report = struct {
     steps: []const StepStatus,
     before: stats.Stats,
     after: stats.Stats,
+    /// Wall time of the whole run: load + steps + serialize/write, in seconds.
+    total_secs: f64 = 0,
 }; // arena-owned, no deinit needed
 
 pub const ProgressFn = *const fn (ctx: ?*anyopaque, step: []const u8, pct: f32) void;
@@ -63,6 +67,7 @@ pub const Options = struct {
 
 /// Load -> execute preset steps -> write out_path -> stats before/after.
 pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options) !Report {
+    const t_start = nowNs(io);
     const n_steps = opts.preset.steps.len;
     var steps = try a.alloc(StepStatus, n_steps);
 
@@ -81,6 +86,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
         const kind: []const u8 = @tagName(std.meta.activeTag(step));
         notify(opts, kind, if (n_steps == 0) 0.0 else @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_steps)));
 
+        const t_step = nowNs(io);
         steps[i] = switch (step) {
             .prune => blk: {
                 const res = try prune.run(a, asset);
@@ -153,6 +159,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     .error_tolerance = p.error_tolerance,
                     .aggressive = p.aggressive,
                     .lock_borders = p.lock_borders,
+                    .use_attributes = p.use_attributes,
+                    .weight_normal = p.weight_normal,
+                    .weight_uv = p.weight_uv,
                 });
                 break :blk .{
                     .kind = kind,
@@ -184,6 +193,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                 };
             },
         };
+        steps[i].secs = @floatCast(secsBetween(t_step, nowNs(io)));
     }
 
     // ---- 3. serialize + write --------------------------------------------
@@ -191,6 +201,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     const bytes = try write.serialize(a, loaded.cdata, loaded.map);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = opts.out_path, .data = bytes });
     notify(opts, "write", 1.0);
+    const t_end = nowNs(io);
 
     // ---- 4. after stats ---------------------------------------------------
     // The written file is the truth: writer GC + cdata-level ops determine
@@ -201,7 +212,21 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     var after = try stats.compute(a, out_loaded.asset);
     try dupImageNames(a, &after);
 
-    return .{ .steps = steps, .before = before, .after = after };
+    return .{
+        .steps = steps,
+        .before = before,
+        .after = after,
+        .total_secs = secsBetween(t_start, t_end),
+    };
+}
+
+/// Monotonic wall clock, in nanoseconds (`awake` = excludes system sleep).
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+fn secsBetween(t0: i96, t1: i96) f64 {
+    return @as(f64, @floatFromInt(t1 - t0)) / @as(f64, std.time.ns_per_s);
 }
 
 const TexEncResult = struct {
@@ -620,6 +645,15 @@ test "run noop preset on box fixture" {
     try testing.expect(rep.steps[0].note.len > 0);
     try testing.expectEqualStrings("dedup", rep.steps[1].kind);
     try testing.expect(rep.steps[1].applied);
+
+    // Timings: every step measured, total covers load+steps+write.
+    var step_secs: f64 = 0;
+    for (rep.steps) |st| {
+        try testing.expect(st.secs >= 0);
+        step_secs += st.secs;
+    }
+    try testing.expect(rep.total_secs >= 0);
+    try testing.expect(rep.total_secs >= step_secs - 1e-3);
 
     // Before/after stats are populated (box has geometry).
     try testing.expect(rep.before.triangles > 0);

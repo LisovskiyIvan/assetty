@@ -4,13 +4,20 @@ import { checkKtx2Assets, configureKtx2, reportDecoderFailure } from "./ktx2";
 import { logHistory, notify, onLog } from "./notify";
 import { createInspectorDock } from "./inspector";
 import { Logger } from "@babylonjs/core/Misc/logger";
+import {
+  applySettingsText,
+  loadSettings,
+  onSettingsChange,
+  saveSettings,
+  settingsToJson,
+  themeMode,
+  toggleTheme,
+} from "./settings";
 import { clear, copyText, el, fmtBytes, fmtCompact, statChip } from "./ui";
 import type { StatChip } from "./ui";
 import { mountViewer } from "./tabs/viewer";
 import { mountOptimize } from "./tabs/optimize";
 import { mountTextures } from "./tabs/textures";
-import { mountDiff } from "./tabs/diff";
-import { mountLint } from "./tabs/lint";
 import { mountSettings } from "./tabs/settings";
 import type { TabHandle } from "./tabs/types";
 
@@ -41,14 +48,12 @@ function surfaceDecoderFailures(): void {
   };
 }
 
-type TabId = "viewer" | "optimize" | "textures" | "diff" | "lint" | "settings";
+type TabId = "viewer" | "optimize" | "textures" | "settings";
 
 const TAB_DEFS: Array<{ id: TabId; label: string; mount: () => TabHandle }> = [
   { id: "viewer", label: "Viewer", mount: mountViewer },
   { id: "optimize", label: "Optimize", mount: mountOptimize },
   { id: "textures", label: "Textures", mount: mountTextures },
-  { id: "diff", label: "Diff", mount: mountDiff },
-  { id: "lint", label: "Lint", mount: mountLint },
   { id: "settings", label: "Settings", mount: mountSettings },
 ];
 
@@ -74,6 +79,23 @@ const inspectorBtn = el("button", {
   title: "Toggle the Babylon inspector for the viewer scene (⌘I)",
   onclick: () => void toggleInspector(),
 });
+
+const themeBtn = el("button", {
+  class: "small theme-toggle",
+  text: "☾",
+  title: "Switch to light theme",
+  onclick: () => toggleTheme(),
+});
+
+function syncThemeButton(): void {
+  const light = themeMode() === "light";
+  themeBtn.textContent = light ? "☀" : "☾";
+  themeBtn.title = light ? "Switch to dark theme" : "Switch to light theme";
+  themeBtn.setAttribute("aria-label", themeBtn.title);
+}
+
+onSettingsChange(syncThemeButton);
+syncThemeButton();
 
 function syncInspectorChrome(): void {
   const open = inspectorDock.isOpen;
@@ -220,7 +242,7 @@ appRoot.append(
     { class: "topbar" },
     el("span", { class: "brand", text: "assetty" }),
     tabBar,
-    el("div", { class: "topbar-actions" }, modePill, inspectorBtn, openBtn),
+    el("div", { class: "topbar-actions" }, modePill, themeBtn, inspectorBtn, openBtn),
   ),
   banner,
   content,
@@ -346,6 +368,9 @@ app.on("context", () => updateStatusBar());
 
 /* ------------------------------------------------------------------- boot */
 
+// Apply the persisted theme + optimize defaults before the first tab mounts.
+void loadSettings();
+
 selectTab("viewer");
 
 window.addEventListener("keydown", (ev) => {
@@ -375,4 +400,12 @@ void checkKtx2Assets().then((missing) => {
   scene: () => app.viewer?.scene ?? null,
   textures: () => app.viewer?.textureDiagnostics() ?? [],
   environmentReady: () => app.viewer?.environmentReady ?? false,
+  // Settings surface for headless checks (theme + JSON round-trip).
+  selectTab,
+  theme: () => themeMode(),
+  toggleTheme,
+  settings: () => settingsToJson(),
+  applySettingsText,
+  saveSettings,
+  loadSettings,
 };

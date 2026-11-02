@@ -115,6 +115,12 @@ pub const SimplifyParams = struct {
     aggressive: bool = false,
     /// Never collapse or move boundary edges.
     lock_borders: bool = true,
+    /// Seam-aware simplification: normal/UV error is part of the collapse cost.
+    use_attributes: bool = false,
+    /// Weight of the normal attribute error (per component).
+    weight_normal: f32 = 1.0,
+    /// Weight of the TEXCOORD_0 attribute error (per component).
+    weight_uv: f32 = 1.0,
 };
 
 pub const TextureParams = struct {
@@ -297,8 +303,8 @@ pub fn describe(p: Preset, w: anytype) !void {
                 .{ v.position_bits, v.normal_oct, v.uv_bits, v.compress },
             ),
             .simplify => |v| try w.print(
-                "simplify  target_ratio={d} error_tolerance={d} aggressive={} lock_borders={}\n",
-                .{ v.target_ratio, v.error_tolerance, v.aggressive, v.lock_borders },
+                "simplify  target_ratio={d} error_tolerance={d} aggressive={} lock_borders={} use_attributes={} weight_normal={d} weight_uv={d}\n",
+                .{ v.target_ratio, v.error_tolerance, v.aggressive, v.lock_borders, v.use_attributes, v.weight_normal, v.weight_uv },
             ),
             .textures => |v| try w.print(
                 "textures  format={s} quality={d} rdo_lambda={d} mips={} max_size={d}\n",

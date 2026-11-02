@@ -1,5 +1,8 @@
 import { app } from "../app";
 import { isBusyError } from "../bridge";
+import { buildOptimizeForm } from "../optimizeForm";
+import { getSettings, onSettingsChange, updateSettings } from "../settings";
+import type { OptimizeSteps } from "../settings";
 import {
   el,
   fmtBytes,
@@ -31,101 +34,40 @@ const ROWS: RowSpec[] = [
   { key: "disk_total", label: "disk size", bytes: true, deltaKey: "disk_bytes" },
 ];
 
-const TEXTURE_MAX_SIZES: Array<[string, number]> = [
-  ["no resize", 0],
-  ["512", 512],
-  ["1024", 1024],
-  ["2048", 2048],
-];
-
-const ERROR_TOLERANCES: Array<[string, number]> = [
-  ["0.05%", 0.0005],
-  ["0.1%", 0.001],
-  ["0.2%", 0.002],
-  ["0.5%", 0.005],
-  ["1%", 0.01],
-];
-
-interface StepState {
-  prune: boolean;
-  dedup: boolean;
-  weld: boolean;
-  weldTolerance: number;
-  join: boolean;
-  textures: boolean;
-  textureFormat: string;
-  textureQuality: number;
-  textureMaxSize: number;
-  textureMips: boolean;
-  quantize: boolean;
-  positionBits: number;
-  uvBits: number;
-  normalOct: boolean;
-  simplify: boolean;
-  targetRatio: number;
-  errorTolerance: number;
-  aggressive: boolean;
-  lockBorders: boolean;
-}
-
-function defaultState(): StepState {
-  return {
-    prune: true,
-    dedup: true,
-    weld: true,
-    weldTolerance: 0,
-    join: true,
-    textures: true,
-    textureFormat: "auto",
-    textureQuality: 128,
-    textureMaxSize: 0,
-    textureMips: true,
-    quantize: true,
-    positionBits: 14,
-    uvBits: 12,
-    normalOct: true,
-    simplify: false,
-    targetRatio: 0.5,
-    errorTolerance: 0.001,
-    aggressive: false,
-    lockBorders: true,
-  };
-}
-
-/** Named presets only prefill the per-step controls. */
-const PRESET_PREFS: Record<string, Partial<StepState>> = {
-  mobile: {
-    textureFormat: "auto",
-    textureQuality: 160,
-    textureMaxSize: 2048,
-    textureMips: true,
-    positionBits: 14,
-    uvBits: 12,
-    normalOct: true,
-    simplify: false,
-    weldTolerance: 0,
+/** Named presets only prefill the per-step controls (the result is saved as settings). */
+const PRESET_PREFS: Record<string, ((steps: OptimizeSteps) => void) | undefined> = {
+  mobile: (steps) => {
+    steps.textures.format = "auto";
+    steps.textures.quality = 160;
+    steps.textures.max_size = 2048;
+    steps.textures.generate_mips = true;
+    steps.quantize.position_bits = 14;
+    steps.quantize.uv_bits = 12;
+    steps.quantize.normal_oct = true;
+    steps.simplify.enabled = false;
+    steps.weld.tolerance = 0;
   },
-  desktop: {
-    textureFormat: "auto",
-    textureQuality: 255,
-    textureMaxSize: 0,
-    textureMips: true,
-    positionBits: 14,
-    uvBits: 12,
-    normalOct: true,
-    simplify: false,
-    weldTolerance: 0,
+  desktop: (steps) => {
+    steps.textures.format = "auto";
+    steps.textures.quality = 255;
+    steps.textures.max_size = 0;
+    steps.textures.generate_mips = true;
+    steps.quantize.position_bits = 14;
+    steps.quantize.uv_bits = 12;
+    steps.quantize.normal_oct = true;
+    steps.simplify.enabled = false;
+    steps.weld.tolerance = 0;
   },
-  web: {
-    textureFormat: "etc1s",
-    textureQuality: 128,
-    textureMaxSize: 1024,
-    textureMips: true,
-    positionBits: 14,
-    uvBits: 12,
-    normalOct: true,
-    simplify: false,
-    weldTolerance: 0,
+  web: (steps) => {
+    steps.textures.format = "etc1s";
+    steps.textures.quality = 128;
+    steps.textures.max_size = 1024;
+    steps.textures.generate_mips = true;
+    steps.quantize.position_bits = 14;
+    steps.quantize.uv_bits = 12;
+    steps.quantize.normal_oct = true;
+    steps.simplify.enabled = false;
+    steps.weld.tolerance = 0;
   },
 };
 
@@ -135,44 +77,75 @@ function stat(stats: Stats | undefined, key: string): number | undefined {
   return typeof v === "number" ? v : undefined;
 }
 
-/** The wire format understood by `optimizeCustom(path, spec)`. */
-function buildSpec(state: StepState): Array<Record<string, unknown>> {
-  const steps: Array<Record<string, unknown>> = [];
-  if (state.prune) steps.push({ prune: {} });
-  if (state.dedup) steps.push({ dedup: {} });
-  if (state.weld) steps.push({ weld: { tolerance: state.weldTolerance } });
-  if (state.join) steps.push({ join: {} });
-  if (state.textures) {
-    steps.push({
+function fmtSecs(secs: number | undefined): string {
+  if (secs == null || !Number.isFinite(secs)) return "";
+  return secs < 1 ? `${Math.round(secs * 1000)} ms` : `${secs.toFixed(2)} s`;
+}
+
+/**
+ * The wire format understood by `optimizeCustom(path, spec)`: only enabled
+ * steps are listed, and parameters are omitted when the backend default should
+ * apply (mode bits default true on the host, so those are always explicit).
+ */
+function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  if (steps.prune.enabled) {
+    out.push({
+      prune: {
+        unused_nodes: steps.prune.unused_nodes,
+        unused_materials: steps.prune.unused_materials,
+        unused_textures: steps.prune.unused_textures,
+      },
+    });
+  }
+  if (steps.dedup.enabled) {
+    out.push({
+      dedup: {
+        accessors: steps.dedup.accessors,
+        meshes: steps.dedup.meshes,
+        materials: steps.dedup.materials,
+      },
+    });
+  }
+  if (steps.weld.enabled) out.push({ weld: { tolerance: steps.weld.tolerance } });
+  if (steps.join.enabled) out.push({ join: {} });
+  if (steps.textures.enabled) {
+    out.push({
       textures: {
-        format: state.textureFormat,
-        quality: state.textureQuality,
+        format: steps.textures.format,
+        quality: steps.textures.quality,
         rdo_lambda: 1,
-        generate_mips: state.textureMips,
-        max_size: state.textureMaxSize,
+        generate_mips: steps.textures.generate_mips,
+        max_size: steps.textures.max_size,
       },
     });
   }
-  if (state.quantize) {
-    steps.push({
+  if (steps.quantize.enabled) {
+    out.push({
       quantize: {
-        position_bits: state.positionBits,
-        uv_bits: state.uvBits,
-        normal_oct: state.normalOct,
+        position_bits: steps.quantize.position_bits,
+        uv_bits: steps.quantize.uv_bits,
+        normal_oct: steps.quantize.normal_oct,
       },
     });
   }
-  if (state.simplify) {
-    steps.push({
-      simplify: {
-        target_ratio: state.targetRatio,
-        error_tolerance: state.errorTolerance,
-        aggressive: state.aggressive,
-        lock_borders: state.lockBorders,
-      },
-    });
+  if (steps.simplify.enabled) {
+    const simplify: Record<string, unknown> = {
+      target_ratio: steps.simplify.target_ratio,
+      error_tolerance: steps.simplify.error_tolerance,
+      aggressive: steps.simplify.aggressive,
+      lock_borders: steps.simplify.lock_borders,
+      use_attributes: steps.simplify.use_attributes,
+    };
+    // Weights only matter when attribute errors are weighed; omitting them lets
+    // the backend use its defaults.
+    if (steps.simplify.use_attributes) {
+      simplify["weight_normal"] = steps.simplify.weight_normal;
+      simplify["weight_uv"] = steps.simplify.weight_uv;
+    }
+    out.push({ simplify });
   }
-  return steps;
+  return out;
 }
 
 export function mountOptimize(): TabHandle {
@@ -209,7 +182,18 @@ export function mountOptimize(): TabHandle {
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
 
-  const state = defaultState();
+  // Step parameters live in the shared settings state (Settings tab edits the
+  // same object); every change is applied in-app immediately and debounce-saved.
+  const steps = (): OptimizeSteps => getSettings().optimize.steps;
+  let internalEdit = false;
+  function edit(mutate: (steps: OptimizeSteps) => void): void {
+    internalEdit = true;
+    try {
+      updateSettings((settings) => mutate(settings.optimize.steps));
+    } finally {
+      internalEdit = false;
+    }
+  }
   // "" = hand-tuned settings (no preset pill highlighted). The named preset is
   // only used as a fallback if the host predates `optimizeCustom`.
   let activePreset = "";
@@ -225,264 +209,17 @@ export function mountOptimize(): TabHandle {
 
   /* -------------------------------------------------------------- step rows */
 
-  const stepBoxes: Array<{ key: keyof StepState; box: HTMLInputElement; params: HTMLElement }> = [];
-  const widgetSync: Array<() => void> = [];
-
-  function syncAll(): void {
-    for (const entry of stepBoxes) {
-      entry.box.checked = Boolean(state[entry.key]);
-      entry.params.hidden = !state[entry.key];
-    }
-    for (const sync of widgetSync) sync();
-    runBtn.disabled = running || !app.bridge.live || !app.pathA;
-  }
-
-  function step(
-    key: keyof StepState,
-    label: string,
-    hint: string,
-    buildParams: () => HTMLElement[],
-  ): HTMLElement {
-    const box = el("input", { type: "checkbox" });
-    box.checked = Boolean(state[key]);
-    box.addEventListener("change", () => {
-      (state as unknown as Record<string, unknown>)[key as string] = box.checked;
-      syncAll();
-    });
-    const params = el("div", { class: "step-params" });
-    params.append(...buildParams());
-    params.hidden = !box.checked;
-    stepBoxes.push({ key, box, params });
-    return el(
-      "div",
-      { class: "step-block" },
-      el(
-        "label",
-        { class: "step-toggle" },
-        box,
-        el("span", { class: "step-name", text: label }),
-        el("span", { class: "step-hint", text: hint }),
-      ),
-      params,
-    );
-  }
-
-  function select(
-    values: Array<[string, string]>,
-    get: () => string,
-    set: (v: string) => void,
-  ): HTMLSelectElement {
-    const node = el("select", { class: "compact" });
-    for (const [label, value] of values) {
-      node.append(el("option", { value, text: label }));
-    }
-    node.value = get();
-    node.addEventListener("change", () => set(node.value));
-    widgetSync.push(() => {
-      node.value = get();
-    });
-    return node;
-  }
-
-  function checkbox(label: string, get: () => boolean, set: (v: boolean) => void): HTMLElement {
-    const box = el("input", { type: "checkbox" });
-    box.checked = get();
-    box.addEventListener("change", () => set(box.checked));
-    widgetSync.push(() => {
-      box.checked = get();
-    });
-    return el("label", { class: "inline-check" }, box, el("span", { text: label }));
-  }
-
-  function slider(
-    min: number,
-    max: number,
-    stepSize: number,
-    get: () => number,
-    set: (v: number) => void,
-    suffix = "",
-  ): HTMLElement {
-    const input = el("input", { type: "range", min, max, step: stepSize });
-    const out = el("span", { class: "range-value mono" });
-    const apply = () => {
-      input.value = String(get());
-      out.textContent = `${get()}${suffix}`;
-    };
-    input.addEventListener("input", () => {
-      set(Number(input.value));
-      out.textContent = `${Number(input.value)}${suffix}`;
-    });
-    widgetSync.push(apply);
-    apply();
-    return el("div", { class: "range-row" }, input, out);
-  }
-
-  const field = (label: string, control: HTMLElement, wide = false): HTMLElement =>
-    el("div", { class: wide ? "field wide" : "field" }, el("span", { text: label }), control);
-
-  const addStep = (...nodes: HTMLElement[]) => {
-    for (const node of nodes) stepsBody.append(node);
-  };
-
   const stepsPanel = el("div", { class: "panel" });
   const stepsBody = el("div", { class: "panel-body form" });
   stepsPanel.append(el("div", { class: "panel-head" }, el("span", { text: "Steps" })), stepsBody);
   side.append(stepsPanel);
 
-  addStep(
-    step("prune", "prune", "unused nodes / materials / textures", () => []),
-    step("dedup", "dedup", "shared accessors, meshes, materials", () => []),
-    step("weld", "weld", "merge duplicate vertices", () => [
-      field(
-        "tolerance",
-        (() => {
-          const input = el("input", {
-            type: "number",
-            min: 0,
-            max: 1,
-            step: 0.0001,
-            class: "compact",
-          });
-          input.value = String(state.weldTolerance);
-          input.addEventListener("input", () => {
-            state.weldTolerance = Math.max(0, Number(input.value) || 0);
-          });
-          widgetSync.push(() => {
-            input.value = String(state.weldTolerance);
-          });
-          return input;
-        })(),
-      ),
-    ]),
-    step("join", "join", "merge primitives sharing a material", () => []),
-    step("textures", "textures", "KTX2 / basis encode", () => [
-      field(
-        "format",
-        select(
-          [
-            ["auto", "auto"],
-            ["ETC1S", "etc1s"],
-            ["UASTC", "uastc"],
-          ],
-          () => state.textureFormat,
-          (v) => {
-            state.textureFormat = v;
-          },
-        ),
-      ),
-      field(
-        "quality",
-        slider(
-          1,
-          255,
-          1,
-          () => state.textureQuality,
-          (v) => {
-            state.textureQuality = v;
-          },
-        ),
-        true,
-      ),
-      field(
-        "max size",
-        select(
-          TEXTURE_MAX_SIZES.map(([label, v]): [string, string] => [label, String(v)]),
-          () => String(state.textureMaxSize),
-          (v) => {
-            state.textureMaxSize = Number(v);
-          },
-        ),
-      ),
-      field(
-        "mips",
-        checkbox(
-          "generate",
-          () => state.textureMips,
-          (v) => {
-            state.textureMips = v;
-          },
-        ),
-      ),
-    ]),
-    step("quantize", "quantize", "attribute bit packing", () => [
-      field(
-        "position bits",
-        select(
-          Array.from({ length: 6 }, (_, i): [string, string] => [String(11 + i), String(11 + i)]),
-          () => String(state.positionBits),
-          (v) => {
-            state.positionBits = Number(v);
-          },
-        ),
-      ),
-      field(
-        "uv bits",
-        select(
-          Array.from({ length: 9 }, (_, i): [string, string] => [String(8 + i), String(8 + i)]),
-          () => String(state.uvBits),
-          (v) => {
-            state.uvBits = Number(v);
-          },
-        ),
-      ),
-      field(
-        "normals",
-        checkbox(
-          "oct-encode",
-          () => state.normalOct,
-          (v) => {
-            state.normalOct = v;
-          },
-        ),
-      ),
-    ]),
-    step("simplify", "simplify", "decimate triangles", () => [
-      field(
-        "keep",
-        slider(
-          10,
-          90,
-          1,
-          () => Math.round(state.targetRatio * 100),
-          (v) => {
-            state.targetRatio = v / 100;
-          },
-          "%",
-        ),
-        true,
-      ),
-      field(
-        "max error",
-        select(
-          ERROR_TOLERANCES.map(([label, v]): [string, string] => [label, String(v)]),
-          () => String(state.errorTolerance),
-          (v) => {
-            state.errorTolerance = Number(v);
-          },
-        ),
-      ),
-      field(
-        "mode",
-        checkbox(
-          "aggressive",
-          () => state.aggressive,
-          (v) => {
-            state.aggressive = v;
-          },
-        ),
-      ),
-      field(
-        "borders",
-        checkbox(
-          "lock",
-          () => state.lockBorders,
-          (v) => {
-            state.lockBorders = v;
-          },
-        ),
-      ),
-    ]),
-  );
+  const form = buildOptimizeForm(stepsBody, { get: steps, edit });
+
+  function syncAll(): void {
+    form.sync();
+    runBtn.disabled = running || !app.bridge.live || !app.pathA;
+  }
   syncAll();
 
   /* ---------------------------------------------------------------- progress */
@@ -595,6 +332,7 @@ export function mountOptimize(): TabHandle {
             { class: `step ${s.applied ? "applied" : ""}` },
             el("span", { class: "mark", text: s.applied ? "✓" : "–" }),
             el("span", { text: s.kind }),
+            el("span", { class: "secs", text: fmtSecs(s.secs) }),
             s.note && s.note !== "ok" ? el("span", { class: "note", text: s.note }) : null,
           ),
         );
@@ -619,7 +357,15 @@ export function mountOptimize(): TabHandle {
         "div",
         { class: "panel-head" },
         el("span", { text: "Report" }),
-        el("span", { class: "muted mono", text: res.report.preset ?? "custom" }),
+        el("span", {
+          class: "muted mono",
+          text: [
+            res.report.preset ?? "custom",
+            fmtSecs(res.report.total_secs) && `total ${fmtSecs(res.report.total_secs)}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        }),
       ),
       el("div", { class: "panel-body" }, body),
     );
@@ -660,7 +406,7 @@ export function mountOptimize(): TabHandle {
   function applyPreset(name: string): void {
     activePreset = name;
     const prefs = PRESET_PREFS[name.toLowerCase()];
-    if (prefs) Object.assign(state, prefs);
+    if (prefs) edit(prefs);
     for (const button of Array.from(presetRow.children)) {
       button.classList.toggle("active", (button as HTMLElement).textContent === name);
     }
@@ -711,12 +457,12 @@ export function mountOptimize(): TabHandle {
   runBtn.addEventListener("click", async () => {
     const path = app.pathA;
     if (!path || running) return;
-    const steps = buildSpec(state);
-    if (steps.length === 0) {
+    const specSteps = buildSpec(steps());
+    if (specSteps.length === 0) {
       notify("pick at least one step", "error");
       return;
     }
-    const specJson = JSON.stringify({ steps });
+    const specJson = JSON.stringify({ steps: specSteps });
     stopProgress?.();
     stopProgress = null;
     setRunning(true);
@@ -780,6 +526,11 @@ export function mountOptimize(): TabHandle {
     void loadSource(d.path);
   });
   const offLog = onLog((message) => setLog(message));
+  // Settings can change elsewhere (Settings tab / reload from file): keep the
+  // controls in sync unless this tab is the origin of the change.
+  const offSettings = onSettingsChange(() => {
+    if (!internalEdit) syncAll();
+  });
 
   return {
     el: root,
@@ -818,7 +569,7 @@ export function mountOptimize(): TabHandle {
       left?.forceResize();
       right?.forceResize();
       void loadPresets();
-      runBtn.disabled = running || !app.bridge.live || !app.pathA;
+      syncAll();
     },
     deactivate: () => {
       left?.pause();
@@ -827,6 +578,7 @@ export function mountOptimize(): TabHandle {
     dispose: () => {
       offPath();
       offLog();
+      offSettings();
       offDone();
       stopJob();
       left?.dispose();

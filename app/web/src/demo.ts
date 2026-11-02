@@ -146,13 +146,14 @@ export const demoOptimize: OptimizeResult = {
   report: {
     preset: "desktop",
     target: "desktop",
+    total_secs: 4.18,
     steps: [
-      { kind: "prune", applied: true, note: "removed 0 nodes, 0 materials" },
-      { kind: "dedup", applied: true, note: "3 accessors deduplicated" },
-      { kind: "weld", applied: true, note: "vertices 14556 -> 14002" },
-      { kind: "join", applied: false, note: "single primitive" },
-      { kind: "textures", applied: true, note: "5 images -> BC7 ktx2" },
-      { kind: "quantize", applied: true, note: "position 14 bits, uv 12 bits" },
+      { kind: "prune", applied: true, note: "removed 0 nodes, 0 materials", secs: 0.12 },
+      { kind: "dedup", applied: true, note: "3 accessors deduplicated", secs: 0.31 },
+      { kind: "weld", applied: true, note: "vertices 14556 -> 14002", secs: 0.88 },
+      { kind: "join", applied: false, note: "single primitive", secs: 0.02 },
+      { kind: "textures", applied: true, note: "5 images -> BC7 ktx2", secs: 2.45 },
+      { kind: "quantize", applied: true, note: "position 14 bits, uv 12 bits", secs: 0.4 },
     ],
     before: {
       triangles: 15_452,

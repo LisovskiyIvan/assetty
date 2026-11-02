@@ -13,6 +13,7 @@
  */
 import type { Scene } from "@babylonjs/core/scene";
 import { notify } from "./notify";
+import { themeMode } from "./settings";
 
 interface InspectorToken {
   dispose(): Promise<void>;
@@ -88,7 +89,8 @@ export class InspectorDock {
         containerElement: this.body,
         layoutMode: "overlay",
         autoResizeEngine: true,
-        themeMode: "dark",
+        // The inspector has its own Fluent theme: follow the app's current one.
+        themeMode: themeMode(),
         disableTeachingMoments: true,
       });
       this.scene = scene;

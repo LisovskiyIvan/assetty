@@ -43,6 +43,11 @@ const preview_max_dim: u32 = 1024;
 /// Where the app drops its outputs, relative to the working directory.
 const out_dir = ".zig-cache/assetty-app";
 
+/// Opaque, frontend-owned settings file. The backend never interprets the
+/// JSON inside: any object the UI wants (theme, optimize defaults, ...) goes
+/// here, and loading/saving is all this file does.
+const settings_file = "assetty.settings.json";
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -70,6 +75,8 @@ pub const Backend = struct {
         .lint = .{ "path", "budgetJson" },
         .presetLoad = .{"name"},
         .presetSave = .{ "name", "zon" },
+        .settingsLoad = .{},
+        .settingsSave = .{"text"},
     };
 
     // ---- browse -----------------------------------------------------------
@@ -182,6 +189,19 @@ pub const Backend = struct {
     /// Writes `presets/<name>.zon`; true on success.
     pub fn presetSave(self: *Backend, call: *nanoui.Call, name: []const u8, zon: []const u8) !bool {
         return self.presetSaveImpl(call.arena, name, zon);
+    }
+
+    /// Settings blob (`assetty.settings.json` in the cwd) as raw JSON; `{}`
+    /// when the file is absent or does not hold valid JSON. The schema is the
+    /// frontend's business.
+    pub fn settingsLoad(self: *Backend, call: *nanoui.Call) !json.Raw {
+        return self.settingsLoadFrom(call.arena, settings_file);
+    }
+
+    /// Validates `text` as JSON and replaces the settings file atomically:
+    /// `{"ok":true}` or `{"error":".."}`.
+    pub fn settingsSave(self: *Backend, call: *nanoui.Call, text: []const u8) !json.Raw {
+        return self.settingsSaveTo(call.arena, settings_file, text);
     }
 
     // ---- implementations --------------------------------------------------
@@ -450,6 +470,44 @@ pub const Backend = struct {
         const path = try std.fmt.bufPrint(&buf, "presets/{s}.zon", .{name});
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = zon }) catch return false;
         return true;
+    }
+
+    /// Read settings from an arbitrary path (the bound method binds
+    /// `settings_file`; tests inject temp paths). Missing/unreadable/invalid
+    /// content collapses to `{}` so the page always gets parseable JSON.
+    fn settingsLoadFrom(self: *Backend, a: std.mem.Allocator, path: []const u8) !json.Raw {
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_text_bytes)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return json.raw("{}"),
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
+            return json.raw("{}");
+        parsed.deinit();
+        return json.raw(text);
+    }
+
+    /// Validate-then-atomic-write. The temp file lives next to the destination
+    /// and is renamed over it, so a crash mid-write cannot truncate the
+    /// settings (or leave invalid JSON behind).
+    fn settingsSaveTo(self: *Backend, a: std.mem.Allocator, path: []const u8, text: []const u8) !json.Raw {
+        if (text.len > max_text_bytes) return json.errorRaw(a, "settings too large", .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
+            return json.errorRaw(a, "invalid settings JSON", .{});
+        parsed.deinit();
+
+        var atomic = std.Io.Dir.cwd().createFileAtomic(self.io, path, .{ .replace = true }) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        defer atomic.deinit(self.io);
+
+        var buf: [8192]u8 = undefined;
+        var fw = atomic.file.writer(self.io, &buf);
+        fw.interface.writeAll(text) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        fw.flush() catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        atomic.replace(self.io) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        return json.raw("{\"ok\":true}");
     }
 
     // ---- background jobs --------------------------------------------------
@@ -1403,6 +1461,9 @@ fn stepFromSpec(
                 .error_tolerance = (try r.floatField("error_tolerance")) orelse d.error_tolerance,
                 .aggressive = (try r.boolField("aggressive")) orelse d.aggressive,
                 .lock_borders = (try r.boolField("lock_borders")) orelse d.lock_borders,
+                .use_attributes = (try r.boolField("use_attributes")) orelse d.use_attributes,
+                .weight_normal = (try r.floatField("weight_normal")) orelse d.weight_normal,
+                .weight_uv = (try r.floatField("weight_uv")) orelse d.weight_uv,
             } };
         },
     };
@@ -1534,6 +1595,61 @@ test "presetLoad impl rejects traversal" {
     try testing.expectError(error.InvalidPresetName, b.presetLoadImpl(arena.allocator(), "../build"));
 }
 
+test "settings: save/load round-trip and atomic file on disk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/settings.json", .{tmp.sub_path[0..]});
+
+    const text = "{\"theme\":\"dark\",\"optimize\":{\"target_ratio\":0.25},\"n\":[1,2,3]}";
+    const saved = try b.settingsSaveTo(a, path, text);
+    try testing.expectEqualStrings("{\"ok\":true}", saved.text);
+
+    // The bytes actually landed on disk, untouched by the backend.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(max_text_bytes));
+    try testing.expectEqualStrings(text, on_disk);
+
+    const loaded = try b.settingsLoadFrom(a, path);
+    try testing.expectEqualStrings(text, loaded.text);
+}
+
+test "settings: invalid JSON is rejected and the old file survives" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/settings.json", .{tmp.sub_path[0..]});
+
+    try testing.expectEqualStrings("{\"ok\":true}", (try b.settingsSaveTo(a, path, "{\"theme\":\"light\"}")).text);
+
+    const bad = try b.settingsSaveTo(a, path, "{\"theme\":");
+    try testing.expect(std.mem.indexOf(u8, bad.text, "\"error\"") != null);
+    // Not truncated, not replaced.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(max_text_bytes));
+    try testing.expectEqualStrings("{\"theme\":\"light\"}", on_disk);
+}
+
+test "settings: missing file loads as an empty object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/absent.json", .{tmp.sub_path[0..]});
+
+    const loaded = try b.settingsLoadFrom(a, path);
+    try testing.expectEqualStrings("{}", loaded.text);
+}
+
 test "optimize impl runs a preset and reports deltas" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1542,6 +1658,11 @@ test "optimize impl runs a preset and reports deltas" {
     try testing.expect(std.mem.indexOf(u8, r.text, "\"steps\": [") != null);
     try testing.expect(std.mem.indexOf(u8, r.text, "\"deltas\":") != null);
     try testing.expect(std.mem.indexOf(u8, r.text, "\"output\": \".zig-cache/assetty-app/opt_") != null);
+    // Per-step and whole-run timings ride along for the progress/timing UI.
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"secs\": ") != null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"total_secs\": ") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), r.text, .{});
+    defer parsed.deinit();
 }
 
 test "textures impl on a fixture" {
@@ -1646,6 +1767,30 @@ test "custom spec maps steps in canonical order with params" {
     const simp_defaults = core.preset.SimplifyParams{};
     try testing.expectEqual(simp_defaults.error_tolerance, p.steps[3].simplify.error_tolerance);
     try testing.expectEqual(simp_defaults.lock_borders, p.steps[3].simplify.lock_borders);
+}
+
+test "custom spec maps simplify attribute fields" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const spec =
+        \\{"steps":[{"simplify":{"use_attributes":true,"weight_normal":2.0,"weight_uv":0.5}}]}
+    ;
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(a, spec, &detail);
+    try testing.expectEqual(@as(usize, 1), p.steps.len);
+    try testing.expect(p.steps[0].simplify.use_attributes);
+    try testing.expectEqual(@as(f32, 2.0), p.steps[0].simplify.weight_normal);
+    try testing.expectEqual(@as(f32, 0.5), p.steps[0].simplify.weight_uv);
+
+    // Omitted → preset defaults (attributes off, weight 1).
+    const d = core.preset.SimplifyParams{};
+    var detail2: []const u8 = "";
+    const p2 = try customPresetFromSpec(a, "{\"steps\":[{\"simplify\":{}}]}", &detail2);
+    try testing.expectEqual(d.use_attributes, p2.steps[0].simplify.use_attributes);
+    try testing.expectEqual(d.weight_normal, p2.steps[0].simplify.weight_normal);
+    try testing.expectEqual(d.weight_uv, p2.steps[0].simplify.weight_uv);
 }
 
 test "custom spec accepts a json string value" {

@@ -237,6 +237,7 @@ pub fn writeOptimize(
         try jsonStr(w, st.kind);
         try w.print(", \"applied\": {s}, \"note\": ", .{if (st.applied) "true" else "false"});
         try jsonStr(w, st.note);
+        try w.print(", \"secs\": {d:.4}", .{st.secs});
         try w.writeByte('}');
     }
     try w.writeAll("\n  ],\n  \"deltas\": {");
@@ -267,7 +268,7 @@ pub fn writeOptimize(
         rep.after.vram_total,
         rep.after.disk_total,
     });
-    try w.writeAll("}\n}\n");
+    try w.print("}},\n  \"total_secs\": {d:.3}\n}}\n", .{rep.total_secs});
 }
 
 /// Lint result for one file: mirrors `assetty lint --json` for a single path.

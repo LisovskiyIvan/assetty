@@ -62,6 +62,8 @@ export interface OptimizeStep {
   kind: string;
   applied: boolean;
   note?: string;
+  /** Wall-clock seconds this step took (newer hosts). */
+  secs?: number;
 }
 
 export interface Stats {
@@ -84,6 +86,8 @@ export interface Delta {
 export interface OptimizeReport {
   preset?: string;
   target?: string;
+  /** Wall-clock seconds for the whole pipeline (newer hosts). */
+  total_secs?: number;
   steps: OptimizeStep[];
   before: Stats;
   after: Stats;

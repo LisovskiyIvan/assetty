@@ -4,7 +4,8 @@ const std = @import("std");
 /// Contains a placeholder when the frontend has not been built yet.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Plain `zig build` ships a fast binary; `-Doptimize=Debug` stays available.
+    const optimize = b.option(std.builtin.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .safe;
 
     const cgltf_mod = b.addTranslateC(.{
         .root_source_file = b.path("vendor/cgltf/cgltf.h"),
