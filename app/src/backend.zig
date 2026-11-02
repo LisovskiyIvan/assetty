@@ -5,6 +5,14 @@
 //! an allocator instead of a `*nanoui.Call`, so tests cover them without a
 //! webview. Results that must keep the CLI's JSON shape are returned as
 //! `json.Raw` (pre-formatted).
+//!
+//! # Long jobs
+//!
+//! Bound methods run on the main thread, so anything that takes seconds
+//! (basisu, meshopt) would freeze the webview. `optimize`, `optimizeCustom`
+//! and `textureEncode` therefore only validate their arguments, hand the work
+//! to a worker thread and answer `{"started":true}`; the result arrives as the
+//! `optimizeDone` / `textureEncodeDone` event. See "background jobs" below.
 const std = @import("std");
 const core = @import("core");
 const nanoui = @import("nanoui");
@@ -17,6 +25,13 @@ const max_text_bytes: usize = 1 << 20;
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// The background run in flight, if any: `optimize`/`optimizeCustom` and
+    /// `textureEncode` share this one gate.
+    job: ?*Job = null,
+    job_lock: Gate = .{},
+    /// Test seam: receives a finished job instead of the main-thread queue.
+    on_job_done: ?*const fn (ctx: ?*anyopaque, job: *Job) void = null,
+    on_job_done_ctx: ?*anyopaque = null,
 
     pub const nanoui_params = .{
         .openDialog = .{},
@@ -60,17 +75,32 @@ pub const Backend = struct {
 
     // ---- pipeline ---------------------------------------------------------
 
-    /// Runs `preset` into `.zig-cache/assetty-app/opt_<ts>.glb`, reporting
-    /// each step through the `progress` event; returns the report JSON.
+    /// Runs `preset` in the background into
+    /// `.zig-cache/assetty-app/opt_<ts>.glb` and answers `{"started":true}` at
+    /// once; each step arrives as a `progress` event and the report as
+    /// `optimizeDone`. `{"error":..}` comes back synchronously for a bad
+    /// preset, an unreadable path or a job already running.
     pub fn optimize(self: *Backend, call: *nanoui.Call, path: []const u8, preset: []const u8) !json.Raw {
-        return self.optimizeImpl(call.arena, call.window, path, preset);
+        if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
+        const resolved = resolvePresetOrMessage(self.io, call.arena, preset);
+        const p = switch (resolved) {
+            .preset => |p2| p2,
+            .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
+        };
+        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0);
     }
 
-    /// Same pipeline as `optimize`, but the steps come from the frontend's
-    /// per-step UI as a JSON spec (`{"steps":[{"prune":{}}, ...]}`); the spec
-    /// is either that JSON text or a JSON string containing it.
+    /// Same as `optimize`, but the steps come from the frontend's per-step UI
+    /// as a JSON spec (`{"steps":[{"prune":{}}, ...]}`); the spec is either
+    /// that JSON text or a JSON string containing it.
     pub fn optimizeCustom(self: *Backend, call: *nanoui.Call, path: []const u8, spec: []const u8) !json.Raw {
-        return self.optimizeCustomImpl(call.arena, call.window, path, spec);
+        if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
+        const resolved = specPresetOrMessage(call.arena, spec);
+        const p = switch (resolved) {
+            .preset => |p2| p2,
+            .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
+        };
+        return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0);
     }
 
     // ---- textures ---------------------------------------------------------
@@ -80,9 +110,12 @@ pub const Backend = struct {
         return self.texturesImpl(call.arena, path);
     }
 
-    /// `assetty textures <path> --encode <index> --json`.
+    /// Encodes image `index` to KTX2 in the background: answers
+    /// `{"started":true}` at once, then `textureEncodeDone` with the size, the
+    /// PSNR and the VRAM it now needs.
     pub fn textureEncode(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
-        return self.textureEncodeImpl(call.arena, path, index);
+        if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
+        return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index);
     }
 
     // ---- report -----------------------------------------------------------
@@ -199,16 +232,6 @@ pub const Backend = struct {
         return json.raw(try aw.toOwnedSlice());
     }
 
-    const ProgressCtx = struct {
-        window: ?*nanoui.Window,
-
-        fn report(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
-            const self: *ProgressCtx = @ptrCast(@alignCast(ctx orelse return));
-            const win = self.window orelse return;
-            events.Progress.emit(win, .{ .step = step, .pct = pct });
-        }
-    };
-
     fn optimizeImpl(
         self: *Backend,
         a: std.mem.Allocator,
@@ -216,11 +239,12 @@ pub const Backend = struct {
         path: []const u8,
         preset_spec: []const u8,
     ) !json.Raw {
-        const p = resolvePreset(self.io, a, preset_spec) catch |err| switch (err) {
-            error.UnknownPreset => return json.errorRaw(a, "unknown preset '{s}'", .{preset_spec}),
-            else => return json.errorRaw(a, "preset '{s}': {s}", .{ preset_spec, @errorName(err) }),
+        const resolved = resolvePresetOrMessage(self.io, a, preset_spec);
+        const p = switch (resolved) {
+            .preset => |p2| p2,
+            .err => |msg| return json.errorRaw(a, "{s}", .{msg}),
         };
-        return self.runPipeline(a, window, path, p);
+        return self.pipelineReply(a, window, path, p);
     }
 
     fn optimizeCustomImpl(
@@ -230,54 +254,71 @@ pub const Backend = struct {
         path: []const u8,
         spec: []const u8,
     ) !json.Raw {
-        var detail: []const u8 = "";
-        const p = customPresetFromSpec(a, spec, &detail) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.NoSteps => return json.errorRaw(a, "no steps", .{}),
-            error.UnknownStep => return json.errorRaw(a, "unknown step '{s}'", .{detail}),
-            error.BadParam => return json.errorRaw(a, "bad params for '{s}'", .{detail}),
-            error.InvalidSpec => return json.errorRaw(a, "invalid spec", .{}),
+        const resolved = specPresetOrMessage(a, spec);
+        const p = switch (resolved) {
+            .preset => |p2| p2,
+            .err => |msg| return json.errorRaw(a, "{s}", .{msg}),
         };
-        return self.runPipeline(a, window, path, p);
+        return self.pipelineReply(a, window, path, p);
     }
 
-    /// The shared tail of `optimize`/`optimizeCustom`: run `p` into
-    /// `.zig-cache/assetty-app/opt_<ts>.glb`, report progress, format the JSON.
-    fn runPipeline(
+    /// Runs the pipeline right here, on the calling thread: the synchronous
+    /// entry point the tests (and any non-UI caller) use.
+    fn pipelineReply(
         self: *Backend,
         a: std.mem.Allocator,
         window: ?*nanoui.Window,
         path: []const u8,
         p: core.preset.Preset,
     ) !json.Raw {
+        var sink: WindowSink = undefined;
+        const sinks: Sinks = if (window) |w| blk: {
+            sink = .{ .window = w };
+            break :blk sink.sinks();
+        } else .{};
+        return switch (self.runPipeline(a, path, p, sinks)) {
+            .done => |d| d.report,
+            .failed => |msg| json.errorRaw(a, "{s}", .{msg}),
+            .out_of_memory => error.OutOfMemory,
+        };
+    }
+
+    /// The shared tail of `optimize`/`optimizeCustom`: run `p` into
+    /// `.zig-cache/assetty-app/opt_<ts>.glb`, report through `sinks`, format
+    /// the JSON. Every allocation comes from `a`.
+    fn runPipeline(
+        self: *Backend,
+        a: std.mem.Allocator,
+        path: []const u8,
+        p: core.preset.Preset,
+        sinks: Sinks,
+    ) PipelineOutcome {
         const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
         const out_path = std.fmt.allocPrint(a, ".zig-cache/assetty-app/opt_{d}.glb", .{nanos}) catch
-            return json.errorRaw(a, "out of memory", .{});
-        std.Io.Dir.cwd().createDirPath(self.io, ".zig-cache/assetty-app") catch |err|
-            return json.errorRaw(a, "out dir: {s}", .{@errorName(err)});
+            return .out_of_memory;
+        std.Io.Dir.cwd().createDirPath(self.io, ".zig-cache/assetty-app") catch |err| {
+            const msg = std.fmt.allocPrint(a, "out dir: {s}", .{@errorName(err)}) catch return .out_of_memory;
+            sinks.logFmt("optimize failed: {s}", .{msg});
+            return .{ .failed = msg };
+        };
 
-        var ctx: ProgressCtx = .{ .window = window };
         const rep = core.runner.run(self.io, a, path, .{
             .preset = p,
             .out_path = out_path,
-            .progress = &ProgressCtx.report,
-            .progress_ctx = &ctx,
+            .progress = sinks.progress,
+            .progress_ctx = sinks.progress_ctx,
         }) catch |err| {
-            if (window) |win| {
-                const line = try std.fmt.allocPrint(a, "optimize failed: {s}: {s}", .{ path, @errorName(err) });
-                events.Log.emit(win, .{ .line = line });
-            }
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+            const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) catch return .out_of_memory;
+            sinks.logFmt("optimize failed: {s}", .{msg});
+            return .{ .failed = msg };
         };
-        if (window) |win| {
-            const line = try std.fmt.allocPrint(a, "optimize \"{s}\" -> {s}", .{ p.name, out_path });
-            events.Log.emit(win, .{ .line = line });
-        }
+        sinks.logFmt("optimize \"{s}\" -> {s}", .{ p.name, out_path });
 
         var aw: std.Io.Writer.Allocating = .init(a);
-        errdefer aw.deinit();
-        try json.writeOptimize(&aw.writer, path, out_path, p, rep);
-        return json.raw(try aw.toOwnedSlice());
+        defer aw.deinit();
+        json.writeOptimize(&aw.writer, path, out_path, p, rep) catch return .out_of_memory;
+        const report = aw.toOwnedSlice() catch return .out_of_memory;
+        return .{ .done = .{ .out_path = out_path, .report = json.raw(report) } };
     }
 
     fn texturesImpl(self: *Backend, a: std.mem.Allocator, path: []const u8) !json.Raw {
@@ -290,26 +331,6 @@ pub const Backend = struct {
         var aw: std.Io.Writer.Allocating = .init(a);
         errdefer aw.deinit();
         try json.writeTextures(&aw.writer, path, loaded.asset, st, null, null);
-        return json.raw(try aw.toOwnedSlice());
-    }
-
-    fn textureEncodeImpl(self: *Backend, a: std.mem.Allocator, path: []const u8, index: u32) !json.Raw {
-        var loaded = core.parse.loadFile(self.io, a, path) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        defer loaded.deinit();
-        if (index >= loaded.asset.images.len)
-            return json.errorRaw(a, "image {d} out of range ({d} images)", .{ index, loaded.asset.images.len });
-        const st = core.stats.compute(a, loaded.asset) catch |err|
-            return json.errorRaw(a, "stats {s}: {s}", .{ path, @errorName(err) });
-
-        const enc = encodeImage(a, loaded.asset.images[index], index) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        };
-
-        var aw: std.Io.Writer.Allocating = .init(a);
-        errdefer aw.deinit();
-        try json.writeTextures(&aw.writer, path, loaded.asset, st, index, enc);
         return json.raw(try aw.toOwnedSlice());
     }
 
@@ -394,7 +415,520 @@ pub const Backend = struct {
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = zon }) catch return false;
         return true;
     }
+
+    // ---- background jobs --------------------------------------------------
+
+    /// Validates `path`, then hands the run to a worker and answers
+    /// `{"started":true}`. Everything the worker needs is deep-copied: the
+    /// caller's arena dies with the call.
+    fn launch(
+        self: *Backend,
+        a: std.mem.Allocator,
+        target: Target,
+        kind: JobKind,
+        path: []const u8,
+        p: ?core.preset.Preset,
+        index: u32,
+    ) !json.Raw {
+        if (self.busy()) return json.errorRaw(a, "busy", .{});
+        // Cheap readability check now, so a mistyped path is an immediate
+        // `{"error":..}` instead of an event a second later.
+        _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        _ = self.spawn(target, kind, path, p, index) catch |err| switch (err) {
+            error.Busy => return json.errorRaw(a, "busy", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SpawnFailed => return json.errorRaw(a, "cannot start a worker thread", .{}),
+        };
+        return json.raw(started_reply);
+    }
+
+    /// One job at a time: true while a worker (or its undelivered result)
+    /// holds the gate.
+    fn busy(self: *Backend) bool {
+        self.job_lock.lock();
+        defer self.job_lock.unlock();
+        return self.job != null;
+    }
+
+    fn spawn(
+        self: *Backend,
+        target: Target,
+        kind: JobKind,
+        path: []const u8,
+        p: ?core.preset.Preset,
+        index: u32,
+    ) SpawnError!*Job {
+        self.job_lock.lock();
+        defer self.job_lock.unlock();
+        if (self.job != null) return error.Busy;
+
+        const gpa = self.gpa;
+        const path_copy = try gpa.dupe(u8, path);
+        errdefer gpa.free(path_copy);
+        const preset_copy: ?core.preset.Preset = if (p) |preset| try clonePreset(gpa, preset) else null;
+        errdefer {
+            if (preset_copy) |copy| freePreset(gpa, copy);
+        }
+
+        const job = try gpa.create(Job);
+        errdefer gpa.destroy(job);
+        job.* = .{
+            .backend = self,
+            .gpa = gpa,
+            .io = self.io,
+            .kind = kind,
+            .index = index,
+            .target = target,
+            .path = path_copy,
+            .preset = preset_copy,
+        };
+
+        // The gate is closed before the worker exists: a job that finishes
+        // immediately must still find (and clear) its own entry.
+        self.job = job;
+        const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
+            self.job = null;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.SpawnFailed,
+            };
+        };
+        // Detached: a quit must not wait for a running encode. `shutdown`
+        // makes the late delivery a no-op instead.
+        thread.detach();
+        return job;
+    }
+
+    /// Clears the gate. Runs on the main thread, right before the result is
+    /// emitted, so an event handler may start the next job.
+    fn releaseJob(self: *Backend, job: *Job) void {
+        self.job_lock.lock();
+        defer self.job_lock.unlock();
+        if (self.job == job) self.job = null;
+    }
+
+    /// Worker thread: runs the delivery, which hops to the main thread.
+    fn deliver(self: *Backend, job: *Job) void {
+        if (self.on_job_done) |cb| return cb(self.on_job_done_ctx, job);
+        nanoui.App.onMain(job, delivered);
+    }
+
+    /// Drops the app's claim on finished jobs: call before `App.destroy`.
+    /// A run still in flight is not waited for (it may take a minute); its
+    /// delivery is skipped and the process is ending anyway.
+    pub fn shutdown(_: *Backend) void {
+        shutting_down.store(true, .release);
+    }
 };
+
+/// The `{"started":true}` reply of every background method.
+const started_reply = "{\"started\":true}";
+
+const JobKind = enum { optimize, texture_encode };
+
+/// Guards `Backend.job`. Critical sections are a pointer compare, so a spin
+/// lock is plenty (and `std.Io.Mutex` would need an `Io` in a `.c` callback).
+const Gate = struct {
+    state: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Gate) void {
+        while (!self.state.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Gate) void {
+        self.state.unlock();
+    }
+};
+
+const SpawnError = error{ Busy, OutOfMemory, SpawnFailed };
+
+/// Where a job's events go: the page's window and, through it, the app. Both
+/// are null in tests, which use `Backend.on_job_done` instead.
+const Target = struct {
+    window: ?*nanoui.Window = null,
+    app: ?*nanoui.App = null,
+
+    fn of(window: ?*nanoui.Window) Target {
+        const w = window orelse return .{};
+        return .{ .window = w, .app = w.app };
+    }
+};
+
+/// Set by `Backend.shutdown` before the windows are torn down: a delivery that
+/// runs after it must not touch the app any more.
+var shutting_down: std.atomic.Value(bool) = .init(false);
+
+/// Progress and log sinks for one pipeline run. The sync entry points emit
+/// straight to the page; the worker copies into the main thread's queue.
+const Sinks = struct {
+    progress: ?core.runner.ProgressFn = null,
+    progress_ctx: ?*anyopaque = null,
+    log: ?*const fn (ctx: ?*anyopaque, line: []const u8) void = null,
+    log_ctx: ?*anyopaque = null,
+
+    fn logFmt(self: Sinks, comptime fmt: []const u8, args: anytype) void {
+        const f = self.log orelse return;
+        var buf: [1024]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        f(self.log_ctx, line);
+    }
+};
+
+/// Sinks that emit on the calling thread: bound methods and tests.
+const WindowSink = struct {
+    window: *nanoui.Window,
+
+    fn sinks(self: *WindowSink) Sinks {
+        return .{
+            .progress = &progress,
+            .progress_ctx = self,
+            .log = &log,
+            .log_ctx = self,
+        };
+    }
+
+    fn progress(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
+        const self: *WindowSink = @ptrCast(@alignCast(ctx orelse return));
+        events.Progress.emit(self.window, .{ .step = step, .pct = pct });
+    }
+
+    fn log(ctx: ?*anyopaque, line: []const u8) void {
+        const self: *WindowSink = @ptrCast(@alignCast(ctx orelse return));
+        events.Log.emit(self.window, .{ .line = line });
+    }
+};
+
+/// How a pipeline run ended. Both `out_path` and `report` come from the
+/// caller's allocator.
+const PipelineOutcome = union(enum) {
+    done: struct { out_path: []const u8, report: json.Raw },
+    /// Human-readable reason, already formatted the way replies want it.
+    failed: []const u8,
+    out_of_memory,
+};
+
+/// A resolved preset, or the text of the error reply.
+const Resolved = union(enum) {
+    preset: core.preset.Preset,
+    err: []const u8,
+};
+
+/// `resolvePreset` with the CLI's wording, for an `{"error":..}` reply.
+fn resolvePresetOrMessage(io: std.Io, a: std.mem.Allocator, spec: []const u8) Resolved {
+    return .{ .preset = resolvePreset(io, a, spec) catch |err| {
+        if (err == error.UnknownPreset)
+            return .{ .err = std.fmt.allocPrint(a, "unknown preset '{s}'", .{spec}) catch "unknown preset" };
+        return .{ .err = std.fmt.allocPrint(a, "preset '{s}': {s}", .{ spec, @errorName(err) }) catch "bad preset" };
+    } };
+}
+
+/// `customPresetFromSpec` with the frontend's wording, for an error reply.
+fn specPresetOrMessage(a: std.mem.Allocator, spec: []const u8) Resolved {
+    var detail: []const u8 = "";
+    return .{ .preset = customPresetFromSpec(a, spec, &detail) catch |err| switch (err) {
+        error.OutOfMemory => return .{ .err = "out of memory" },
+        error.NoSteps => return .{ .err = "no steps" },
+        error.UnknownStep => return .{ .err = std.fmt.allocPrint(a, "unknown step '{s}'", .{detail}) catch "unknown step" },
+        error.BadParam => return .{ .err = std.fmt.allocPrint(a, "bad params for '{s}'", .{detail}) catch "bad params" },
+        error.InvalidSpec => return .{ .err = "invalid spec" },
+    } };
+}
+
+// ---- background jobs ------------------------------------------------------
+
+/// One background run. The main thread owns `Backend.job`; the worker owns
+/// everything else, writes `result` (or the message in `err_buf`) and posts.
+const Job = struct {
+    backend: *Backend,
+    /// `init.gpa`: thread-safe, so the worker allocates and frees it itself.
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    kind: JobKind,
+    index: u32 = 0,
+    target: Target = .{},
+    /// Deep copy of the call's path (the call's arena dies with the method).
+    path: []u8,
+    /// Deep copy of the resolved preset; null for `texture_encode`.
+    preset: ?core.preset.Preset = null,
+    /// Set by the worker before it posts: null means it failed, see `err`.
+    result: ?Result = null,
+    /// Failure message, formatted in place: the error path never allocates.
+    err_buf: [512]u8 = undefined,
+    err_len: usize = 0,
+
+    const Result = union(enum) {
+        /// `{"out_path","report"}`: the written file and its report JSON.
+        optimize: struct { out_path: []u8, report: []u8 },
+        /// The numbers `textureEncodeDone` carries.
+        texture: Encoded,
+    };
+
+    /// Thread entry.
+    fn run(self: *Job) void {
+        switch (self.kind) {
+            .optimize => self.runOptimize(),
+            .texture_encode => self.runTextureEncode(),
+        }
+        self.backend.deliver(self);
+    }
+
+    /// The whole pipeline, on this thread, with an arena of its own: the
+    /// report is copied into `gpa` before it is torn down.
+    fn runOptimize(self: *Job) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const p = self.preset orelse return self.fail("no preset", .{});
+        switch (self.backend.runPipeline(arena.allocator(), self.path, p, self.sinks())) {
+            .done => |d| {
+                const out_path = self.gpa.dupe(u8, d.out_path) catch return self.fail("out of memory", .{});
+                const report = self.gpa.dupe(u8, d.report.text) catch {
+                    self.gpa.free(out_path);
+                    return self.fail("out of memory", .{});
+                };
+                self.result = .{ .optimize = .{ .out_path = out_path, .report = report } };
+            },
+            .failed => |msg| self.fail("{s}", .{msg}),
+            .out_of_memory => self.fail("out of memory", .{}),
+        }
+    }
+
+    fn runTextureEncode(self: *Job) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index) catch
+            return self.fail("out of memory", .{});
+        switch (outcome) {
+            .done => |d| self.result = .{ .texture = d },
+            .skipped => self.fail("image {d} is not encodable (external or unsupported format)", .{self.index}),
+            .failed => |msg| self.fail("{s}", .{msg}),
+        }
+    }
+
+    fn sinks(self: *Job) Sinks {
+        return .{
+            .progress = &onProgress,
+            .progress_ctx = self,
+            .log = &onLog,
+            .log_ctx = self,
+        };
+    }
+
+    fn onProgress(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
+        const self: *Job = @ptrCast(@alignCast(ctx orelse return));
+        self.postProgress(step, pct);
+    }
+
+    fn onLog(ctx: ?*anyopaque, line: []const u8) void {
+        const self: *Job = @ptrCast(@alignCast(ctx orelse return));
+        self.postLog(line);
+    }
+
+    /// `step` points into this job's arena, which ends with the run: copy it
+    /// and hand it to the main thread.
+    fn postProgress(self: *Job, step: []const u8, pct: f32) void {
+        const app = self.target.app orelse return;
+        const window = self.target.window orelse return;
+        const copy = self.gpa.dupe(u8, step) catch return;
+        const posted = postToMain(ProgressMsg, self.gpa, .{
+            .gpa = self.gpa,
+            .app = app,
+            .window = window,
+            .step = copy,
+            .pct = pct,
+        });
+        if (!posted) self.gpa.free(copy);
+    }
+
+    fn postLog(self: *Job, line: []const u8) void {
+        const app = self.target.app orelse return;
+        const window = self.target.window orelse return;
+        const copy = self.gpa.dupe(u8, line) catch return;
+        const posted = postToMain(LogMsg, self.gpa, .{
+            .gpa = self.gpa,
+            .app = app,
+            .window = window,
+            .line = copy,
+        });
+        if (!posted) self.gpa.free(copy);
+    }
+
+    fn fail(self: *Job, comptime fmt: []const u8, args: anytype) void {
+        self.result = null;
+        const text: []const u8 = std.fmt.bufPrint(&self.err_buf, fmt, args) catch "";
+        self.err_len = text.len;
+    }
+
+    fn err(self: *const Job) []const u8 {
+        return self.err_buf[0..self.err_len];
+    }
+
+    /// Frees the job and everything it owns, from whichever thread holds it.
+    fn destroy(self: *Job) void {
+        const gpa = self.gpa;
+        if (self.preset) |p| freePreset(gpa, p);
+        gpa.free(self.path);
+        if (self.result) |res| switch (res) {
+            .optimize => |o| {
+                gpa.free(o.out_path);
+                gpa.free(o.report);
+            },
+            .texture => {},
+        };
+        gpa.destroy(self);
+    }
+};
+
+/// Runs `Msg.run` on the main thread soon: `nanoui.App.onMain` is
+/// `dispatch_async_f` on the main queue, the only thread the page (and the
+/// window list) may be touched from. False when out of memory.
+fn postToMain(comptime Msg: type, gpa: std.mem.Allocator, msg: Msg) bool {
+    const p = gpa.create(Msg) catch return false;
+    p.* = msg;
+    nanoui.App.onMain(p, Msg.run);
+    return true;
+}
+
+const ProgressMsg = struct {
+    /// The job's allocator: allocation and free stay on the same one.
+    gpa: std.mem.Allocator,
+    app: *nanoui.App,
+    window: *nanoui.Window,
+    step: []u8,
+    pct: f32,
+
+    fn run(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *ProgressMsg = @ptrCast(@alignCast(ctx));
+        const gpa = self.gpa;
+        defer gpa.destroy(self);
+        defer gpa.free(self.step);
+        if (shutting_down.load(.acquire)) return;
+        if (!windowAlive(self.app, self.window)) return;
+        events.Progress.emit(self.window, .{ .step = self.step, .pct = self.pct });
+    }
+};
+
+const LogMsg = struct {
+    gpa: std.mem.Allocator,
+    app: *nanoui.App,
+    window: *nanoui.Window,
+    line: []u8,
+
+    fn run(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *LogMsg = @ptrCast(@alignCast(ctx));
+        const gpa = self.gpa;
+        defer gpa.destroy(self);
+        defer gpa.free(self.line);
+        if (shutting_down.load(.acquire)) return;
+        if (!windowAlive(self.app, self.window)) return;
+        events.Log.emit(self.window, .{ .line = self.line });
+    }
+};
+
+/// Main thread: clears the gate and emits the job's event.
+fn delivered(ctx: ?*anyopaque) callconv(.c) void {
+    const job: *Job = @ptrCast(@alignCast(ctx));
+    job.backend.releaseJob(job);
+    defer job.destroy();
+    if (shutting_down.load(.acquire)) return;
+    const window = liveWindow(job) orelse return;
+    if (job.result) |result| {
+        switch (result) {
+            .optimize => |o| events.OptimizeDone.emit(window, .{
+                .ok = true,
+                .out_path = o.out_path,
+                .report = json.raw(o.report),
+            }),
+            .texture => |t| events.TextureEncodeDone.emit(window, .{
+                .ok = true,
+                .index = t.index,
+                .ktx2_size = t.ktx2_size,
+                .psnr = t.psnr,
+                .vram_after = t.vram_after,
+            }),
+        }
+    } else {
+        emitFailure(job, window);
+    }
+}
+
+fn emitFailure(job: *Job, window: *nanoui.Window) void {
+    switch (job.kind) {
+        .optimize => events.OptimizeDone.emit(window, .{
+            .ok = false,
+            .@"error" = if (job.err_len > 0) job.err() else "optimize failed",
+        }),
+        .texture_encode => events.TextureEncodeDone.emit(window, .{
+            .ok = false,
+            .index = job.index,
+            .@"error" = if (job.err_len > 0) job.err() else "encode failed",
+        }),
+    }
+}
+
+/// The job's window, if it is still open. Main thread only, and pointers are
+/// compared before anything is dereferenced: a closed window is gone.
+fn liveWindow(job: *const Job) ?*nanoui.Window {
+    const app = job.target.app orelse return null;
+    const window = job.target.window orelse return null;
+    if (windowAlive(app, window)) return window;
+    return null;
+}
+
+/// Whether `window` is still in the app's list. It is removed (and freed) when
+/// it closes, so the main thread can tell without touching the window itself.
+fn windowAlive(app: *nanoui.App, window: *nanoui.Window) bool {
+    for (app.windows.items) |live| {
+        if (live == window) return true;
+    }
+    return false;
+}
+
+fn clonePreset(gpa: std.mem.Allocator, p: core.preset.Preset) !core.preset.Preset {
+    const name = try gpa.dupe(u8, p.name);
+    errdefer gpa.free(name);
+    return .{ .name = name, .target = p.target, .steps = try gpa.dupe(core.preset.Step, p.steps) };
+}
+
+fn freePreset(gpa: std.mem.Allocator, p: core.preset.Preset) void {
+    gpa.free(p.name);
+    gpa.free(p.steps);
+}
+
+// ---- texture encode -------------------------------------------------------
+
+const EncodeOutcome = union(enum) {
+    done: Encoded,
+    /// Not encodable: an external image or an unsupported pixel format.
+    skipped,
+    /// Human-readable reason (arena-owned).
+    failed: []const u8,
+};
+
+/// What `textureEncodeDone` reports: the encoded size, the quality and the
+/// VRAM the texture needs afterwards.
+const Encoded = struct { index: u32, ktx2_size: u64, psnr: f32, vram_after: u64 };
+
+/// Load `path`, encode image `index` to KTX2, measure it.
+fn encodeTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32) error{OutOfMemory}!EncodeOutcome {
+    var loaded = core.parse.loadFile(io, a, path) catch |err|
+        return .{ .failed = try std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) };
+    defer loaded.deinit();
+    if (index >= loaded.asset.images.len)
+        return .{ .failed = try std.fmt.allocPrint(a, "image {d} out of range ({d} images)", .{ index, loaded.asset.images.len }) };
+
+    const enc = encodeImage(a, loaded.asset.images[index], index) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failed = try std.fmt.allocPrint(a, "encode {d}: {s}", .{ index, @errorName(err) }) },
+    };
+    const e = enc orelse return .skipped;
+    return .{ .done = .{
+        .index = e.index,
+        .ktx2_size = e.ktx2_bytes,
+        .psnr = e.psnr_db,
+        .vram_after = e.vram_after,
+    } };
+}
 
 /// `{"path":"<abs>"}` or `{"path":null}`: the `openDialog` reply.
 fn pathResultRaw(a: std.mem.Allocator, path: ?[]const u8) !json.Raw {
@@ -985,4 +1519,146 @@ test "optimizeCustom runs the full pipeline and writes a parseable glb" {
     };
     defer out.deinit();
     try testing.expect(out.asset.meshes.len > 0);
+}
+
+// ---- background jobs ------------------------------------------------------
+
+test "a second job answers busy instead of spawning" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    var occupied: Job = undefined; // the gate only ever compares pointers
+    b.job = &occupied;
+    defer b.job = null;
+
+    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/box.glb", null, 0);
+    try testing.expectEqualStrings("{\"error\":\"busy\"}", r.text);
+    try testing.expect(b.busy());
+}
+
+test "launch rejects an unreadable path without spawning" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    const r = try b.launch(a, .{}, .texture_encode, "test/fixtures/nope.glb", null, 0);
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "nope.glb") != null);
+    try testing.expect(!b.busy());
+}
+
+/// Stands in for the main-thread delivery: records what the worker produced.
+const Collector = struct {
+    mutex: Gate = .{},
+    called: std.atomic.Value(bool) = .init(false),
+    ok: bool = false,
+    report: ?[]u8 = null,
+
+    fn collect(ctx: ?*anyopaque, job: *Job) void {
+        const self: *Collector = @ptrCast(@alignCast(ctx orelse return));
+        self.mutex.lock();
+        self.ok = job.result != null;
+        if (job.result) |res| switch (res) {
+            .optimize => |o| self.report = testing.allocator.dupe(u8, o.report) catch null,
+            .texture => {},
+        };
+        self.mutex.unlock();
+        job.backend.releaseJob(job);
+        job.destroy();
+        self.called.store(true, .release);
+    }
+
+    fn wait(self: *Collector) void {
+        while (!self.called.load(.acquire)) std.atomic.spinLoopHint();
+    }
+};
+
+test "optimizeCustom runs on a worker and delivers the report" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    var got: Collector = .{};
+    b.on_job_done = &Collector.collect;
+    b.on_job_done_ctx = &got;
+    defer b.on_job_done = null;
+    defer if (got.report) |r| testing.allocator.free(r);
+
+    const resolved = specPresetOrMessage(a, "{\"steps\":[{\"dedup\":{}},{\"quantize\":{}}]}");
+    const p = switch (resolved) {
+        .preset => |p2| p2,
+        .err => |msg| {
+            std.debug.print("spec rejected: {s}\n", .{msg});
+            return error.TestUnexpectedResult;
+        },
+    };
+
+    const reply = try b.launch(a, .{}, .optimize, "test/fixtures/box.glb", p, 0);
+    try testing.expectEqualStrings("{\"started\":true}", reply.text);
+
+    got.wait();
+    try testing.expect(got.ok);
+    // The gate is open again once the result is delivered.
+    try testing.expect(!b.busy());
+    const report = got.report orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, report, "\"preset\": \"custom\"") != null);
+    try testing.expect(std.mem.indexOf(u8, report, "\"output\": \".zig-cache/assetty-app/opt_") != null);
+}
+
+test "texture encode reports an out-of-range index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 999)) {
+        .failed => |msg| try testing.expect(std.mem.indexOf(u8, msg, "out of range") != null),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "done event payloads carry the documented shapes" {
+    var buf: [512]u8 = undefined;
+
+    var ok_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.OptimizeDonePayload{
+        .ok = true,
+        .out_path = ".zig-cache/assetty-app/opt_1.glb",
+        .report = json.raw("{\"preset\": \"custom\"}"),
+    }, .{}, &ok_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":true,\"out_path\":\".zig-cache/assetty-app/opt_1.glb\",\"report\":{\"preset\": \"custom\"}}",
+        ok_w.buffered(),
+    );
+
+    var err_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.OptimizeDonePayload{ .ok = false, .@"error" = "boom" }, .{}, &err_w);
+    try testing.expectEqualStrings("{\"ok\":false,\"error\":\"boom\"}", err_w.buffered());
+
+    var tex_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.TextureEncodeDonePayload{
+        .ok = true,
+        .index = 2,
+        .ktx2_size = 1024,
+        .psnr = 41.5,
+        .vram_after = 2048,
+    }, .{}, &tex_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":true,\"index\":2,\"ktx2_size\":1024,\"psnr\":41.50,\"vram_after\":2048}",
+        tex_w.buffered(),
+    );
+
+    var tex_err_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.TextureEncodeDonePayload{
+        .ok = false,
+        .index = 3,
+        .@"error" = "image 3 out of range",
+    }, .{}, &tex_err_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":false,\"index\":3,\"error\":\"image 3 out of range\"}",
+        tex_err_w.buffered(),
+    );
 }

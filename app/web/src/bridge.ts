@@ -10,16 +10,24 @@
  *   openDialog()            -> { path } | "/abs/file.glb" | null (cancel)
  *   info(path)              -> Info
  *   loadBytes(path)         -> { b64, size } | string (base64)
- *   optimize(path, preset)  -> { out_path, report }
+ *   optimize(path, preset)  -> { started: true } — result arrives as "optimizeDone"
+ *                              (older hosts: { out_path, report } synchronously)
  *   optimizeCustom(path, spec) -> same shape; spec is a JSON string
  *   textures(path)          -> { images }
- *   textureEncode(path, i)  -> { ktx2_size, psnr, vram_after }
+ *   textureEncode(path, i)  -> { started: true } — result arrives as "textureEncodeDone"
+ *                              (older hosts: { ktx2_size, psnr, vram_after } synchronously)
  *   diff(a, b)              -> DiffReport
  *   lint(path, budgetJson)  -> { violations, total }
  *   presets()               -> ["desktop", ...] | { presets: [...] }
  *   presetLoad(name)        -> zon text | { zon }
  *   presetSave(name, zon)   -> anything
- * Events: "progress" { step, pct }, "log" { line }
+ *
+ * A job that is already running answers `{ "error": "busy" }`.
+ *
+ * Events: "progress" { step, pct }, "log" { line },
+ *         "optimizeDone" { ok: true, out_path, report } | { ok: false, error },
+ *         "textureEncodeDone" { ok: true, index, ktx2_size, psnr, vram_after }
+ *                            | { ok: false, index, error }
  */
 
 import * as demo from "./demo";
@@ -46,6 +54,25 @@ export interface ProgressEvent {
 export interface OpenDialogResult {
   path: string | null;
 }
+
+/**
+ * What `optimize()` / `optimizeCustom()` resolve to.
+ * `started: true` means the job runs in the background — the report arrives
+ * through `onOptimizeDone()`. `stopProgress()` releases the `progress` listener
+ * the bridge opened for the call.
+ */
+export type OptimizeInvocation =
+  | { started: true; stopProgress: () => void }
+  | { started: false; result: OptimizeResult };
+
+export type OptimizeDoneEvent = { ok: true; result: OptimizeResult } | { ok: false; error: string };
+
+/** What `textureEncode()` resolves to (async on new hosts, immediate on old ones). */
+export type EncodeInvocation = { started: true } | { started: false; result: EncodeResult };
+
+export type TextureEncodeDoneEvent =
+  | { ok: true; index: number; result: EncodeResult }
+  | { ok: false; index: number; error: string };
 
 const METHOD_NAMES = [
   "openDialog",
@@ -271,6 +298,45 @@ function normalizeImages(raw: unknown): TexturesResult {
   return { images: images as TexturesResult["images"] };
 }
 
+/** New hosts acknowledge a job with `{"started":true}` instead of blocking. */
+function isStartedAck(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  return (raw as Record<string, unknown>).started === true;
+}
+
+function normalizeOptimizeDone(raw: unknown): OptimizeDoneEvent {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
+  if (!ok) return { ok: false, error: String(r.error ?? "optimize failed") };
+  // Accept both the flat contract and a `{ ok, result }` wrapper.
+  const payload =
+    r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
+  return { ok: true, result: normalizeOptimize(payload) };
+}
+
+function normalizeEncodeDone(raw: unknown): TextureEncodeDoneEvent {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const index = asNumber(r.index, -1);
+  if (r.ok === false || (r.error != null && r.ok !== true)) {
+    return { ok: false, index, error: String(r.error ?? "encode failed") };
+  }
+  return {
+    ok: true,
+    index,
+    result: {
+      ktx2_size: asNumber(r.ktx2_size ?? r.size),
+      psnr: asNumber(r.psnr),
+      vram_after: asNumber(r.vram_after ?? r.vram),
+    },
+  };
+}
+
+/** True when the host rejected a call because another job is still running. */
+export function isBusyError(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err ?? "");
+  return /\bbusy\b|already running|job in progress/i.test(text);
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 class DemoBackend {
@@ -423,21 +489,28 @@ export class Bridge {
     method: "optimize" | "optimizeCustom",
     args: unknown[],
     onProgress?: (p: ProgressEvent) => void,
-  ): Promise<OptimizeResult> {
+  ): Promise<OptimizeInvocation> {
     const off = this.progressInto(onProgress);
+    let res: unknown;
     try {
-      return normalizeOptimize(parseMaybeJson(await this.raw(method, args)));
-    } finally {
+      res = parseMaybeJson(await this.raw(method, args));
+    } catch (err) {
       off();
+      throw err;
     }
+    // New contract: the host returns immediately and reports through events.
+    if (isStartedAck(res)) return { started: true, stopProgress: off };
+    off();
+    return { started: false, result: normalizeOptimize(res) };
   }
 
   async optimize(
     path: string,
     preset: string,
     onProgress?: (p: ProgressEvent) => void,
-  ): Promise<OptimizeResult> {
-    if (!this.live) return this.demo.optimize(path, preset, onProgress);
+  ): Promise<OptimizeInvocation> {
+    if (!this.live)
+      return { started: false, result: await this.demo.optimize(path, preset, onProgress) };
     return this.callOptimize("optimize", [path, preset], onProgress);
   }
 
@@ -452,8 +525,10 @@ export class Bridge {
     specJson: string,
     fallbackPreset: string,
     onProgress?: (p: ProgressEvent) => void,
-  ): Promise<OptimizeResult> {
-    if (!this.live) return this.demo.optimizeCustom(path, specJson, onProgress);
+  ): Promise<OptimizeInvocation> {
+    if (!this.live) {
+      return { started: false, result: await this.demo.optimizeCustom(path, specJson, onProgress) };
+    }
     if (!this.native?.methods.includes("optimizeCustom")) {
       notify(
         `backend has no optimizeCustom() — running the "${fallbackPreset}" preset instead`,
@@ -480,15 +555,21 @@ export class Bridge {
     return normalizeImages(parseMaybeJson(await this.raw("textures", [path])));
   }
 
-  async textureEncode(path: string, index: number): Promise<EncodeResult> {
-    if (!this.live) return this.demo.textureEncode(path, index);
+  async textureEncode(path: string, index: number): Promise<EncodeInvocation> {
+    if (!this.live) {
+      return { started: false, result: await this.demo.textureEncode(path, index) };
+    }
     const res = parseMaybeJson<Record<string, unknown>>(
       await this.raw("textureEncode", [path, index]),
     );
+    if (isStartedAck(res)) return { started: true };
     return {
-      ktx2_size: asNumber(res.ktx2_size ?? res.size),
-      psnr: asNumber(res.psnr),
-      vram_after: asNumber(res.vram_after ?? res.vram),
+      started: false,
+      result: {
+        ktx2_size: asNumber(res.ktx2_size ?? res.size),
+        psnr: asNumber(res.psnr),
+        vram_after: asNumber(res.vram_after ?? res.vram),
+      },
     };
   }
 
@@ -542,6 +623,19 @@ export class Bridge {
     const obj = res as Record<string, unknown>;
     const p = obj.path ?? obj.file;
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
+  }
+
+  /**
+   * Final result of a background `optimize()` / `optimizeCustom()` run.
+   * Fires once per job, after the call already resolved with `{ started: true }`.
+   */
+  onOptimizeDone(cb: (event: OptimizeDoneEvent) => void): () => void {
+    return this.on("optimizeDone", (payload) => cb(normalizeOptimizeDone(payload)));
+  }
+
+  /** Final result of a background `textureEncode()` run. */
+  onTextureEncodeDone(cb: (event: TextureEncodeDoneEvent) => void): () => void {
+    return this.on("textureEncodeDone", (payload) => cb(normalizeEncodeDone(payload)));
   }
 
   /** Subscribe to a backend event ("progress" | "log"). Returns an unsubscribe fn. */

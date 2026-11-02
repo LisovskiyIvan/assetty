@@ -1,13 +1,18 @@
+/**
+ * Viewer tab: pure Babylon canvas.
+ *
+ * Scene exploration lives in the Babylon inspector (⌘I / topbar button); the
+ * model summary lives in the status bar. This tab only owns the canvas, its
+ * empty state and the load lifecycle.
+ */
 import { app } from "../app";
-import { el, fmtBytes, fmtNum, kv, section, clear, emptyState, OPEN_HINT } from "../ui";
-import type { Info } from "../types";
+import { el, emptyState, OPEN_HINT } from "../ui";
 import { ViewerScene } from "../viewer";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
-import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
 import type { TabHandle } from "./types";
 
 export function mountViewer(): TabHandle {
-  const root = el("div", { class: "tab-body" });
+  const root = el("div", { class: "tab-body canvas-only" });
   const main = el("div", { class: "tab-main" });
   const wrap = el("div", { class: "canvas-wrap" });
   const canvas = el("canvas", { id: "viewer-canvas" });
@@ -18,9 +23,7 @@ export function mountViewer(): TabHandle {
   openHint.hidden = true;
   wrap.append(canvas, label, loading, openHint);
   main.append(wrap);
-
-  const side = el("div", { class: "tab-side" });
-  root.append(main, side);
+  root.append(main);
 
   let viewer: ViewerScene | null = null;
   let pendingPath: string | null = app.pathA;
@@ -30,178 +33,6 @@ export function mountViewer(): TabHandle {
     loading.textContent = text;
     loading.classList.toggle("show", on);
   };
-
-  function explorerPanel(v: ViewerScene): HTMLElement {
-    const data = v.explorerData();
-    const host = el("div", { class: "explorer" });
-
-    const group = (
-      title: string,
-      items: Array<{ label: string; kind: string; mesh?: AbstractMesh }>,
-    ) => {
-      if (items.length === 0) return;
-      host.append(el("div", { class: "group", text: `${title} (${items.length})` }));
-      for (const item of items) {
-        const row = el(
-          "div",
-          {
-            class: "item",
-            onclick: () => {
-              if (!item.mesh) return;
-              v.selectMesh(item.mesh);
-              host
-                .querySelectorAll(".item.selected")
-                .forEach((n) => n.classList.remove("selected"));
-              row.classList.add("selected");
-            },
-          },
-          el("span", { class: "kind", text: item.kind }),
-          el("span", { class: "name", text: item.label }),
-        );
-        host.append(row);
-      }
-    };
-
-    group(
-      "Meshes",
-      data.nodes.map((m) => ({
-        label: m.name || `mesh#${m.uniqueId}`,
-        kind: m.getTotalVertices() > 0 ? "mesh" : "node",
-        mesh: m,
-      })),
-    );
-    group(
-      "Materials",
-      data.materials.map((m) => ({ label: m.name || "material", kind: "mat" })),
-    );
-    group(
-      "Textures",
-      data.textures.map((t) => ({ label: t.name || "texture", kind: "tex" })),
-    );
-    if (data.animations.length > 0) {
-      host.append(el("div", { class: "group", text: `Animations (${data.animations.length})` }));
-      for (const g of data.animations)
-        host.append(
-          el(
-            "div",
-            { class: "item" },
-            el("span", { class: "kind", text: "anim" }),
-            el("span", { class: "name", text: g.name }),
-          ),
-        );
-    }
-    host.append(
-      el("div", {
-        class: "hint",
-        text: "click a mesh to highlight · drag to orbit · wheel to zoom",
-      }),
-    );
-    return section("Scene explorer", host);
-  }
-
-  function animationsPanel(v: ViewerScene): HTMLElement {
-    const groups = v.scene.animationGroups;
-    const list = el("div", { class: "anim-list" });
-    if (groups.length === 0)
-      list.append(el("div", { class: "muted", text: "no animation groups" }));
-    for (const g of groups) list.append(animRow(g));
-    return section("Animations", list);
-  }
-
-  function animRow(group: AnimationGroup): HTMLElement {
-    const name = el("span", { class: "name", text: group.name || "animation" });
-    const toggle = el("button", {
-      class: "small",
-      text: group.isPlaying ? "pause" : "play",
-      onclick: () => {
-        if (group.isPlaying) group.pause();
-        else group.play(true);
-        toggle.textContent = group.isPlaying ? "pause" : "play";
-      },
-    });
-    const restart = el("button", {
-      class: "small",
-      text: "restart",
-      onclick: () => {
-        group.restart();
-        toggle.textContent = "pause";
-      },
-    });
-    return el("div", { class: "anim" }, name, toggle, restart);
-  }
-
-  function infoPanels(info: Info): HTMLElement[] {
-    const g = info.geometry;
-    const c = info.counts;
-    return [
-      section(
-        "File",
-        kv([
-          ["path", info.file],
-          ["container", info.container ?? "—"],
-          ["generator", info.generator ?? "—"],
-        ]),
-      ),
-      section(
-        "Geometry",
-        kv([
-          ["triangles", fmtNum(g.triangles)],
-          ["vertices", fmtNum(g.vertices)],
-          ["mesh inst.", fmtNum(g.mesh_instances)],
-          ["draw calls", fmtNum(g.draw_calls)],
-        ]),
-        el("div", { class: "section-title", text: "counts" }),
-        kv([
-          ["meshes / prims", `${c.meshes} / ${c.primitives}`],
-          ["materials", fmtNum(c.materials)],
-          ["textures / images", `${c.textures} / ${c.images}`],
-          ["animations", fmtNum(c.animations)],
-          ["skins / joints", `${c.skins} / ${c.joints}`],
-        ]),
-      ),
-      section(
-        "Disk",
-        kv([
-          ["total", fmtBytes(info.disk.total)],
-          ["json", `${fmtBytes(info.disk.json)} (${info.disk.json_pct.toFixed(1)}%)`],
-          ["bin", fmtBytes(info.disk.bin)],
-        ]),
-      ),
-      section(
-        "VRAM (estimated)",
-        kv([["total", fmtBytes(info.vram.total_est)]]),
-        el(
-          "table",
-          null,
-          el(
-            "tbody",
-            null,
-            ...info.vram.images.map((im) =>
-              el(
-                "tr",
-                null,
-                el("td", { class: "mono", text: String(im.index) }),
-                el("td", { text: im.name ?? "—" }),
-                el("td", { class: "mono", text: im.format }),
-                el("td", { class: "num", text: `${im.width}×${im.height}` }),
-                el("td", { class: "num", text: fmtBytes(im.vram) }),
-              ),
-            ),
-          ),
-        ),
-      ),
-    ];
-  }
-
-  function renderSide(info: Info | null, v: ViewerScene | null): void {
-    clear(side);
-    if (info) {
-      for (const panel of infoPanels(info)) side.append(panel);
-    } else {
-      side.append(emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() }));
-    }
-    if (v) side.append(explorerPanel(v), animationsPanel(v));
-  }
 
   async function loadPath(path: string): Promise<void> {
     const v = viewer;
@@ -226,12 +57,11 @@ export function mountViewer(): TabHandle {
     }
 
     try {
-      app.info = await app.bridge.info(path);
+      app.setInfo(await app.bridge.info(path));
     } catch (err) {
-      app.info = null;
+      app.setInfo(null);
       app.toast(`info failed: ${(err as Error).message}`, "error");
     }
-    renderSide(app.info, v);
 
     if (!pickedBound) {
       pickedBound = true;
@@ -259,16 +89,13 @@ export function mountViewer(): TabHandle {
           } else if (!app.bridge.live) {
             viewer.loadDemo();
             label.textContent = "demo scene (no nanoui)";
-            renderSide(null, viewer);
           } else {
             openHint.hidden = false;
-            renderSide(null, null);
           }
         } catch (err) {
           const reason = (err as Error).message;
           wrap.append(el("div", { class: "empty", text: `WebGL unavailable: ${reason}` }));
           app.toast(`WebGL unavailable: ${reason}`, "error");
-          renderSide(null, null);
         }
       } else {
         viewer.resume();

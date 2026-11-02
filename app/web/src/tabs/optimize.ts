@@ -1,4 +1,5 @@
 import { app } from "../app";
+import { isBusyError } from "../bridge";
 import {
   el,
   fmtBytes,
@@ -203,7 +204,10 @@ export function mountOptimize(): TabHandle {
   let right: ViewerScene | null = null;
   let linked = false;
   let lastResult: OptimizeResult | null = null;
-  let busy = false;
+  /** True while a background job owns the backend (Run stays disabled). */
+  let running = false;
+  let doneTimer: ReturnType<typeof setTimeout> | null = null;
+  let stopProgress: (() => void) | null = null;
 
   const state = defaultState();
   // "" = hand-tuned settings (no preset pill highlighted). The named preset is
@@ -230,7 +234,7 @@ export function mountOptimize(): TabHandle {
       entry.params.hidden = !state[entry.key];
     }
     for (const sync of widgetSync) sync();
-    runBtn.disabled = busy || !app.bridge.live || !app.pathA;
+    runBtn.disabled = running || !app.bridge.live || !app.pathA;
   }
 
   function step(
@@ -486,15 +490,15 @@ export function mountOptimize(): TabHandle {
   const progressStep = el("span", { text: "idle" });
   const progressPct = el("span", { text: "0%" });
   const progressFill = el("div");
+  const progressBar = el("div", { class: "progress" }, progressFill);
   const logLine = el("div", { class: "logline mono", text: "—" });
-  side.append(
-    section(
-      "Progress",
-      el("div", { class: "progress-meta" }, progressStep, progressPct),
-      el("div", { class: "progress" }, progressFill),
-      logLine,
-    ),
+  const progressPanel = section(
+    "Progress",
+    el("div", { class: "progress-meta" }, progressStep, progressPct),
+    progressBar,
+    logLine,
   );
+  side.append(progressPanel);
 
   /* ------------------------------------------------------------------ report */
 
@@ -514,6 +518,30 @@ export function mountOptimize(): TabHandle {
   function setLog(message: string): void {
     logLine.textContent = message;
     logLine.title = message;
+  }
+
+  function setRunning(on: boolean): void {
+    running = on;
+    runBtn.textContent = on ? "Running…" : "Run optimize";
+    runBtn.disabled = on || !app.bridge.live || !app.pathA;
+    exportBtn.disabled = on || !lastResult;
+    progressBar.classList.toggle("running", on);
+  }
+
+  function stopJob(): void {
+    if (doneTimer) {
+      clearTimeout(doneTimer);
+      doneTimer = null;
+    }
+    stopProgress?.();
+    stopProgress = null;
+    setRunning(false);
+  }
+
+  function finishJobError(message: string): void {
+    stopJob();
+    setProgress("failed", 0);
+    notify(`optimize failed: ${message}`, "error");
   }
 
   function renderReport(res: OptimizeResult): void {
@@ -597,6 +625,36 @@ export function mountOptimize(): TabHandle {
     );
   }
 
+  async function loadOptimized(outPath: string): Promise<void> {
+    if (!right) return;
+    if (!app.bridge.live) {
+      right.loadDemo();
+      return;
+    }
+    try {
+      await right.loadBase64(await app.bridge.loadBytes(outPath));
+    } catch (err) {
+      notify(`load optimized failed: ${(err as Error).message}`, "error");
+    }
+  }
+
+  // The host runs the pipeline off the UI thread and reports back here. This
+  // fires even when the user switched tabs meanwhile; the closure state is
+  // kept alive by the mounted tab.
+  const offDone = app.bridge.onOptimizeDone((event) => {
+    if (!running) return;
+    if (!event.ok) {
+      finishJobError(event.error);
+      return;
+    }
+    lastResult = event.result;
+    stopJob();
+    setProgress("done", 100);
+    renderReport(event.result);
+    void loadOptimized(event.result.out_path);
+    notify("optimization finished", "ok");
+  });
+
   /* --------------------------------------------------------------------- run */
 
   function applyPreset(name: string): void {
@@ -645,48 +703,67 @@ export function mountOptimize(): TabHandle {
       notify(`load failed: ${(err as Error).message}`, "error");
       openHint.hidden = false;
     }
-    runBtn.disabled = busy || !app.bridge.live || !app.pathA;
+    runBtn.disabled = running || !app.bridge.live || !app.pathA;
   }
+
+  const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
   runBtn.addEventListener("click", async () => {
     const path = app.pathA;
-    if (!path || busy) return;
+    if (!path || running) return;
     const steps = buildSpec(state);
     if (steps.length === 0) {
       notify("pick at least one step", "error");
       return;
     }
     const specJson = JSON.stringify({ steps });
-    busy = true;
-    runBtn.disabled = true;
-    exportBtn.disabled = true;
+    stopProgress?.();
+    stopProgress = null;
+    setRunning(true);
     setProgress("starting…", 0);
     try {
-      const res = await app.bridge.optimizeCustom(path, specJson, activePreset || "desktop", (p) =>
-        setProgress(p.step, p.pct),
+      const call = await app.bridge.optimizeCustom(
+        path,
+        specJson,
+        activePreset || "desktop",
+        (p) => {
+          if (running) setProgress(p.step || "running…", p.pct);
+        },
       );
-      lastResult = res;
-      setProgress("done", 100);
-      renderReport(res);
-      exportBtn.disabled = false;
-      if (right) {
-        if (app.bridge.live) {
-          try {
-            await right.loadBase64(await app.bridge.loadBytes(res.out_path));
-          } catch (err) {
-            notify(`load optimized failed: ${(err as Error).message}`, "error");
-          }
-        } else {
-          right.loadDemo();
+      if (call.started) {
+        // Background job: Run stays disabled until optimizeDone arrives.
+        stopProgress = call.stopProgress;
+        if (!running) {
+          // Timed out/re-enabled while the call was in flight.
+          stopProgress();
+          stopProgress = null;
+          return;
         }
+        setProgress("running…", 0);
+        setLog("optimization running in the background…");
+        doneTimer = setTimeout(() => {
+          doneTimer = null;
+          finishJobError("no completion event within 10 minutes — timed out");
+        }, RUN_TIMEOUT_MS);
+        return;
       }
+
+      // Older hosts: the call itself returned the finished report.
+      lastResult = call.result;
+      stopJob();
+      setProgress("done", 100);
+      renderReport(call.result);
+      void loadOptimized(call.result.out_path);
       notify("optimization finished", "ok");
     } catch (err) {
-      setProgress("failed", 0);
-      notify(`optimize failed: ${(err as Error).message}`, "error");
-    } finally {
-      busy = false;
-      runBtn.disabled = !app.bridge.live || !app.pathA;
+      stopJob();
+      if (isBusyError(err)) {
+        setProgress("busy", 0);
+        notify("optimize already running — wait for it to finish", "error");
+      } else {
+        setProgress("failed", 0);
+        notify(`optimize failed: ${(err as Error).message}`, "error");
+      }
     }
   });
 
@@ -730,7 +807,7 @@ export function mountOptimize(): TabHandle {
         right?.resume();
       }
       void loadPresets();
-      runBtn.disabled = busy || !app.bridge.live || !app.pathA;
+      runBtn.disabled = running || !app.bridge.live || !app.pathA;
     },
     deactivate: () => {
       left?.pause();
@@ -739,6 +816,8 @@ export function mountOptimize(): TabHandle {
     dispose: () => {
       offPath();
       offLog();
+      offDone();
+      stopJob();
       left?.dispose();
       right?.dispose();
       left = null;

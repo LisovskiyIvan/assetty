@@ -175,6 +175,11 @@ button.active {
   grid-template-columns: minmax(0, 1fr) minmax(280px, min(420px, 46vw));
 }
 
+/* Viewer is a pure canvas: no owner-drawn side panel. */
+.tab-body.canvas-only {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .tab-main {
   position: relative;
   min-width: 0;
@@ -386,6 +391,30 @@ textarea {
   width: 0%;
   background: linear-gradient(90deg, #2f6fb5, var(--accent));
   transition: width 0.15s linear;
+}
+
+/* Indeterminate shimmer while a background job owns the backend. */
+.progress.running > div {
+  background-image: linear-gradient(
+    90deg,
+    #2f6fb5 0%,
+    var(--accent) 40%,
+    #8fc4ff 50%,
+    var(--accent) 60%,
+    #2f6fb5 100%
+  );
+  background-size: 200% 100%;
+  animation: progress-shimmer 1.2s linear infinite;
+}
+
+@keyframes progress-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: -100% 0;
+  }
 }
 
 .progress-meta {
@@ -611,7 +640,7 @@ tr.selected {
   grid-row: 4;
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 10px;
   height: 26px;
   padding: 0 12px;
   background: var(--bg-alt);
@@ -621,6 +650,7 @@ tr.selected {
   color: var(--text-dim);
   min-width: 0;
   overflow: hidden;
+  white-space: nowrap;
 }
 
 .statusbar > span {
@@ -629,6 +659,16 @@ tr.selected {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* metrics share the row and ellipsize; the path gets the elastic share */
+.statusbar .metric {
+  flex: 0 1 auto;
+}
+
+.statusbar .status-path {
+  flex: 1 1 auto;
+  min-width: 8ch;
 }
 
 .statusbar .sep {
@@ -642,19 +682,25 @@ tr.selected {
 }
 
 .statusbar .grow {
-  flex: 1 1 auto;
+  flex: 0 0 0;
 }
 
 /* last toast/decoder message stays visible in the status bar */
 .statusbar .status-log {
-  flex: 1 1 40%;
+  flex: 0 1 18ch;
   min-width: 0;
-  max-width: 46%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: right;
   color: var(--text-dim);
+}
+
+/* The summary owns the row; transient log text is the first thing to go. */
+@media (max-width: 1100px) {
+  .statusbar .status-log {
+    display: none;
+  }
 }
 
 .statusbar .status-log[data-kind="error"] {

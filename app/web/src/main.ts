@@ -4,7 +4,7 @@ import { checkKtx2Assets, configureKtx2, reportDecoderFailure } from "./ktx2";
 import { notify, onLog } from "./notify";
 import { createInspectorDock } from "./inspector";
 import { Logger } from "@babylonjs/core/Misc/logger";
-import { el } from "./ui";
+import { el, fmtBytes, fmtNum } from "./ui";
 import { mountViewer } from "./tabs/viewer";
 import { mountOptimize } from "./tabs/optimize";
 import { mountTextures } from "./tabs/textures";
@@ -92,14 +92,19 @@ async function toggleInspector(): Promise<void> {
 }
 
 const status = {
-  fps: el("span", { text: "fps —" }),
-  tris: el("span", { text: "tris —" }),
-  draws: el("span", { text: "draws —" }),
-  meshes: el("span", { text: "meshes —" }),
-  path: el("span", { text: "no file" }),
+  fps: el("span", { class: "metric", text: "fps —" }),
+  tris: el("span", { class: "metric", text: "tris —" }),
+  draws: el("span", { class: "metric", text: "draws —" }),
+  meshes: el("span", { class: "metric", text: "meshes —" }),
+  materials: el("span", { class: "metric", text: "materials —" }),
+  textures: el("span", { class: "metric", text: "textures —" }),
+  vram: el("span", { class: "metric", text: "vram —" }),
+  disk: el("span", { class: "metric", text: "disk —" }),
+  path: el("span", { class: "metric status-path", text: "no file" }),
   log: el("span", { class: "status-log", text: "" }),
-  mode: el("span", { text: app.bridge.modeLabel }),
 };
+
+const sep = () => el("span", { class: "sep" });
 
 onLog((message, kind) => {
   status.log.textContent = message;
@@ -123,18 +128,24 @@ appRoot.append(
     "footer",
     { class: "statusbar" },
     status.fps,
-    el("span", { class: "sep" }),
+    sep(),
     status.tris,
-    el("span", { class: "sep" }),
+    sep(),
     status.draws,
-    el("span", { class: "sep" }),
+    sep(),
     status.meshes,
-    el("span", { class: "sep" }),
+    sep(),
+    status.materials,
+    sep(),
+    status.textures,
+    sep(),
+    status.vram,
+    sep(),
+    status.disk,
+    sep(),
     status.path,
     el("span", { class: "grow" }),
     status.log,
-    el("span", { class: "sep" }),
-    status.mode,
   ),
 );
 document.body.append(appRoot);
@@ -208,25 +219,40 @@ for (const def of TAB_DEFS) {
 
 /* ---------------------------------------------------------------- status bar */
 
-setInterval(() => {
+const updateStatusBar = (): void => {
   const viewer = app.viewer;
   if (!viewer) {
     status.fps.textContent = "fps —";
     status.tris.textContent = "tris —";
     status.draws.textContent = "draws —";
     status.meshes.textContent = "meshes —";
-    return;
+    status.materials.textContent = "materials —";
+    status.textures.textContent = "textures —";
+  } else {
+    const s = viewer.getStats();
+    status.fps.textContent = `fps ${s.fps.toFixed(0)}`;
+    status.tris.textContent = `tris ${fmtNum(s.triangles)}`;
+    status.draws.textContent = `draws ${fmtNum(s.drawCalls)}`;
+    status.meshes.textContent = `meshes ${fmtNum(s.meshes)}`;
+    status.materials.textContent = `materials ${fmtNum(s.materials)}`;
+    status.textures.textContent = `textures ${fmtNum(s.textures)}`;
   }
-  const s = viewer.getStats();
-  status.fps.textContent = `fps ${s.fps.toFixed(0)}`;
-  status.tris.textContent = `tris ${s.triangles.toLocaleString("en-US")}`;
-  status.draws.textContent = `draws ${s.drawCalls}`;
-  status.meshes.textContent = `meshes ${s.meshes}`;
-}, 500);
+  const info = app.info;
+  status.vram.textContent = `vram ${info ? fmtBytes(info.vram.total_est) : "—"}`;
+  status.disk.textContent = `disk ${info ? fmtBytes(info.disk.total) : "—"}`;
+  const path = app.pathA ?? "no file";
+  if (status.path.textContent !== path) status.path.textContent = path;
+  status.path.title = app.pathA ?? "";
+};
+
+setInterval(updateStatusBar, 500);
+updateStatusBar();
 
 app.on("path", (d) => {
   status.path.textContent = d.path;
+  status.path.title = d.path;
 });
+app.on("context", () => updateStatusBar());
 
 /* ------------------------------------------------------------------- boot */
 

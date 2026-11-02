@@ -52,7 +52,14 @@ export class App {
 
   setPath(path: string): void {
     this.pathA = path;
+    // The previous model's info no longer describes what is on screen.
+    this.info = null;
     this.emit("path", { path });
+  }
+
+  setInfo(info: Info | null): void {
+    this.info = info;
+    this.emit("context");
   }
 
   setViewer(viewer: ViewerScene | null): void {

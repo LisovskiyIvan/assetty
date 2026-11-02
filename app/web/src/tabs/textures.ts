@@ -1,7 +1,10 @@
 import { app } from "../app";
+import { isBusyError } from "../bridge";
 import { el, fmtBytes, kv, psnrBadge, section, clear, emptyState, OPEN_HINT } from "../ui";
 import type { EncodeResult, ImageInfo } from "../types";
 import type { TabHandle } from "./types";
+
+const ENCODE_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function mountTextures(): TabHandle {
   const root = el("div", { class: "tab-body" });
@@ -20,7 +23,9 @@ export function mountTextures(): TabHandle {
 
   let images: ImageInfo[] = [];
   let selected = -1;
-  let busy = false;
+  /** Index of the image whose async encode is in flight (null when idle). */
+  let encoding: number | null = null;
+  let encodeTimer: ReturnType<typeof setTimeout> | null = null;
   let last: { image: ImageInfo; result: EncodeResult } | null = null;
 
   const encodeBtn = el("button", {
@@ -57,7 +62,9 @@ export function mountTextures(): TabHandle {
       ),
     );
     const resultHost = el("div", { class: "panel-body" });
-    if (last && last.image.index === img.index) {
+    if (encoding === img.index) {
+      resultHost.append(el("span", { class: "badge yellow", text: "encoding…" }));
+    } else if (last && last.image.index === img.index) {
       const r = last.result;
       resultHost.append(
         el(
@@ -76,6 +83,8 @@ export function mountTextures(): TabHandle {
     } else {
       resultHost.append(el("div", { class: "muted", text: "not encoded yet" }));
     }
+    encodeBtn.textContent = encoding === null ? "Encode to KTX2" : "encoding…";
+    encodeBtn.disabled = !app.bridge.live || encoding !== null;
     side.append(
       section(
         "Encode",
@@ -105,13 +114,14 @@ export function mountTextures(): TabHandle {
       el(
         "tr",
         {
-          class: `clickable ${img.index === selected ? "selected" : ""}`,
+          class: `clickable ${img.index === selected ? "selected" : ""} ${
+            img.index === encoding ? "encoding" : ""
+          }`,
           onclick: () => {
             selected = img.index;
             last = null;
             renderList();
             renderSide();
-            encodeBtn.disabled = !app.bridge.live || busy;
           },
         },
         el("td", { class: "mono", text: String(img.index) }),
@@ -123,9 +133,11 @@ export function mountTextures(): TabHandle {
         el(
           "td",
           null,
-          img.has_mips
-            ? el("span", { class: "badge green", text: "mips" })
-            : el("span", { class: "badge dim", text: "no mips" }),
+          img.index === encoding
+            ? el("span", { class: "badge yellow", text: "encoding…" })
+            : img.has_mips
+              ? el("span", { class: "badge green", text: "mips" })
+              : el("span", { class: "badge dim", text: "no mips" }),
         ),
       ),
     );
@@ -158,6 +170,7 @@ export function mountTextures(): TabHandle {
     images = [];
     selected = -1;
     last = null;
+    clearEncodeState();
     if (path || !app.bridge.live) {
       try {
         const res = await app.bridge.textures(path ?? "/demo/DamagedHelmet.glb");
@@ -171,27 +184,77 @@ export function mountTextures(): TabHandle {
     encodeBtn.disabled = true;
   }
 
+  function clearEncodeState(): void {
+    if (encodeTimer) {
+      clearTimeout(encodeTimer);
+      encodeTimer = null;
+    }
+    encoding = null;
+  }
+
+  function applyEncode(index: number, result: EncodeResult): void {
+    clearEncodeState();
+    const image = images.find((i) => i.index === index) ?? images[selected];
+    if (!image) return;
+    last = { image, result };
+    renderList();
+    renderSide();
+    app.toast(
+      `image ${image.index}: ${fmtBytes(result.ktx2_size)} @ ${result.psnr.toFixed(1)} dB`,
+      "ok",
+    );
+  }
+
+  // Background encode: the call resolves with `{ started: true }` and the real
+  // result arrives here (new hosts). Old hosts return the result directly.
+  const offDone = app.bridge.onTextureEncodeDone((event) => {
+    if (encoding === null) return;
+    if (event.index >= 0 && event.index !== encoding) return;
+    if (!event.ok) {
+      clearEncodeState();
+      renderList();
+      renderSide();
+      app.toast(`encode failed: ${event.error}`, "error");
+      return;
+    }
+    applyEncode(event.index >= 0 ? event.index : encoding, event.result);
+  });
+
   encodeBtn.addEventListener("click", async () => {
     const path = app.pathA;
     const img = images[selected];
-    if (!path || !img || busy) return;
-    busy = true;
+    if (!path || !img || encoding !== null) return;
+    const index = img.index;
+    encoding = index;
     encodeBtn.disabled = true;
     encodeBtn.textContent = "encoding…";
+    renderList();
+    renderSide();
     try {
-      const result = await app.bridge.textureEncode(path, img.index);
-      last = { image: img, result };
+      const call = await app.bridge.textureEncode(path, index);
+      if (call.started) {
+        // Run stays disabled until textureEncodeDone arrives.
+        encodeTimer = setTimeout(() => {
+          encodeTimer = null;
+          if (encoding !== index) return;
+          clearEncodeState();
+          renderList();
+          renderSide();
+          app.toast("texture encode timed out — no completion event", "error");
+        }, ENCODE_TIMEOUT_MS);
+        return;
+      }
+      applyEncode(index, call.result);
+    } catch (err) {
+      clearEncodeState();
+      renderList();
       renderSide();
       app.toast(
-        `image ${img.index}: ${fmtBytes(result.ktx2_size)} @ ${result.psnr.toFixed(1)} dB`,
-        "ok",
+        isBusyError(err)
+          ? "texture encode already running — wait for it to finish"
+          : `encode failed: ${(err as Error).message}`,
+        "error",
       );
-    } catch (err) {
-      app.toast(`encode failed: ${(err as Error).message}`, "error");
-    } finally {
-      busy = false;
-      encodeBtn.textContent = "Encode to KTX2";
-      encodeBtn.disabled = false;
     }
   });
 
@@ -204,6 +267,10 @@ export function mountTextures(): TabHandle {
     activate: () => {
       void reload();
     },
-    dispose: () => offPath(),
+    dispose: () => {
+      offPath();
+      offDone();
+      clearEncodeState();
+    },
   };
 }

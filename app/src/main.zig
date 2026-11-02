@@ -16,11 +16,15 @@ pub fn run(init: std.process.Init) !u8 {
     defer app.destroy();
 
     var backend = backend_mod.Backend{ .gpa = init.gpa, .io = init.io };
+    // Before `destroy`: a delivery still queued after this must not touch the app.
+    defer backend.shutdown();
     try app.bind(&backend);
 
     // Events first: the generated client carries their declarations.
     try app.registerEvent(events.Progress);
     try app.registerEvent(events.Log);
+    try app.registerEvent(events.OptimizeDone);
+    try app.registerEvent(events.TextureEncodeDone);
 
     _ = try app.newWindow(.{
         .title = "assetty",

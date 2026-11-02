@@ -35,6 +35,10 @@ export interface ViewerStats {
   meshes: number;
   triangles: number;
   drawCalls: number;
+  /** Materials referenced by the loaded meshes (excludes engine internals). */
+  materials: number;
+  /** Model textures (excludes the scene environment map and render targets). */
+  textures: number;
 }
 
 export interface ExplorerData {
@@ -340,11 +344,21 @@ export class ViewerScene {
     const indices = this.scene.getActiveIndices();
     const engineAny = this.engine as unknown as { _drawCalls?: { current?: number } };
     const drawCalls = engineAny._drawCalls?.current ?? active.length;
+    const materials = new Set<Material>();
+    for (const mesh of this.scene.meshes) {
+      if (mesh.material) materials.add(mesh.material);
+    }
+    const env = this.scene.environmentTexture;
+    const textures = this.scene.textures.filter(
+      (t) => t !== env && t.getClassName() !== "RenderTargetTexture",
+    ).length;
     return {
       fps: this.engine.getFps(),
       meshes: this.scene.meshes.length,
       triangles: Math.round(indices / 3),
       drawCalls,
+      materials: materials.size,
+      textures,
     };
   }
 
