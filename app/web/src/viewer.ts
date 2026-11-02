@@ -10,6 +10,7 @@ import { HighlightLayer } from "@babylonjs/core/Layers/highlightLayer";
 import { LoadAssetContainerAsync, SceneLoader } from "@babylonjs/core/Loading/sceneLoader";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
+import { CubeTexture } from "@babylonjs/core/Materials/Textures/cubeTexture";
 import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { Material } from "@babylonjs/core/Materials/material";
@@ -17,6 +18,11 @@ import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
 import "@babylonjs/loaders/glTF";
 import { b64ToBytes } from "./bridge";
+import { notify } from "./notify";
+
+/** Vendored prefiltered IBL (specular + irradiance polynomials) in `public/env/`. */
+export const ENVIRONMENT_URL = (): string =>
+  new URL("env/environmentSpecular.env", document.baseURI).href;
 
 export interface ExplorerSelection {
   kind: "node" | "mesh" | "material" | "texture" | "animation";
@@ -46,6 +52,7 @@ export class ViewerScene {
   readonly highlight: HighlightLayer;
   private resizeObserver: ResizeObserver;
   private disposed = false;
+  private envWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   onProgress?: (label: string) => void;
 
@@ -91,6 +98,8 @@ export class ViewerScene {
     dir.intensity = 1.6;
     dir.position = new Vector3(8, 12, 8);
 
+    this.setupEnvironmentDeferred();
+
     this.highlight = new HighlightLayer("hl", this.scene, {
       blurHorizontalSize: 1.2,
       blurVerticalSize: 1.2,
@@ -106,13 +115,67 @@ export class ViewerScene {
       this.scene.onBeforeRenderObservable.add(() => drawCounter.fetchNewFrame?.());
     }
 
-    this.resizeObserver = new ResizeObserver(() => this.engine.resize());
-    this.resizeObserver.observe(canvas.parentElement ?? canvas);
+    // Observe the canvas itself: its CSS box is what actually changes when the
+    // window, the right panel or the inspector dock resizes. Listening on the
+    // parent misses dock-driven layout changes.
+    this.resizeObserver = new ResizeObserver(() => this.resize());
+    this.resizeObserver.observe(canvas);
     window.addEventListener("resize", this.resize);
   }
 
+  /**
+   * Image-based lighting. glTF metallic-roughness materials are lit almost
+   * entirely by the environment (metals have no diffuse term), so without one
+   * they render black. The prefiltered `.env` also carries the irradiance
+   * polynomials used for the diffuse term.
+   *
+   * The upload compiles a helper post-process through the scene's render
+   * pipeline, so it must not start before the first frame — creating it in the
+   * constructor deadlocks `scene.isReady()` (materials wait for the env, the
+   * env waits for a render). Defer until one frame has been drawn, with a
+   * timer as a belt-and-braces fallback for paused/offscreen tabs.
+   */
+  private setupEnvironmentDeferred(): void {
+    let started = false;
+    const start = (): void => {
+      if (started || this.disposed) return;
+      started = true;
+      this.setupEnvironment();
+    };
+    this.scene.onAfterRenderObservable.addOnce(start);
+    setTimeout(start, 400);
+  }
+
+  private setupEnvironment(): void {
+    const url = ENVIRONMENT_URL();
+    const env = CubeTexture.CreateFromPrefilteredData(url, this.scene);
+    env.name = "environmentSpecular.env";
+    env.level = 1;
+    this.scene.environmentTexture = env;
+    this.scene.environmentIntensity = 0.9;
+
+    // A missing/undecodable .env would silently leave metals black: report it
+    // once the texture should have been ready.
+    this.envWatchdog = setTimeout(() => {
+      this.envWatchdog = null;
+      if (this.disposed || env.isReady()) return;
+      notify(
+        `environment map failed to load (${url}) — metallic materials will look dark`,
+        "error",
+      );
+    }, 8000);
+  }
+
+  /** True when the IBL map finished loading. */
+  get environmentReady(): boolean {
+    return this.scene.environmentTexture?.isReady() ?? false;
+  }
+
   resize = (): void => {
-    if (!this.disposed) this.engine.resize();
+    if (this.disposed) return;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    this.engine.resize();
   };
 
   private renderLoop = (): void => {
@@ -151,6 +214,50 @@ export class ViewerScene {
     container.animationGroups.forEach((g) => g.stop());
     this.frameAll();
     this.onProgress?.(undefined as unknown as string);
+    this.scheduleTextureAudit();
+  }
+
+  /**
+   * Babylon reports a texture that failed to decode (KTX2, image decode) with a
+   * `Logger.Warn` only — the material then renders with its factor colour and
+   * the failure is invisible in the UI. Re-check after the decoders settle and
+   * surface the names.
+   */
+  private scheduleTextureAudit(): void {
+    const check = (attempt: number): void => {
+      if (this.disposed) return;
+      const bad = this.scene.textures.filter(
+        (t) => t.getClassName() !== "RenderTargetTexture" && !t.isReady(),
+      );
+      if (bad.length === 0) return;
+      if (attempt < 2) {
+        setTimeout(() => check(attempt + 1), 2000);
+        return;
+      }
+      const names = bad
+        .slice(0, 3)
+        .map((t) => t.name || "(unnamed)")
+        .join(", ");
+      notify(
+        `${bad.length} texture${bad.length === 1 ? "" : "s"} failed to load: ${names}${
+          bad.length > 3 ? "…" : ""
+        }`,
+        "error",
+      );
+    };
+    setTimeout(() => check(0), 1500);
+  }
+
+  /** Snapshot used by the debug hook and the inspector-less diagnostics. */
+  textureDiagnostics(): Array<{ name: string; kind: string; ready: boolean; size: string }> {
+    return this.scene.textures
+      .filter((t) => t.getClassName() !== "RenderTargetTexture")
+      .map((t) => ({
+        name: t.name || "(unnamed)",
+        kind: t.getClassName(),
+        ready: t.isReady(),
+        size: `${t.getSize().width || "?"}x${t.getSize().height || "?"}`,
+      }));
   }
 
   /** Placeholder geometry so the layout is usable without nanoui. */
@@ -189,7 +296,14 @@ export class ViewerScene {
     this.scene.animationGroups.slice().forEach((g) => g.stop());
     this.scene.meshes.slice().forEach((m) => m.dispose());
     this.scene.materials.slice().forEach((m) => m.dispose());
-    this.scene.textures.slice().forEach((t) => t.dispose());
+    // The IBL map is scene-level and survives model swaps; disposing it here
+    // would leave `environmentTexture` pointing at a dead texture and the whole
+    // scene would stop rendering (PBR materials wait for it forever).
+    const env = this.scene.environmentTexture;
+    this.scene.textures
+      .filter((t) => t !== env)
+      .slice()
+      .forEach((t) => t.dispose());
     this.scene.transformNodes.slice().forEach((n) => n.dispose());
     this.scene.animationGroups.slice().forEach((g) => g.dispose());
   }
@@ -278,6 +392,8 @@ export class ViewerScene {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.envWatchdog) clearTimeout(this.envWatchdog);
+    this.envWatchdog = null;
     window.removeEventListener("resize", this.resize);
     this.resizeObserver.disconnect();
     this.engine.stopRenderLoop();

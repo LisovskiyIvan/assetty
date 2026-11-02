@@ -7,8 +7,18 @@ pub fn main(init: std.process.Init) !u8 {
     _ = it.skip(); // argv[0]
     const first = it.next();
 
+    // nanoui's own runtime flags belong to the app
+    var nanoui_flag = false;
+    {
+        var probe = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+        _ = probe.skip();
+        while (probe.next()) |a| {
+            if (std.mem.startsWith(u8, a, "--nanoui-")) nanoui_flag = true;
+        }
+    }
+
     if (first) |a| {
-        if (std.mem.eql(u8, a, "app") or std.mem.eql(u8, a, "--app") or std.mem.eql(u8, a, "-a")) {
+        if (nanoui_flag or std.mem.eql(u8, a, "app") or std.mem.eql(u8, a, "--app") or std.mem.eql(u8, a, "-a")) {
             return @import("app/src/main.zig").run(init);
         }
     } else {

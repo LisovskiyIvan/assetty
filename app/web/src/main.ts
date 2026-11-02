@@ -1,6 +1,9 @@
 import "./style.css";
 import { app } from "./app";
-import { configureKtx2 } from "./ktx2";
+import { checkKtx2Assets, configureKtx2, reportDecoderFailure } from "./ktx2";
+import { notify, onLog } from "./notify";
+import { createInspectorDock } from "./inspector";
+import { Logger } from "@babylonjs/core/Misc/logger";
 import { el } from "./ui";
 import { mountViewer } from "./tabs/viewer";
 import { mountOptimize } from "./tabs/optimize";
@@ -11,6 +14,31 @@ import { mountSettings } from "./tabs/settings";
 import type { TabHandle } from "./tabs/types";
 
 configureKtx2();
+surfaceDecoderFailures();
+
+/**
+ * Babylon reports texture/environment decode failures through `Logger` only —
+ * the material then renders with its factor colour and nothing tells the user.
+ * Mirror those entries into the toast + status bar.
+ */
+function surfaceDecoderFailures(): void {
+  const previous = Logger.OnNewCacheEntry;
+  Logger.OnNewCacheEntry = (entry: string) => {
+    previous?.(entry);
+    if (
+      !/failed to load ktx2|missing ktx identifier|failed to load texture|unable to load (?:image|texture|environment)|not found in the scene|error while trying to load/i.test(
+        entry,
+      )
+    ) {
+      return;
+    }
+    const text = entry
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    reportDecoderFailure(text.slice(0, 240));
+  };
+}
 
 type TabId = "viewer" | "optimize" | "textures" | "diff" | "lint" | "settings";
 
@@ -37,14 +65,47 @@ const openBtn = el("button", {
   onclick: () => void app.pickAndOpen(),
 });
 
+const inspectorDock = createInspectorDock(() => syncInspectorChrome());
+
+const inspectorBtn = el("button", {
+  class: "small",
+  text: "Inspector",
+  title: "Toggle the Babylon inspector for the viewer scene (⌘I)",
+  onclick: () => void toggleInspector(),
+});
+
+function syncInspectorChrome(): void {
+  const open = inspectorDock.isOpen;
+  inspectorBtn.classList.toggle("active", open);
+  appRoot?.classList.toggle("inspector-open", open);
+}
+
+async function toggleInspector(): Promise<void> {
+  let scene = app.viewer?.scene ?? null;
+  if (!scene) {
+    // Nothing rendered yet: the Viewer tab owns the primary scene.
+    selectTab("viewer");
+    scene = app.viewer?.scene ?? null;
+  }
+  await inspectorDock.toggle(scene);
+  syncInspectorChrome();
+}
+
 const status = {
   fps: el("span", { text: "fps —" }),
   tris: el("span", { text: "tris —" }),
   draws: el("span", { text: "draws —" }),
   meshes: el("span", { text: "meshes —" }),
   path: el("span", { text: "no file" }),
+  log: el("span", { class: "status-log", text: "" }),
   mode: el("span", { text: app.bridge.modeLabel }),
 };
+
+onLog((message, kind) => {
+  status.log.textContent = message;
+  status.log.title = message;
+  status.log.dataset.kind = kind;
+});
 
 const appRoot = el("div", { id: "app" });
 appRoot.append(
@@ -53,10 +114,11 @@ appRoot.append(
     { class: "topbar" },
     el("span", { class: "brand", text: "assetty" }),
     tabBar,
-    el("div", { class: "topbar-actions" }, modePill, openBtn),
+    el("div", { class: "topbar-actions" }, modePill, inspectorBtn, openBtn),
   ),
   banner,
   content,
+  inspectorDock.el,
   el(
     "footer",
     { class: "statusbar" },
@@ -70,6 +132,8 @@ appRoot.append(
     el("span", { class: "sep" }),
     status.path,
     el("span", { class: "grow" }),
+    status.log,
+    el("span", { class: "sep" }),
     status.mode,
   ),
 );
@@ -173,4 +237,26 @@ window.addEventListener("keydown", (ev) => {
     ev.preventDefault();
     void app.pickAndOpen();
   }
+  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "i") {
+    ev.preventDefault();
+    void toggleInspector();
+  }
 });
+
+/* ------------------------------------------------------- diagnostics boot */
+
+void checkKtx2Assets().then((missing) => {
+  if (missing.length > 0) {
+    notify(`KTX2 decoders unavailable: ${missing.join(", ")}`, "error", 9000);
+  }
+});
+
+/** Debug hook: lets the host (and headless checks) inspect the live scene. */
+(window as unknown as Record<string, unknown>)["__assetty"] = {
+  app,
+  toggleInspector,
+  inspectorDock,
+  scene: () => app.viewer?.scene ?? null,
+  textures: () => app.viewer?.textureDiagnostics() ?? [],
+  environmentReady: () => app.viewer?.environmentReady ?? false,
+};

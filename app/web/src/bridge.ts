@@ -11,6 +11,7 @@
  *   info(path)              -> Info
  *   loadBytes(path)         -> { b64, size } | string (base64)
  *   optimize(path, preset)  -> { out_path, report }
+ *   optimizeCustom(path, spec) -> same shape; spec is a JSON string
  *   textures(path)          -> { images }
  *   textureEncode(path, i)  -> { ktx2_size, psnr, vram_after }
  *   diff(a, b)              -> DiffReport
@@ -22,6 +23,7 @@
  */
 
 import * as demo from "./demo";
+import { isMissingMethodError, notify } from "./notify";
 import { toast } from "./ui";
 import type {
   DiffReport,
@@ -50,6 +52,7 @@ const METHOD_NAMES = [
   "info",
   "loadBytes",
   "optimize",
+  "optimizeCustom",
   "textures",
   "textureEncode",
   "diff",
@@ -140,7 +143,7 @@ function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|textures|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|textureEncode|diff|lint|presets|presetLoad|presetSave)$/.exec(
         key,
       );
     if (!m) continue;
@@ -292,6 +295,35 @@ class DemoBackend {
     };
   }
 
+  /** Mirrors `optimizeCustom(path, spec)`: only the requested steps run. */
+  async optimizeCustom(
+    path: string,
+    specJson: string,
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<OptimizeResult> {
+    void path;
+    let kinds: string[] = [];
+    try {
+      const spec = JSON.parse(specJson) as { steps?: Array<Record<string, unknown>> };
+      kinds = (spec.steps ?? []).flatMap((step) => Object.keys(step));
+    } catch {
+      kinds = [];
+    }
+    if (kinds.length === 0) kinds = ["prune"];
+    for (let i = 0; i < kinds.length; i++) {
+      onProgress?.({ step: kinds[i], pct: Math.round(((i + 1) / kinds.length) * 100) });
+      await sleep(160);
+    }
+    const all = demo.demoOptimize.report.steps;
+    const steps = kinds.map(
+      (kind) => all.find((s) => s.kind === kind) ?? { kind, applied: true, note: "ok" },
+    );
+    return {
+      out_path: demo.demoOptimize.out_path,
+      report: { ...demo.demoOptimize.report, preset: "custom", steps },
+    };
+  }
+
   async textures(): Promise<TexturesResult> {
     await sleep(120);
     return demo.demoTextures;
@@ -355,7 +387,15 @@ export class Bridge {
   private async raw(method: string, args: unknown[]): Promise<unknown> {
     if (!this.native) throw new Error("no nanoui backend");
     if (!this.native.methods.includes(method)) throw new Error(`backend has no ${method}()`);
-    return await this.native.call(method, args);
+    const result = await this.native.call(method, args);
+    // The host reports failures as `{"error":"..."}` payloads instead of
+    // rejecting; surface them so callers can react (fallback, toast, retry).
+    const parsed = parseMaybeJson<unknown>(result);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const message = (parsed as Record<string, unknown>).error;
+      if (typeof message === "string" && message.trim()) throw new Error(message);
+    }
+    return result;
   }
 
   async info(path: string): Promise<Info> {
@@ -371,22 +411,67 @@ export class Bridge {
     return String(obj.b64 ?? obj.base64 ?? obj.data ?? "");
   }
 
+  private progressInto(onProgress?: (p: ProgressEvent) => void): () => void {
+    if (!onProgress) return () => {};
+    return this.on("progress", (payload) => {
+      const p = (payload ?? {}) as Record<string, unknown>;
+      onProgress({ step: String(p.step ?? ""), pct: asNumber(p.pct ?? p.progress) });
+    });
+  }
+
+  private async callOptimize(
+    method: "optimize" | "optimizeCustom",
+    args: unknown[],
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<OptimizeResult> {
+    const off = this.progressInto(onProgress);
+    try {
+      return normalizeOptimize(parseMaybeJson(await this.raw(method, args)));
+    } finally {
+      off();
+    }
+  }
+
   async optimize(
     path: string,
     preset: string,
     onProgress?: (p: ProgressEvent) => void,
   ): Promise<OptimizeResult> {
     if (!this.live) return this.demo.optimize(path, preset, onProgress);
-    const off = onProgress
-      ? this.on("progress", (payload) => {
-          const p = (payload ?? {}) as Record<string, unknown>;
-          onProgress({ step: String(p.step ?? ""), pct: asNumber(p.pct ?? p.progress) });
-        })
-      : () => {};
+    return this.callOptimize("optimize", [path, preset], onProgress);
+  }
+
+  /**
+   * Per-step optimization: `specJson` is a JSON *string* like
+   * `{"steps":[{"prune":{}},{"textures":{"format":"auto","quality":128}}]}`.
+   * Older hosts only expose `optimize(path, preset)`; in that case we say so
+   * and fall back to the named preset instead of failing the whole run.
+   */
+  async optimizeCustom(
+    path: string,
+    specJson: string,
+    fallbackPreset: string,
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<OptimizeResult> {
+    if (!this.live) return this.demo.optimizeCustom(path, specJson, onProgress);
+    if (!this.native?.methods.includes("optimizeCustom")) {
+      notify(
+        `backend has no optimizeCustom() — running the "${fallbackPreset}" preset instead`,
+        "error",
+      );
+      return this.optimize(path, fallbackPreset, onProgress);
+    }
     try {
-      return normalizeOptimize(parseMaybeJson(await this.raw("optimize", [path, preset])));
-    } finally {
-      off();
+      return await this.callOptimize("optimizeCustom", [path, specJson], onProgress);
+    } catch (err) {
+      if (isMissingMethodError(err)) {
+        notify(
+          `custom optimize unavailable (${(err as Error).message}) — running "${fallbackPreset}" instead`,
+          "error",
+        );
+        return this.optimize(path, fallbackPreset, onProgress);
+      }
+      throw err;
     }
   }
 

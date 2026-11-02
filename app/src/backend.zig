@@ -24,6 +24,7 @@ pub const Backend = struct {
         .info = .{"path"},
         .loadBytes = .{"path"},
         .optimize = .{ "path", "preset" },
+        .optimizeCustom = .{ "path", "spec" },
         .textures = .{"path"},
         .textureEncode = .{ "path", "index" },
         .diff = .{ "a", "b" },
@@ -63,6 +64,13 @@ pub const Backend = struct {
     /// each step through the `progress` event; returns the report JSON.
     pub fn optimize(self: *Backend, call: *nanoui.Call, path: []const u8, preset: []const u8) !json.Raw {
         return self.optimizeImpl(call.arena, call.window, path, preset);
+    }
+
+    /// Same pipeline as `optimize`, but the steps come from the frontend's
+    /// per-step UI as a JSON spec (`{"steps":[{"prune":{}}, ...]}`); the spec
+    /// is either that JSON text or a JSON string containing it.
+    pub fn optimizeCustom(self: *Backend, call: *nanoui.Call, path: []const u8, spec: []const u8) !json.Raw {
+        return self.optimizeCustomImpl(call.arena, call.window, path, spec);
     }
 
     // ---- textures ---------------------------------------------------------
@@ -212,7 +220,36 @@ pub const Backend = struct {
             error.UnknownPreset => return json.errorRaw(a, "unknown preset '{s}'", .{preset_spec}),
             else => return json.errorRaw(a, "preset '{s}': {s}", .{ preset_spec, @errorName(err) }),
         };
+        return self.runPipeline(a, window, path, p);
+    }
 
+    fn optimizeCustomImpl(
+        self: *Backend,
+        a: std.mem.Allocator,
+        window: ?*nanoui.Window,
+        path: []const u8,
+        spec: []const u8,
+    ) !json.Raw {
+        var detail: []const u8 = "";
+        const p = customPresetFromSpec(a, spec, &detail) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoSteps => return json.errorRaw(a, "no steps", .{}),
+            error.UnknownStep => return json.errorRaw(a, "unknown step '{s}'", .{detail}),
+            error.BadParam => return json.errorRaw(a, "bad params for '{s}'", .{detail}),
+            error.InvalidSpec => return json.errorRaw(a, "invalid spec", .{}),
+        };
+        return self.runPipeline(a, window, path, p);
+    }
+
+    /// The shared tail of `optimize`/`optimizeCustom`: run `p` into
+    /// `.zig-cache/assetty-app/opt_<ts>.glb`, report progress, format the JSON.
+    fn runPipeline(
+        self: *Backend,
+        a: std.mem.Allocator,
+        window: ?*nanoui.Window,
+        path: []const u8,
+        p: core.preset.Preset,
+    ) !json.Raw {
         const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
         const out_path = std.fmt.allocPrint(a, ".zig-cache/assetty-app/opt_{d}.glb", .{nanos}) catch
             return json.errorRaw(a, "out of memory", .{});
@@ -397,6 +434,227 @@ fn resolvePreset(io: std.Io, a: std.mem.Allocator, spec: []const u8) !core.prese
     return core.preset.platformDefaults(target);
 }
 
+// ---- custom step specs ----------------------------------------------------
+
+const SpecError = error{ OutOfMemory, InvalidSpec, NoSteps, UnknownStep, BadParam };
+
+/// Canonical execution order: a spec may list its steps in any order.
+const step_order = [_]core.preset.StepKind{
+    .prune, .dedup, .weld, .join, .textures, .quantize, .simplify,
+};
+
+fn isStepName(name: []const u8) bool {
+    for (step_order) |kind| {
+        if (std.mem.eql(u8, name, @tagName(kind))) return true;
+    }
+    return false;
+}
+
+/// Build a preset from the frontend's per-step JSON spec. `spec` is either the
+/// JSON text itself (`{"steps":[...]}`) or a JSON string holding that text
+/// (`"{\"steps\":[...]}"`), whichever form the bridge delivers. `detail`
+/// receives the offending step name for `UnknownStep`/`BadParam`.
+fn customPresetFromSpec(
+    a: std.mem.Allocator,
+    spec: []const u8,
+    detail: *[]const u8,
+) SpecError!core.preset.Preset {
+    const text = std.mem.trim(u8, spec, " \t\r\n");
+    if (text.len == 0) return error.NoSteps;
+
+    if (text[0] == '"') {
+        // A JSON string value: unwrap it and parse the text it contains.
+        var outer = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
+            return error.InvalidSpec;
+        defer outer.deinit();
+        const inner = switch (outer.value) {
+            .string => |s| std.mem.trim(u8, s, " \t\r\n"),
+            else => return error.InvalidSpec,
+        };
+        if (inner.len == 0) return error.NoSteps;
+        var parsed = std.json.parseFromSlice(std.json.Value, a, inner, .{}) catch
+            return error.InvalidSpec;
+        defer parsed.deinit();
+        return presetFromSpecValue(a, parsed.value, detail);
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
+        return error.InvalidSpec;
+    defer parsed.deinit();
+    return presetFromSpecValue(a, parsed.value, detail);
+}
+
+fn presetFromSpecValue(
+    a: std.mem.Allocator,
+    v: std.json.Value,
+    detail: *[]const u8,
+) SpecError!core.preset.Preset {
+    const obj = switch (v) {
+        .object => |o| o,
+        else => return error.InvalidSpec,
+    };
+    const raw_steps = obj.get("steps") orelse return error.NoSteps;
+    const items = switch (raw_steps) {
+        .array => |arr| arr.items,
+        else => return error.InvalidSpec,
+    };
+    if (items.len == 0) return error.NoSteps;
+
+    // Validate every entry up front so an unknown kind is reported with its
+    // name instead of failing halfway through an ordered build.
+    for (items) |item| {
+        const fields = switch (item) {
+            .object => |o| o,
+            else => return error.InvalidSpec,
+        };
+        var seen = false;
+        var it = fields.iterator();
+        while (it.next()) |entry| {
+            if (!isStepName(entry.key_ptr.*)) {
+                detail.* = try a.dupe(u8, entry.key_ptr.*);
+                return error.UnknownStep;
+            }
+            seen = true;
+        }
+        if (!seen) {
+            detail.* = "step";
+            return error.UnknownStep;
+        }
+    }
+
+    const steps = try a.alloc(core.preset.Step, items.len);
+    var n: usize = 0;
+    for (step_order) |kind| {
+        for (items) |item| {
+            const params = item.object.get(@tagName(kind)) orelse continue;
+            steps[n] = try stepFromSpec(kind, params, detail);
+            n += 1;
+        }
+    }
+    return .{ .name = "custom", .target = .desktop, .steps = steps[0..n] };
+}
+
+/// Typed readers over one step's params object. Omitted fields yield `null`,
+/// which the caller turns into the param struct's own default.
+const SpecParams = struct {
+    kind: core.preset.StepKind,
+    fields: ?std.json.ObjectMap,
+    detail: *[]const u8,
+
+    fn bad(self: *SpecParams) SpecError {
+        self.detail.* = @tagName(self.kind);
+        return error.BadParam;
+    }
+
+    fn get(self: *SpecParams, name: []const u8) ?std.json.Value {
+        const fields = self.fields orelse return null;
+        return fields.get(name);
+    }
+
+    fn boolField(self: *SpecParams, name: []const u8) SpecError!?bool {
+        return switch (self.get(name) orelse return null) {
+            .bool => |b| b,
+            else => self.bad(),
+        };
+    }
+
+    fn intField(self: *SpecParams, comptime T: type, name: []const u8) SpecError!?T {
+        return switch (self.get(name) orelse return null) {
+            .integer => |i| std.math.cast(T, i) orelse self.bad(),
+            else => self.bad(),
+        };
+    }
+
+    fn floatField(self: *SpecParams, name: []const u8) SpecError!?f32 {
+        return switch (self.get(name) orelse return null) {
+            .float => |f| std.math.lossyCast(f32, f),
+            .integer => |i| @floatFromInt(i),
+            else => self.bad(),
+        };
+    }
+
+    /// `"auto"`/`"etc1s"`/`"uastc"` (and the other preset formats); anything
+    /// unrecognised falls back to `.auto`.
+    fn formatField(self: *SpecParams, name: []const u8) SpecError!?core.preset.TextureFormat {
+        const s = switch (self.get(name) orelse return null) {
+            .string => |s| s,
+            else => return self.bad(),
+        };
+        return std.meta.stringToEnum(core.preset.TextureFormat, s) orelse .auto;
+    }
+};
+
+fn stepFromSpec(
+    kind: core.preset.StepKind,
+    v: std.json.Value,
+    detail: *[]const u8,
+) SpecError!core.preset.Step {
+    var r: SpecParams = .{ .kind = kind, .fields = null, .detail = detail };
+    switch (v) {
+        .object => |o| r.fields = o,
+        .null => {}, // `{"prune": null}` == `{"prune": {}}`
+        else => {
+            detail.* = @tagName(kind);
+            return error.BadParam;
+        },
+    }
+
+    return switch (kind) {
+        .prune => blk: {
+            const d = core.preset.PruneParams{};
+            break :blk .{ .prune = .{
+                .unused_nodes = (try r.boolField("unused_nodes")) orelse d.unused_nodes,
+                .unused_materials = (try r.boolField("unused_materials")) orelse d.unused_materials,
+                .unused_textures = (try r.boolField("unused_textures")) orelse d.unused_textures,
+            } };
+        },
+        .dedup => blk: {
+            const d = core.preset.DedupParams{};
+            break :blk .{ .dedup = .{
+                .accessors = (try r.boolField("accessors")) orelse d.accessors,
+                .meshes = (try r.boolField("meshes")) orelse d.meshes,
+                .materials = (try r.boolField("materials")) orelse d.materials,
+            } };
+        },
+        .weld => blk: {
+            const d = core.preset.WeldParams{};
+            break :blk .{ .weld = .{
+                .tolerance = (try r.floatField("tolerance")) orelse d.tolerance,
+            } };
+        },
+        .join => .{ .join = .{} },
+        .textures => blk: {
+            const d = core.preset.TextureParams{};
+            break :blk .{ .textures = .{
+                .format = (try r.formatField("format")) orelse d.format,
+                .quality = (try r.intField(u8, "quality")) orelse d.quality,
+                .rdo_lambda = (try r.floatField("rdo_lambda")) orelse d.rdo_lambda,
+                .normal_maps_renormalize = (try r.boolField("normal_maps_renormalize")) orelse d.normal_maps_renormalize,
+                .generate_mips = (try r.boolField("generate_mips")) orelse d.generate_mips,
+                .max_size = (try r.intField(u32, "max_size")) orelse d.max_size,
+            } };
+        },
+        .quantize => blk: {
+            const d = core.preset.QuantizeParams{};
+            break :blk .{ .quantize = .{
+                .position_bits = (try r.intField(u5, "position_bits")) orelse d.position_bits,
+                .normal_oct = (try r.boolField("normal_oct")) orelse d.normal_oct,
+                .uv_bits = (try r.intField(u5, "uv_bits")) orelse d.uv_bits,
+                .compress = (try r.boolField("compress")) orelse d.compress,
+            } };
+        },
+        .simplify => blk: {
+            const d = core.preset.SimplifyParams{};
+            break :blk .{ .simplify = .{
+                .target_ratio = (try r.floatField("target_ratio")) orelse d.target_ratio,
+                .error_tolerance = (try r.floatField("error_tolerance")) orelse d.error_tolerance,
+                .aggressive = (try r.boolField("aggressive")) orelse d.aggressive,
+                .lock_borders = (try r.boolField("lock_borders")) orelse d.lock_borders,
+            } };
+        },
+    };
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
@@ -555,4 +813,176 @@ test "openDialog json shape for pick and cancel" {
     // Escapes go through json.jsonStrOpt.
     const weird = try pathResultRaw(a, "/tmp/a\"b.glb");
     try testing.expectEqualStrings("{\"path\":\"/tmp/a\\\"b.glb\"}", weird.text);
+}
+
+// ---- custom step specs ----------------------------------------------------
+
+fn specKinds(p: core.preset.Preset, buf: *[16]core.preset.StepKind) []const core.preset.StepKind {
+    for (p.steps, 0..) |s, i| buf[i] = std.meta.activeTag(s);
+    return buf[0..p.steps.len];
+}
+
+test "custom spec maps steps in canonical order with params" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const spec =
+        \\{"steps":[
+        \\  {"simplify":{"target_ratio":0.25,"aggressive":true}},
+        \\  {"textures":{"format":"uastc","quality":160,"max_size":2048}},
+        \\  {"weld":{"tolerance":0.25}},
+        \\  {"prune":{}}
+        \\]}
+    ;
+
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(arena.allocator(), spec, &detail);
+
+    try testing.expectEqualStrings("custom", p.name);
+    try testing.expectEqual(core.preset.Target.desktop, p.target);
+    try testing.expectEqual(@as(usize, 4), p.steps.len);
+
+    var kinds_buf: [16]core.preset.StepKind = undefined;
+    try testing.expectEqualSlices(core.preset.StepKind, &.{
+        .prune, .weld, .textures, .simplify,
+    }, specKinds(p, &kinds_buf));
+
+    // Explicit values land on the right fields.
+    try testing.expectEqual(@as(f32, 0.25), p.steps[1].weld.tolerance);
+    try testing.expectEqual(core.preset.TextureFormat.uastc, p.steps[2].textures.format);
+    try testing.expectEqual(@as(u8, 160), p.steps[2].textures.quality);
+    try testing.expectEqual(@as(u32, 2048), p.steps[2].textures.max_size);
+    try testing.expectEqual(@as(f32, 0.25), p.steps[3].simplify.target_ratio);
+    try testing.expect(p.steps[3].simplify.aggressive);
+
+    // Omitted params keep the preset.zig defaults.
+    const defaults = core.preset.PruneParams{};
+    try testing.expectEqual(defaults.unused_nodes, p.steps[0].prune.unused_nodes);
+    try testing.expectEqual(defaults.unused_materials, p.steps[0].prune.unused_materials);
+    try testing.expectEqual(defaults.unused_textures, p.steps[0].prune.unused_textures);
+    const tex_defaults = core.preset.TextureParams{};
+    try testing.expectEqual(tex_defaults.rdo_lambda, p.steps[2].textures.rdo_lambda);
+    try testing.expectEqual(tex_defaults.generate_mips, p.steps[2].textures.generate_mips);
+    try testing.expectEqual(tex_defaults.normal_maps_renormalize, p.steps[2].textures.normal_maps_renormalize);
+    const simp_defaults = core.preset.SimplifyParams{};
+    try testing.expectEqual(simp_defaults.error_tolerance, p.steps[3].simplify.error_tolerance);
+    try testing.expectEqual(simp_defaults.lock_borders, p.steps[3].simplify.lock_borders);
+}
+
+test "custom spec accepts a json string value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The bridge may hand over `spec` already encoded as a JSON string.
+    const inner = "{\"steps\":[{\"dedup\":{\"meshes\":false}},{\"join\":{}}]}";
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(inner, .{}, &w);
+
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(a, w.buffered(), &detail);
+    try testing.expectEqual(@as(usize, 2), p.steps.len);
+    try testing.expect(!p.steps[0].dedup.meshes);
+    try testing.expect(p.steps[0].dedup.accessors);
+    try testing.expectEqual(core.preset.StepKind.dedup, std.meta.activeTag(p.steps[0]));
+    try testing.expectEqual(core.preset.StepKind.join, std.meta.activeTag(p.steps[1]));
+}
+
+test "custom spec rejects unknown step kinds by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    try testing.expectError(
+        error.UnknownStep,
+        customPresetFromSpec(a, "{\"steps\":[{\"bperfume\":{}}]}", &detail),
+    );
+    try testing.expect(std.mem.indexOf(u8, detail, "bperfume") != null);
+
+    var b = testBackend();
+    const r = try b.optimizeCustomImpl(a, null, "test/fixtures/box.glb", "{\"steps\":[{\"bperfume\":{}}]}");
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "unknown") != null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "bperfume") != null);
+}
+
+test "custom spec rejects empty and malformed specs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    try testing.expectError(error.NoSteps, customPresetFromSpec(a, "{\"steps\":[]}", &detail));
+    try testing.expectError(error.NoSteps, customPresetFromSpec(a, "{}", &detail));
+    try testing.expectError(error.NoSteps, customPresetFromSpec(a, "   ", &detail));
+    try testing.expectError(error.InvalidSpec, customPresetFromSpec(a, "not json", &detail));
+    try testing.expectError(error.InvalidSpec, customPresetFromSpec(a, "[1,2]", &detail));
+
+    var b = testBackend();
+    const empty = try b.optimizeCustomImpl(a, null, "test/fixtures/box.glb", "{\"steps\":[]}");
+    try testing.expectEqualStrings("{\"error\":\"no steps\"}", empty.text);
+}
+
+test "custom spec rejects bad params by step name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    // Wrong type.
+    try testing.expectError(
+        error.BadParam,
+        customPresetFromSpec(a, "{\"steps\":[{\"textures\":{\"quality\":\"high\"}}]}", &detail),
+    );
+    try testing.expectEqualStrings("textures", detail);
+
+    // Out of range for u5.
+    try testing.expectError(
+        error.BadParam,
+        customPresetFromSpec(a, "{\"steps\":[{\"quantize\":{\"uv_bits\":99}}]}", &detail),
+    );
+    try testing.expectEqualStrings("quantize", detail);
+
+    // Unknown texture format strings fall back to .auto, not an error.
+    const p = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"textures\":{\"format\":\"bogus\"}}]}",
+        &detail,
+    );
+    try testing.expectEqual(core.preset.TextureFormat.auto, p.steps[0].textures.format);
+}
+
+test "optimizeCustom runs the full pipeline and writes a parseable glb" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    const r = try b.optimizeCustomImpl(
+        a,
+        null,
+        "test/fixtures/box.glb",
+        "{\"steps\":[{\"quantize\":{}},{\"dedup\":{}}]}",
+    );
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") == null);
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"preset\": \"custom\"") != null);
+    // Canonical order regardless of the spec's order.
+    const dedup_at = std.mem.indexOf(u8, r.text, "{\"kind\": \"dedup\"") orelse
+        return error.TestUnexpectedResult;
+    const quant_at = std.mem.indexOf(u8, r.text, "{\"kind\": \"quantize\"") orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(dedup_at < quant_at);
+
+    const Report = struct { output: []const u8 };
+    const parsed = try std.json.parseFromSlice(Report, a, r.text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var out = core.parse.loadFile(testing.io, a, parsed.value.output) catch |err| {
+        std.debug.print("custom optimize output '{s}' unreadable: {s}\n", .{ parsed.value.output, @errorName(err) });
+        return error.TestUnexpectedResult;
+    };
+    defer out.deinit();
+    try testing.expect(out.asset.meshes.len > 0);
 }
