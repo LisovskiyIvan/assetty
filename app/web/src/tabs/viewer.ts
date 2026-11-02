@@ -26,7 +26,7 @@ export function mountViewer(): TabHandle {
   root.append(main);
 
   let viewer: ViewerScene | null = null;
-  let pendingPath: string | null = app.pathA;
+  let pendingPath: string | null = app.viewPath;
   let pickedBound = false;
 
   const showLoading = (on: boolean, text = "loading…") => {
@@ -72,7 +72,7 @@ export function mountViewer(): TabHandle {
     }
   }
 
-  const offPath = app.on("path", (d) => {
+  const offView = app.on("view", (d) => {
     pendingPath = d.path;
     if (viewer) void loadPath(d.path);
   });
@@ -106,7 +106,7 @@ export function mountViewer(): TabHandle {
     },
     deactivate: () => viewer?.pause(),
     dispose: () => {
-      offPath();
+      offView();
       if (viewer) {
         app.setViewer(null);
         viewer.dispose();

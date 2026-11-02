@@ -16,8 +16,13 @@ import {
 } from "../ui";
 import { isMissingMethodError, notify, onLog } from "../notify";
 import { ViewerScene, linkCameras } from "../viewer";
-import type { OptimizeResult, Stats } from "../types";
+import type { ImageInfo, Info, OptimizeResult, Stats } from "../types";
 import type { TabHandle } from "./types";
+
+/** Encodable by the textures step: anything that is not already KTX2/basis. */
+export function isEncodableImage(img: ImageInfo): boolean {
+  return !/ktx2|basis/i.test(img.format ?? "");
+}
 
 interface RowSpec {
   key: string;
@@ -170,6 +175,18 @@ export function mountOptimize(): TabHandle {
   openHint.hidden = true;
   main.append(openHint);
 
+  /** "No source model" when a view exists without a source; else the Open hint. */
+  function syncEmptyHint(): void {
+    const label = openHint.querySelector(".empty-state-text");
+    if (label) {
+      label.textContent =
+        !app.sourcePath && app.viewPath
+          ? "No source model — open one (⌘O) or use as source"
+          : OPEN_HINT;
+    }
+    if (!app.sourcePath) openHint.hidden = false;
+  }
+
   const side = el("div", { class: "tab-side" });
   root.append(main, side);
 
@@ -202,13 +219,40 @@ export function mountOptimize(): TabHandle {
   // only used as a fallback if the host predates `optimizeCustom`.
   let activePreset = "";
 
-  const pathLabel = el("div", { class: "mono muted wrap", text: app.pathA ?? "no file selected" });
+  const sourceLabel = el("div", {
+    class: "mono muted wrap",
+    text: `Source: ${app.sourcePath ?? "no file selected"}`,
+  });
+  const viewNote = el("div", {
+    class: "amber-note",
+    text: "Viewing a different file (results are not the source)",
+  });
+  viewNote.hidden = true;
   const presetRow = el("div", { class: "preset-row" });
   const runBtn = el("button", { class: "primary", text: "Run optimize", disabled: true });
   const exportBtn = el("button", { text: "Export", disabled: true });
+  /** Pre-run guard: shown when the source has no encodable images left. */
+  const guardBox = el("div", { class: "guard-box" });
+  guardBox.hidden = true;
+
+  function syncSourceHead(): void {
+    sourceLabel.textContent = `Source: ${app.sourcePath ?? "no file selected"}`;
+    sourceLabel.title = app.sourcePath ?? "";
+    const diverged = !!app.viewPath && !!app.sourcePath && app.viewPath !== app.sourcePath;
+    viewNote.hidden = !diverged;
+    if (diverged) viewNote.title = `viewing ${app.viewPath}`;
+  }
+  syncSourceHead();
 
   side.append(
-    section("Optimize", pathLabel, presetRow, el("div", { class: "row" }, runBtn, exportBtn)),
+    section(
+      "Optimize",
+      sourceLabel,
+      viewNote,
+      guardBox,
+      presetRow,
+      el("div", { class: "row" }, runBtn, exportBtn),
+    ),
   );
 
   /* -------------------------------------------------------------- step rows */
@@ -222,7 +266,9 @@ export function mountOptimize(): TabHandle {
 
   function syncAll(): void {
     form.sync();
-    runBtn.disabled = running || !app.bridge.live || !app.pathA;
+    runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
+    syncSourceHead();
+    syncEmptyHint();
   }
   syncAll();
 
@@ -270,7 +316,7 @@ export function mountOptimize(): TabHandle {
   function setRunning(on: boolean): void {
     running = on;
     runBtn.textContent = on ? "Running…" : "Run optimize";
-    runBtn.disabled = on || !app.bridge.live || !app.pathA;
+    runBtn.disabled = on || !app.bridge.live || !app.sourcePath;
     exportBtn.disabled = on || exporting || !lastResult;
     progressBar.classList.toggle("running", on);
   }
@@ -417,6 +463,24 @@ export function mountOptimize(): TabHandle {
         { class: "row" },
         el("button", {
           class: "small primary",
+          text: "View result",
+          title: "Load this result into the viewer (the optimize source is unchanged)",
+          onclick: () => {
+            app.setView(res.out_path);
+            notify(`viewing ${res.out_path}`, "ok");
+          },
+        }),
+        el("button", {
+          class: "small",
+          text: "Use as source",
+          title: "Run further experiments starting from this result",
+          onclick: () => {
+            app.useAsSource(res.out_path);
+            notify(`source: ${res.out_path}`, "ok");
+          },
+        }),
+        el("button", {
+          class: "small",
           text: "Save as…",
           title: "Copy this result wherever you want it (the source model is never modified)",
           onclick: () => void saveAs(res.out_path),
@@ -528,7 +592,10 @@ export function mountOptimize(): TabHandle {
   }
 
   async function loadSource(path: string): Promise<void> {
-    pathLabel.textContent = path;
+    sourceLabel.textContent = `Source: ${path}`;
+    sourceLabel.title = path;
+    syncSourceHead();
+    syncEmptyHint();
     if (!left) return;
     try {
       if (app.bridge.live) await left.loadBase64(await app.bridge.loadBytes(path));
@@ -538,13 +605,72 @@ export function mountOptimize(): TabHandle {
       notify(`load failed: ${(err as Error).message}`, "error");
       openHint.hidden = false;
     }
-    runBtn.disabled = running || !app.bridge.live || !app.pathA;
+    runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
   }
 
   const RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
-  runBtn.addEventListener("click", async () => {
-    const path = app.pathA;
+  /** Images of the optimize source (cached info when it matches, else fresh). */
+  async function sourceImages(): Promise<ImageInfo[] | null> {
+    const src = app.sourcePath;
+    if (!src) return null;
+    try {
+      const info: Info | null =
+        app.info && app.info.file === src ? app.info : await app.bridge.info(src);
+      return info?.vram.images ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Guard: textures step on an already-KTX2 source would silently skip. */
+  function showGuard(note: string, onRun: () => void): void {
+    guardBox.replaceChildren(
+      el("div", { text: note }),
+      el(
+        "div",
+        { class: "row" },
+        el("button", {
+          class: "small primary",
+          text: "Run anyway",
+          onclick: () => {
+            guardBox.hidden = true;
+            guardBox.replaceChildren();
+            onRun();
+          },
+        }),
+        el("button", {
+          class: "small",
+          text: "Cancel",
+          onclick: () => {
+            guardBox.hidden = true;
+            guardBox.replaceChildren();
+          },
+        }),
+      ),
+    );
+    guardBox.hidden = false;
+  }
+
+  async function maybeRun(): Promise<void> {
+    const path = app.sourcePath;
+    if (!path || running) return;
+    if (steps().textures.enabled) {
+      const images = await sourceImages();
+      if (images && images.length > 0 && !images.some(isEncodableImage)) {
+        showGuard(
+          "All textures in the source are already KTX2 — texture settings will not apply.",
+          () => void doRun(),
+        );
+        setLog("run blocked: source textures are all KTX2 (confirm to run anyway)");
+        return;
+      }
+    }
+    await doRun();
+  }
+
+  async function doRun(): Promise<void> {
+    const path = app.sourcePath;
     if (!path || running) return;
     const specSteps = buildSpec(steps());
     if (specSteps.length === 0) {
@@ -600,14 +726,19 @@ export function mountOptimize(): TabHandle {
         notify(`optimize failed: ${(err as Error).message}`, "error");
       }
     }
-  });
+  }
+
+  runBtn.addEventListener("click", () => void maybeRun());
 
   exportBtn.addEventListener("click", () => {
     if (lastResult) void saveAs(lastResult.out_path);
   });
 
-  const offPath = app.on("path", (d) => {
+  const offSource = app.on("source", (d) => {
     void loadSource(d.path);
+  });
+  const offView = app.on("view", () => {
+    syncSourceHead();
   });
   const offLog = onLog((message) => setLog(message));
   // Settings can change elsewhere (Settings tab / reload from file): keep the
@@ -633,7 +764,7 @@ export function mountOptimize(): TabHandle {
             | Record<string, unknown>
             | undefined;
           if (dbg) dbg["panes"] = () => ({ left, right });
-          if (app.pathA) void loadSource(app.pathA);
+          if (app.sourcePath) void loadSource(app.sourcePath);
           else if (!app.bridge.live) {
             left.loadDemo();
             right.loadDemo();
@@ -660,7 +791,8 @@ export function mountOptimize(): TabHandle {
       right?.pause();
     },
     dispose: () => {
-      offPath();
+      offSource();
+      offView();
       offLog();
       offSettings();
       offDone();

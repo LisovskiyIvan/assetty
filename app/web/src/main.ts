@@ -148,21 +148,39 @@ function basename(path: string): string {
   return parts.length > 0 ? parts[parts.length - 1] : path;
 }
 
-const pathText = el("span", { class: "v", text: "no file" });
-const pathChip = el(
+const srcText = el("span", { class: "v", text: "no file" });
+const srcChip = el(
   "button",
   {
     class: "status-path",
     title: "no model open",
     onclick: () => {
-      const path = app.pathA;
+      const path = app.sourcePath;
       if (!path) return;
       void copyText(path).then((ok) => notify(ok ? "copied model path" : path, ok ? "ok" : "info"));
     },
   },
-  pathText,
+  el("span", { class: "k", text: "SRC " }),
+  srcText,
 );
-pathChip.dataset.empty = "true";
+srcChip.dataset.empty = "true";
+
+const viewText = el("span", { class: "v", text: "" });
+const viewChip = el(
+  "button",
+  {
+    class: "status-path",
+    title: "",
+    onclick: () => {
+      const path = app.viewPath;
+      if (!path) return;
+      void copyText(path).then((ok) => notify(ok ? "copied view path" : path, ok ? "ok" : "info"));
+    },
+  },
+  el("span", { class: "k", text: "VIEW " }),
+  viewText,
+);
+viewChip.hidden = true;
 
 const logList = el("div", { class: "log-list" });
 const logPopover = el(
@@ -251,7 +269,8 @@ appRoot.append(
     "footer",
     { class: "statusbar" },
     statusMetrics,
-    pathChip,
+    srcChip,
+    viewChip,
     el("span", { class: "status-spacer" }),
     infoBtn,
     logPopover,
@@ -353,16 +372,27 @@ const updateStatusBar = (): void => {
   set(status.vram, info ? fmtBytes(info.vram.total_est) : "—");
   set(status.disk, info ? fmtBytes(info.disk.total) : "—");
 
-  const path = app.pathA;
-  const label = path ? (pathIsNarrow ? basename(path) : path) : "no file";
-  if (pathText.textContent !== label) pathText.textContent = label;
-  pathChip.title = path ? `${path}\nclick to copy` : "no model open";
-  pathChip.dataset.empty = path ? "false" : "true";
+  const src = app.sourcePath;
+  const srcLabel = src ? (pathIsNarrow ? basename(src) : src) : "no file";
+  if (srcText.textContent !== srcLabel) srcText.textContent = srcLabel;
+  srcChip.title = src ? `${src}\nclick to copy` : "no model open";
+  srcChip.dataset.empty = src ? "false" : "true";
+
+  const diverged = !!app.viewPath && !!src && app.viewPath !== src;
+  viewChip.hidden = !diverged;
+  if (diverged) {
+    const view = app.viewPath as string;
+    const viewLabel = pathIsNarrow ? basename(view) : view;
+    if (viewText.textContent !== viewLabel) viewText.textContent = viewLabel;
+    viewChip.title = `${view}\nclick to copy`;
+  }
 };
 
 setInterval(updateStatusBar, 500);
 updateStatusBar();
 
+app.on("source", () => updateStatusBar());
+app.on("view", () => updateStatusBar());
 app.on("path", () => updateStatusBar());
 app.on("context", () => updateStatusBar());
 

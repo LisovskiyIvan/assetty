@@ -48,7 +48,7 @@ export function mountTextures(): TabHandle {
     "div",
     { class: "panel-head" },
     el("span", { text: "images" }),
-    el("span", { class: "muted mono", text: "source: info()" }),
+    el("span", { class: "muted mono", text: "images: view · apply: source" }),
   );
   const listHost = el("div", { class: "texture-list" });
   const detailHost = el("div", { class: "texture-detail" });
@@ -58,6 +58,9 @@ export function mountTextures(): TabHandle {
   const applyBtn = el("button", { class: "primary", text: "Apply to model…" });
   const applyParams = el("span", { class: "muted mono" });
   const applyStatus = el("span", { class: "muted mono", text: "idle" });
+  /** Which file each action targets (preview sees the view, apply reads the source). */
+  const previewActs = el("div", { class: "hint muted mono" });
+  const applyActs = el("div", { class: "hint muted mono" });
   const applyResultHost = el("div");
   const applyBar = el(
     "div",
@@ -67,6 +70,7 @@ export function mountTextures(): TabHandle {
       text: "Preview = dry run. The model file is not modified. To write KTX2 into a new file use Apply to model.",
     }),
     el("div", { class: "row" }, applyBtn, applyParams),
+    applyActs,
     el("div", {
       class: "hint",
       text: "First run on 7×2048² textures takes ~30–40s; re-running on KTX2 is fast (skipped).",
@@ -74,6 +78,21 @@ export function mountTextures(): TabHandle {
     el("div", { class: "hint" }, applyStatus),
     applyResultHost,
   );
+
+  function basenameShort(path: string | null): string {
+    if (!path) return "—";
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : path;
+  }
+
+  /** Refresh the "acts on <path>" lines under Preview / Apply. */
+  function syncActsOn(): void {
+    previewActs.textContent = `preview acts on view: ${basenameShort(app.viewPath)}`;
+    previewActs.title = app.viewPath ?? "no file viewed";
+    applyActs.textContent = `apply acts on source: ${basenameShort(app.sourcePath)}`;
+    applyActs.title = app.sourcePath ?? "no source model";
+  }
+  syncActsOn();
   main.append(head, applyBar, listHost, detailHost);
 
   const side = el("div", { class: "tab-side" });
@@ -359,8 +378,15 @@ export function mountTextures(): TabHandle {
   function renderList(): void {
     clear(listHost);
     if (images.length === 0) {
-      if (app.pathA) {
+      if (app.sourcePath) {
         listHost.append(el("div", { class: "empty", text: "no images in this asset" }));
+      } else if (app.viewPath) {
+        listHost.append(
+          emptyState("No source model — open one (⌘O) or use as source", {
+            label: "Open…",
+            onClick: () => void app.pickAndOpen(),
+          }),
+        );
       } else {
         listHost.append(
           emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() }),
@@ -443,6 +469,7 @@ export function mountTextures(): TabHandle {
 
     const body: Array<Node | string> = [
       el("div", { class: "row" }, encodeBtn),
+      previewActs,
       el("div", {
         class: "hint",
         text: "dry run — the model file is not modified",
@@ -509,7 +536,7 @@ export function mountTextures(): TabHandle {
   }
 
   async function requestPreview(index: number): Promise<void> {
-    const path = app.pathA ?? (!app.bridge.live ? "/demo/DamagedHelmet.glb" : null);
+    const path = app.viewPath ?? (!app.bridge.live ? "/demo/DamagedHelmet.glb" : null);
     if (!path) return;
     const seq = ++previewSeq;
     previewing = index;
@@ -609,7 +636,7 @@ export function mountTextures(): TabHandle {
   }
 
   async function startEncode(): Promise<void> {
-    const path = app.pathA;
+    const path = app.viewPath;
     const img = images[selected];
     if (!path || !img || activeEncode) return;
     const token = ++encodeSeq;
@@ -668,7 +695,7 @@ export function mountTextures(): TabHandle {
     const active = activeEncode;
     if (!active) return;
     if (event.index >= 0 && event.index !== active.index) return;
-    if (active.path !== app.pathA) {
+    if (active.path !== app.viewPath) {
       // Model changed while the job ran: the result no longer applies.
       clearEncodeState();
       renderList();
@@ -729,8 +756,9 @@ export function mountTextures(): TabHandle {
 
   function syncApplyBar(): void {
     applyParams.textContent = describeTextureParams();
-    applyBtn.disabled = applyRunning;
+    applyBtn.disabled = applyRunning || !app.sourcePath;
     if (!applyRunning) applyBtn.textContent = "Apply to model…";
+    syncActsOn();
   }
 
   function stopApplyJob(): void {
@@ -770,9 +798,21 @@ export function mountTextures(): TabHandle {
         { class: "row" },
         el("button", {
           class: "small primary",
-          text: "Open result",
-          title: "Load the KTX2 file like Open… does",
-          onclick: () => app.setPath(res.out_path),
+          text: "View result",
+          title: "Load the KTX2 file into the viewer (the optimize source is unchanged)",
+          onclick: () => {
+            app.setView(res.out_path);
+            notify(`viewing ${res.out_path}`, "ok");
+          },
+        }),
+        el("button", {
+          class: "small",
+          text: "Use as source",
+          title: "Run further experiments starting from this result",
+          onclick: () => {
+            app.useAsSource(res.out_path);
+            notify(`source: ${res.out_path}`, "ok");
+          },
         }),
         el("button", {
           class: "small",
@@ -852,9 +892,9 @@ export function mountTextures(): TabHandle {
       notify("demo mode — apply needs the assetty binary", "error");
       return;
     }
-    const path = app.pathA;
+    const path = app.sourcePath;
     if (!path) {
-      notify("open a model first", "error");
+      notify("no source model — open one (⌘O) or use as source", "error");
       return;
     }
     if (applyRunning) {
@@ -932,7 +972,7 @@ export function mountTextures(): TabHandle {
   /* ------------------------------------------------------------------ reload */
 
   async function reload(): Promise<void> {
-    const path = app.pathA;
+    const path = app.viewPath;
     images = [];
     selected = -1;
     preview = null;
@@ -954,9 +994,8 @@ export function mountTextures(): TabHandle {
     applyRunning = false;
     exporting = false;
     pendingDst = null;
-    clear(applyResultHost);
-    setApplyStatus("idle");
     syncApplyBar();
+    syncActsOn();
     results.clear();
     compares.clear();
     renderList();
@@ -977,8 +1016,14 @@ export function mountTextures(): TabHandle {
     if (selected >= 0) void requestPreview(selected);
   }
 
-  const offPath = app.on("path", () => {
+  const offView = app.on("view", () => {
     void reload();
+  });
+  const offSource = app.on("source", () => {
+    syncApplyBar();
+    syncActsOn();
+    renderList();
+    renderSide();
   });
 
   return {
@@ -987,7 +1032,8 @@ export function mountTextures(): TabHandle {
       void reload();
     },
     dispose: () => {
-      offPath();
+      offView();
+      offSource();
       offDone();
       offPreviewDone();
       offApplyDone();
