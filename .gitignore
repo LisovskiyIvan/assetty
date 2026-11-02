@@ -3,3 +3,4 @@ zig-out/
 .DS_Store
 app/web/node_modules/
 zig-pkg/
+assetty.settings.json
