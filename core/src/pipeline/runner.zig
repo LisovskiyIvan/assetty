@@ -247,7 +247,107 @@ fn setMimeKtx2(d: *c.cgltf_data, im: *c.cgltf_image) void {
     im.*.mime_type = @ptrCast(dstu);
 }
 
+/// An image that got a KTX2 buffer view; applied to the cgltf graph on the
+/// main thread once every view exists.
+const PendingView = struct { img: *c.cgltf_image, view_idx: usize, normal: bool };
+
+/// Outer concurrency for the per-image encode phase. basisu threads a single
+/// encode internally, so the cap stays small: oversubscribing the machine
+/// (4 outer x 8 inner basisu threads) only adds context switching.
+const max_parallel_encodes = 4;
+
+/// One image to encode, in `cdata.images` order.
+const ImageJob = struct {
+    bytes: []const u8,
+    normal: bool,
+};
+
+const EncOutcome = struct {
+    /// KTX2 bytes owned by `std.heap.c_allocator`, freed by the joining thread.
+    ktx2: []u8 = &.{},
+    src_bytes: u64 = 0,
+    err: ?anyerror = null,
+};
+
+const ParCtx = struct {
+    jobs: []const ImageJob,
+    mode: encode_ktx.Mode,
+    p: preset.TextureParams,
+    /// Work-stealing cursor: workers claim the next image index, so uneven
+    /// image sizes balance out without chunking.
+    next: std.atomic.Value(usize) = .init(0),
+    outs: []EncOutcome,
+};
+
+const Worker = struct {
+    ctx: *ParCtx,
+    /// Scratch arena per worker. Arenas are not thread-safe and the caller's
+    /// `a` may be one, so each worker gets its own over `std.heap.c_allocator`
+    /// and is reset between images; only the final KTX2 bytes are copied out
+    /// (into c_allocator) and handed to the main thread.
+    arena: std.heap.ArenaAllocator,
+};
+
+/// decode -> (downscale) -> basisu encode for one image, all scratch from
+/// `scratch`. The returned KTX2 is a c_allocator copy so it outlives the arena.
+fn encodeOneJob(scratch: std.mem.Allocator, job: ImageJob, mode: encode_ktx.Mode, p: preset.TextureParams) EncOutcome {
+    const dec = decode.decodeRgba(scratch, job.bytes) orelse return .{ .err = error.ImageDecode };
+
+    var px = dec.pixels;
+    var w = dec.width;
+    var h = dec.height;
+    if (p.max_size > 0 and (w > p.max_size or h > p.max_size)) {
+        const fit = mips.fitMaxSize(scratch, px, w, h, p.max_size) catch |err| return .{ .err = err };
+        px = fit.pixels;
+        w = fit.w;
+        h = fit.h;
+    }
+
+    const out = encode_ktx.encode(scratch, px, w, h, .{
+        .mode = mode,
+        .quality = p.quality,
+        .rdo_lambda = p.rdo_lambda,
+        .normal_map = job.normal and p.normal_maps_renormalize,
+        .generate_mips = p.generate_mips,
+        .max_size = 0, // already downscaled
+        .srgb = !job.normal,
+    }) catch |err| return .{ .err = err };
+
+    const owned = std.heap.c_allocator.dupe(u8, out.ktx2) catch return .{ .err = error.OutOfMemory };
+    return .{ .ktx2 = owned, .src_bytes = job.bytes.len };
+}
+
+fn workerMain(w: *Worker) void {
+    const ctx = w.ctx;
+    const scratch = w.arena.allocator();
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.jobs.len) return;
+        ctx.outs[i] = encodeOneJob(scratch, ctx.jobs[i], ctx.mode, ctx.p);
+        _ = w.arena.reset(.retain_capacity);
+    }
+}
+
+/// Number of outer encode threads to use: at most `max_parallel_encodes` and
+/// never more than there are images (or CPUs).
+fn encodeThreadCount(n_images: usize) usize {
+    if (n_images <= 1) return 1;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @min(@min(cpus, max_parallel_encodes), n_images);
+}
+
 fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureParams, target: preset.Target) !TexEncResult {
+    return encodeTexturesWith(a, loaded, p, target, max_parallel_encodes);
+}
+
+/// `thread_cap` exists for tests: 1 forces the original fully sequential path.
+fn encodeTexturesWith(
+    a: std.mem.Allocator,
+    loaded: parse.Loaded,
+    p: preset.TextureParams,
+    target: preset.Target,
+    thread_cap: usize,
+) !TexEncResult {
     var res: TexEncResult = .{};
     const mode: encode_ktx.Mode = switch (p.format) {
         // ETC1S transcodes to ASTC/ETC2/BC1-5 at load — the compact choice
@@ -274,12 +374,42 @@ fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureP
     var gb = try geom.Builder.init(a, loaded.cdata);
     defer gb.deinit();
 
-    const Pending = struct { img: *c.cgltf_image, view_idx: usize, normal: bool };
-    var pending: std.ArrayList(Pending) = .empty;
+    var pending: std.ArrayList(PendingView) = .empty;
 
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
+    const n_threads = @min(thread_cap, encodeThreadCount(images.len));
+    if (n_threads <= 1) {
+        try encodeImagesSequential(a, loaded.cdata, p, mode, images, &gb, &pending, &res);
+    } else {
+        try encodeImagesParallel(a, loaded.cdata, p, mode, images, &gb, &pending, &res, n_threads);
+    }
+
+    if (pending.items.len == 0) return res;
+    try gb.finish();
+
+    const views = geom.sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
+    for (pending.items) |pd| {
+        pd.img.*.buffer_view = @ptrCast(&views[pd.view_idx]);
+        setMimeKtx2(loaded.cdata, pd.img);
+    }
+    _ = formats; // format label comes from the written file's header via stats
+    return res;
+}
+
+/// Original one-image-at-a-time loop, kept for the single-image fast path and
+/// as the reference behaviour (same allocations in `a`, same view order).
+fn encodeImagesSequential(
+    a: std.mem.Allocator,
+    cd: *c.cgltf_data,
+    p: preset.TextureParams,
+    mode: encode_ktx.Mode,
+    images: []c.cgltf_image,
+    gb: *geom.Builder,
+    pending: *std.ArrayList(PendingView),
+    res: *TexEncResult,
+) !void {
     for (images) |*im| {
-        const bytes = embeddedImageBytes(loaded.cdata, im) orelse {
+        const bytes = embeddedImageBytes(cd, im) orelse {
             res.skipped += 1;
             continue;
         };
@@ -319,17 +449,95 @@ fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureP
         try pending.append(a, .{ .img = im, .view_idx = vi, .normal = normal });
         res.encoded += 1;
     }
+}
 
-    if (pending.items.len == 0) return res;
-    try gb.finish();
+/// Decode + encode up to `n_threads` images concurrently, then append the
+/// buffer views in IMAGE order on the main thread (the builder is single
+/// threaded, and output order must not depend on completion order).
+fn encodeImagesParallel(
+    a: std.mem.Allocator,
+    cd: *c.cgltf_data,
+    p: preset.TextureParams,
+    mode: encode_ktx.Mode,
+    images: []c.cgltf_image,
+    gb: *geom.Builder,
+    pending: *std.ArrayList(PendingView),
+    res: *TexEncResult,
+    n_threads: usize,
+) !void {
+    const Slot = union(enum) { skip, job: usize };
+    var slots = try a.alloc(Slot, images.len);
+    @memset(slots, .skip);
 
-    const views = geom.sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
-    for (pending.items) |pd| {
-        pd.img.*.buffer_view = @ptrCast(&views[pd.view_idx]);
-        setMimeKtx2(loaded.cdata, pd.img);
+    var jobs: std.ArrayList(ImageJob) = .empty;
+    for (images, 0..) |*im, i| {
+        const bytes = embeddedImageBytes(cd, im) orelse continue;
+        slots[i] = .{ .job = jobs.items.len };
+        try jobs.append(a, .{ .bytes = bytes, .normal = isNormalName(im.name) });
     }
-    _ = formats; // format label comes from the written file's header via stats
-    return res;
+    if (jobs.items.len == 0) {
+        res.skipped += @intCast(images.len);
+        return;
+    }
+
+    var ctx: ParCtx = .{
+        .jobs = jobs.items,
+        .mode = mode,
+        .p = p,
+        .outs = try a.alloc(EncOutcome, jobs.items.len),
+    };
+    @memset(ctx.outs, .{});
+    // Encoder/transcoder init is a global one-time cost; do it before spawning
+    // so workers don't serialise on it.
+    _ = encode_ktx.init();
+
+    const n_workers = @min(n_threads, jobs.items.len);
+    const workers = try a.alloc(Worker, n_workers);
+    for (workers) |*w| w.* = .{ .ctx = &ctx, .arena = .init(std.heap.c_allocator) };
+
+    const handles = try a.alloc(?std.Thread, n_workers);
+    var spawned: usize = 0;
+    for (workers) |*w| {
+        handles[spawned] = std.Thread.spawn(.{}, workerMain, .{w}) catch {
+            // Out of threads: do that share of the work inline instead.
+            workerMain(w);
+            continue;
+        };
+        spawned += 1;
+    }
+    for (handles[0..spawned]) |h| h.?.join();
+
+    // Every worker is done and its KTX2 bytes already live in c_allocator, so
+    // the scratch arenas can go before the views are appended.
+    for (workers) |*w| w.arena.deinit();
+    defer for (ctx.outs) |o| {
+        if (o.ktx2.len > 0) std.heap.c_allocator.free(o.ktx2);
+    };
+
+    for (images, 0..) |*im, i| {
+        const j = switch (slots[i]) {
+            .skip => {
+                res.skipped += 1;
+                continue;
+            },
+            .job => |idx| idx,
+        };
+        const out = ctx.outs[j];
+        if (out.err) |err| {
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    res.skipped += 1;
+                    continue;
+                },
+            }
+        }
+        res.src_bytes += out.src_bytes;
+        res.ktx_bytes += out.ktx2.len;
+        const vi = try gb.addView(out.ktx2, 0);
+        try pending.append(a, .{ .img = im, .view_idx = vi, .normal = jobs.items[j].normal });
+        res.encoded += 1;
+    }
 }
 
 fn notify(opts: Options, step: []const u8, pct: f32) void {
@@ -460,4 +668,158 @@ test "run: weld and textures apply" {
     // box.glb ships one embedded PNG → now encoded to KTX2
     try testing.expect(rep.steps[1].applied);
     try testing.expect(std.mem.indexOf(u8, rep.steps[1].note, "1 encoded") != null);
+}
+
+fn testNowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+/// Minimal GLB with `pngs.len` embedded PNG images and no geometry.
+fn testGlbWithImages(a: std.mem.Allocator, pngs: []const []const u8) ![]u8 {
+    var offs = try a.alloc(usize, pngs.len);
+    var bin_len: usize = 0;
+    for (pngs, 0..) |png, i| {
+        bin_len = std.mem.alignForward(usize, bin_len, 4);
+        offs[i] = bin_len;
+        bin_len += png.len;
+    }
+    const bin_padded = std.mem.alignForward(usize, bin_len, 4);
+
+    var js: std.ArrayList(u8) = .empty;
+    try js.appendSlice(a, "{\"asset\":{\"version\":\"2.0\"},\"images\":[");
+    for (pngs, 0..) |_, i| {
+        if (i != 0) try js.append(a, ',');
+        try js.appendSlice(a, try std.fmt.allocPrint(
+            a,
+            "{{\"name\":\"tex{d}\",\"bufferView\":{d},\"mimeType\":\"image/png\"}}",
+            .{ i, i },
+        ));
+    }
+    try js.appendSlice(a, "],\"bufferViews\":[");
+    for (pngs, 0..) |png, i| {
+        if (i != 0) try js.append(a, ',');
+        try js.appendSlice(a, try std.fmt.allocPrint(
+            a,
+            "{{\"buffer\":0,\"byteOffset\":{d},\"byteLength\":{d}}}",
+            .{ offs[i], png.len },
+        ));
+    }
+    try js.appendSlice(a, try std.fmt.allocPrint(
+        a,
+        "],\"buffers\":[{{\"byteLength\":{d}}}]}}",
+        .{bin_padded},
+    ));
+
+    const json_padded = std.mem.alignForward(usize, js.items.len, 4);
+    const out = try a.alloc(u8, 12 + 8 + json_padded + 8 + bin_padded);
+    @memset(out, 0);
+    std.mem.writeInt(u32, out[0..4], 0x46546C67, .little); // "glTF"
+    std.mem.writeInt(u32, out[4..8], 2, .little);
+    std.mem.writeInt(u32, out[8..12], @intCast(out.len), .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(json_padded), .little);
+    std.mem.writeInt(u32, out[16..20], 0x4E4F534A, .little); // "JSON"
+    @memset(out[20 .. 20 + json_padded], ' ');
+    @memcpy(out[20 .. 20 + js.items.len], js.items);
+    const bin_hdr = 20 + json_padded;
+    std.mem.writeInt(u32, out[bin_hdr..][0..4], @intCast(bin_padded), .little);
+    std.mem.writeInt(u32, out[bin_hdr + 4 ..][0..4], 0x004E4942, .little); // "BIN"
+    for (pngs, 0..) |png, i| {
+        const dst = out[bin_hdr + 8 + offs[i] ..][0..png.len];
+        @memcpy(dst, png);
+    }
+    return out;
+}
+
+fn testGradient(a: std.mem.Allocator, w: u32, h: u32, seed: u8) ![]u8 {
+    const px = try a.alloc(u8, @as(usize, w) * h * 4);
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const o = (y * w + x) * 4;
+            px[o] = @intCast((x * 255) / @max(w - 1, 1));
+            px[o + 1] = @intCast((y * 255) / @max(h - 1, 1));
+            px[o + 2] = seed;
+            px[o + 3] = 255;
+        }
+    }
+    return px;
+}
+
+// Every encoded image must carry a KTX2 view, in image order, with strictly
+// increasing BIN offsets, and (since basisu's per-encode thread count is the
+// same either way) bytes identical to the sequential result.
+test "textures: 4 images encode in parallel, image order preserved" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dim: u32 = 1024;
+    const pngs = try a.alloc([]const u8, 4);
+    for (pngs, 0..) |*png, i| {
+        const px = try testGradient(a, dim, dim, @intCast(63 * (i + 1)));
+        png.* = try decode.encodePngRgba(a, px, dim, dim);
+    }
+
+    const in_path = ".zig-cache/pipeline_runner_tex4.glb";
+    const out_path = ".zig-cache/pipeline_runner_tex4.opt.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = in_path, .data = try testGlbWithImages(a, pngs) });
+    defer std.Io.Dir.cwd().deleteFile(io, in_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    // Sequential reference, in memory (thread cap 1 = the legacy path).
+    const tex_params: preset.TextureParams = .{ .quality = 64, .generate_mips = false };
+    var seq_loaded = try parse.loadFile(io, a, in_path);
+    defer seq_loaded.deinit();
+    const seq_t0 = testNowMs();
+    const seq = try encodeTexturesWith(a, seq_loaded, tex_params, .mobile, 1);
+    const seq_ms = testNowMs() - seq_t0;
+    try testing.expectEqual(@as(u32, 4), seq.encoded);
+    try testing.expectEqual(@as(u32, 0), seq.skipped);
+
+    // End-to-end through the real pipeline (default thread cap): all four
+    // encode, none skipped. The written file drops them again — they are not
+    // referenced by any material — so the view checks below use the in-memory
+    // graphs, which is where the encode step actually writes.
+    const steps = [_]preset.Step{.{ .textures = tex_params }};
+    const rep = try run(io, a, in_path, .{
+        .preset = .{ .name = "tex4", .target = .mobile, .steps = &steps },
+        .out_path = out_path,
+    });
+    try testing.expect(rep.steps[0].applied);
+    try testing.expect(std.mem.indexOf(u8, rep.steps[0].note, "4 encoded, 0 skipped") != null);
+
+    // Same images, in parallel, without the writer in the way.
+    var par_loaded = try parse.loadFile(io, a, in_path);
+    defer par_loaded.deinit();
+    const par_t0 = testNowMs();
+    const par = try encodeTexturesWith(a, par_loaded, tex_params, .mobile, 4);
+    const par_ms = testNowMs() - par_t0;
+    // Informational only (the CI box is not quiet), never asserted.
+    std.debug.print("4x1024 encode: seq {d} ms, par {d} ms\n", .{ seq_ms, par_ms });
+    try testing.expectEqual(seq.encoded, par.encoded);
+    try testing.expectEqual(seq.skipped, par.skipped);
+    try testing.expectEqual(seq.src_bytes, par.src_bytes);
+    try testing.expectEqual(seq.ktx_bytes, par.ktx_bytes);
+
+    const seq_images = geom.sl(c.cgltf_image, seq_loaded.cdata.images, seq_loaded.cdata.images_count);
+    const par_images = geom.sl(c.cgltf_image, par_loaded.cdata.images, par_loaded.cdata.images_count);
+    try testing.expectEqual(@as(usize, 4), seq_images.len);
+    try testing.expectEqual(@as(usize, 4), par_images.len);
+
+    var prev_offset: usize = 0;
+    for (par_images, seq_images, 0..) |*im, *ref, i| {
+        try testing.expect(im.buffer_view != null);
+        const mime = std.mem.span(im.mime_type orelse return error.TestUnexpectedResult);
+        try testing.expectEqualStrings("image/ktx2", mime);
+
+        const view: *const c.cgltf_buffer_view = @ptrCast(im.buffer_view.?);
+        const off: usize = @intCast(view.offset);
+        if (i > 0) try testing.expect(off > prev_offset);
+        prev_offset = off;
+
+        const ref_view: *const c.cgltf_buffer_view = @ptrCast(ref.buffer_view.?);
+        try testing.expectEqualSlices(u8, geom.viewData(ref_view).?, geom.viewData(view).?);
+    }
 }
