@@ -1,5 +1,6 @@
 /** Shared app state + a minimal event bus. */
 import { Bridge } from "./bridge";
+import { t } from "./i18n";
 import { toast } from "./ui";
 import type { Info } from "./types";
 import type { ViewerScene } from "./viewer";
@@ -52,7 +53,7 @@ export class App {
       const res = await this.bridge.openDialog();
       return res.path;
     } catch (err) {
-      toast(`open failed: ${(err as Error).message}`, "error");
+      toast(t("toast.openFailed", { message: (err as Error).message }), "error");
       return null;
     }
   }

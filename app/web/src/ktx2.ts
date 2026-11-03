@@ -17,6 +17,7 @@
  */
 import { KhronosTextureContainer2 } from "@babylonjs/core/Misc/khronosTextureContainer2";
 import "@babylonjs/core/Materials/Textures/Loaders/index";
+import { t } from "./i18n";
 import { notify } from "./notify";
 
 let configured = false;
@@ -98,5 +99,5 @@ export function reportDecoderFailure(detail: string): void {
   const now = Date.now();
   if (now - warnedTime < 3000) return;
   warnedTime = now;
-  notify(`texture decode failed: ${detail}`, "error");
+  notify(t("toast.decodeFail", { detail: detail }), "error");
 }

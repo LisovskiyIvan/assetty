@@ -12,6 +12,7 @@
  * engine follows through its ResizeObserver.
  */
 import type { Scene } from "@babylonjs/core/scene";
+import { onLang, t } from "./i18n";
 import { notify } from "./notify";
 import { themeMode } from "./settings";
 
@@ -33,17 +34,19 @@ export class InspectorDock {
   private scene: Scene | null = null;
   private busy = false;
   private readonly title: HTMLElement;
+  private readonly closeBtn: HTMLButtonElement;
   private readonly onChange?: (open: boolean) => void;
 
   constructor(onChange?: (open: boolean) => void) {
     this.onChange = onChange;
     this.title = document.createElement("span");
-    this.title.textContent = "Inspector — no scene";
+    this.title.textContent = t("toast.inspNoScene");
 
     const close = document.createElement("button");
     close.className = "small";
-    close.textContent = "close";
-    close.title = "Hide inspector (⌘I)";
+    close.textContent = t("common.close");
+    close.title = t("common.closeTitle");
+    this.closeBtn = close;
     close.addEventListener("click", () => void this.hide());
 
     const head = document.createElement("div");
@@ -58,6 +61,16 @@ export class InspectorDock {
     this.el.className = "inspector-dock";
     this.el.hidden = true;
     this.el.append(head, this.body);
+    onLang(() => this.syncStrings());
+  }
+
+  /** Re-renders dock chrome in the active language. */
+  private syncStrings(): void {
+    this.closeBtn.textContent = t("common.close");
+    this.closeBtn.title = t("common.closeTitle");
+    this.title.textContent = this.scene
+      ? t("toast.inspMeshes", { n: this.scene.meshes.length })
+      : t("toast.inspNoScene");
   }
 
   get isOpen(): boolean {
@@ -72,7 +85,7 @@ export class InspectorDock {
       return false;
     }
     if (!scene) {
-      notify("Inspector needs a loaded scene — open a model first", "error");
+      notify(t("toast.inspectorNeedScene"), "error");
       return false;
     }
     this.busy = true;
@@ -94,7 +107,7 @@ export class InspectorDock {
         disableTeachingMoments: true,
       });
       this.scene = scene;
-      this.title.textContent = `Inspector — ${scene.meshes.length} meshes`;
+      this.title.textContent = t("toast.inspMeshes", { n: scene.meshes.length });
       this.el.dataset.state = "ready";
       this.onChange?.(true);
       return true;
@@ -102,7 +115,7 @@ export class InspectorDock {
       this.el.hidden = true;
       this.el.dataset.state = "failed";
       this.onChange?.(false);
-      notify(`inspector failed: ${(err as Error).message}`, "error");
+      notify(t("toast.inspectorFail", { message: (err as Error).message }), "error");
       return false;
     } finally {
       this.busy = false;
@@ -124,7 +137,7 @@ export class InspectorDock {
       try {
         await token.dispose();
       } catch (err) {
-        notify(`inspector close failed: ${(err as Error).message}`, "error");
+        notify(t("toast.inspectorCloseFail", { message: (err as Error).message }), "error");
       }
     }
     this.onChange?.(false);

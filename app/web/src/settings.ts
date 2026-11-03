@@ -8,6 +8,7 @@
  *
  * {
  *   "theme": "dark" | "light",
+ *   "language": "en" | "ru",
  *   "optimize": {
  *     "steps": {
  *       "prune":    { "enabled": true, "unused_nodes": true, "unused_materials": true, "unused_textures": true },
@@ -45,8 +46,11 @@
  * `skip: true` leaves the image unencoded. Missing `per_model` merges to {}.
  */
 import { bridge } from "./bridge";
+import { detectLanguage, setLang, t } from "./i18n";
+import type { Lang } from "./i18n";
 
 export type ThemeMode = "dark" | "light";
+export type Language = Lang;
 export type TextureFormat = "auto" | "etc1s" | "uastc";
 
 export interface PruneSettings {
@@ -138,6 +142,7 @@ export interface OptimizeSteps {
 
 export interface Settings {
   theme: ThemeMode;
+  language: Language;
   optimize: { steps: OptimizeSteps; per_model: Record<string, PerModelEntry> };
 }
 
@@ -151,11 +156,13 @@ export class SettingsError extends Error {}
 
 const SAVE_DEBOUNCE_MS = 500;
 const THEMES: readonly ThemeMode[] = ["dark", "light"];
+const LANGUAGES: readonly Language[] = ["en", "ru"];
 const TEXTURE_FORMATS: readonly TextureFormat[] = ["auto", "etc1s", "uastc"];
 
 export function defaultSettings(): Settings {
   return {
     theme: "dark",
+    language: detectLanguage(),
     optimize: {
       steps: {
         prune: {
@@ -237,10 +244,11 @@ export function applyTheme(mode: ThemeMode): void {
   root.style.colorScheme = mode;
 }
 
-/** Mutates settings in place, applies the theme, notifies and debounce-saves. */
+/** Mutates settings in place, applies theme + language, notifies and debounce-saves. */
 export function updateSettings(mutate: (settings: Settings) => void): void {
   mutate(current);
   applyTheme(current.theme);
+  setLang(current.language);
   emitChange();
   scheduleSave();
 }
@@ -250,6 +258,17 @@ export function setTheme(mode: ThemeMode): void {
   updateSettings((settings) => {
     settings.theme = mode;
   });
+}
+
+export function setLanguage(language: Language): void {
+  if (current.language === language) return;
+  updateSettings((settings) => {
+    settings.language = language;
+  });
+}
+
+export function languageMode(): Language {
+  return current.language;
 }
 
 export function toggleTheme(): ThemeMode {
@@ -390,6 +409,7 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
   }
 
   out.theme = readEnum(raw, "theme", out.theme, THEMES, "theme", strict);
+  out.language = readEnum(raw, "language", out.language, LANGUAGES, "language", strict);
 
   const optimize = readObject(raw, "optimize", "optimize", strict);
   const stepsRaw = readObject(optimize, "steps", "optimize.steps", strict);
@@ -828,17 +848,17 @@ export function describeTextureDeviation(
 ): string | null {
   const base = current.optimize.steps.textures;
   const eff = effectiveTextureParams(sourcePath, image, name);
-  if (eff.skip) return "skipped";
+  if (eff.skip) return t("tex.skipped");
   const parts: string[] = [];
   if (eff.format !== base.format) parts.push(eff.format);
   if (eff.quality !== base.quality) parts.push(`q${eff.quality}`);
   if (eff.max_size !== base.max_size) {
-    parts.push(eff.max_size === 0 ? "orig" : String(eff.max_size));
+    parts.push(eff.max_size === 0 ? t("tex.devOrig") : String(eff.max_size));
   }
   if (eff.generate_mips !== base.generate_mips) {
-    parts.push(eff.generate_mips ? "mips" : "no-mips");
+    parts.push(eff.generate_mips ? t("tex.devMips") : t("tex.devNoMips"));
   }
-  if (eff.normal_map) parts.push("normal");
+  if (eff.normal_map) parts.push(t("tex.devNormal"));
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
@@ -860,6 +880,7 @@ export function applySettingsText(text: string): Settings {
   const next = parseSettingsText(text);
   current = next;
   applyTheme(current.theme);
+  setLang(current.language);
   emitChange();
   scheduleSave();
   return next;
@@ -890,6 +911,7 @@ export async function loadSettings(options: { announce?: boolean } = {}): Promis
   current = next;
   lastSaved = settingsToJson(current);
   applyTheme(current.theme);
+  setLang(current.language);
   emitChange();
   setStatus({ state: "saved", message: options.announce ? "reloaded from file" : "loaded" });
   return true;

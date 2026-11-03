@@ -1,11 +1,42 @@
 //! Typed events pushed from Zig to the page (`window.nanoui.on("<name>")`).
+const std = @import("std");
 const nanoui = @import("nanoui");
 const json = @import("json.zig");
 
-/// One pipeline step finished (or started): `pct` is 0..1.
+/// One pipeline step finished (or started): `pct` is 0..1. `sub` is present
+/// only for steps that report finer-grained progress (the textures step's
+/// per-image counter); it is omitted from the JSON entirely when null, so
+/// payloads without it stay byte-identical to before.
 pub const ProgressPayload = struct {
     step: []const u8,
     pct: f32,
+    sub: ?ProgressSub = null,
+
+    pub fn jsonStringify(self: ProgressPayload, jws: anytype) !void {
+        // `step`/`pct` go through std.json, exactly as the derived
+        // serialization did before `sub` existed; `sub` is appended only
+        // when present, so sub-less payloads keep today's wire shape.
+        const w = jws.writer;
+        try w.writeAll("{\"step\":");
+        try std.json.Stringify.encodeJsonString(self.step, .{}, w);
+        try w.writeAll(",\"pct\":");
+        try std.json.Stringify.value(self.pct, .{}, w);
+        if (self.sub) |s| {
+            try w.writeAll(",\"sub\":{\"label\":");
+            try std.json.Stringify.encodeJsonString(s.label, .{}, w);
+            try w.print(",\"done\":{d},\"total\":{d}}}", .{ s.done, s.total });
+        } else {
+            try w.writeByte('}');
+        }
+    }
+};
+
+/// Finer-grained progress inside one step: `label` is a stable ASCII token
+/// ("texture") the page maps to a localized frame.
+pub const ProgressSub = struct {
+    label: []const u8,
+    done: u32,
+    total: u32,
 };
 pub const Progress = nanoui.Event("progress", ProgressPayload);
 

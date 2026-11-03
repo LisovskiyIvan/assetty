@@ -18,6 +18,7 @@ import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
 import "@babylonjs/loaders/glTF";
 import { b64ToBytes } from "./bridge";
+import { t } from "./i18n";
 import { notify } from "./notify";
 
 /** Vendored prefiltered IBL (specular + irradiance polynomials) in `public/env/`. */
@@ -168,10 +169,7 @@ export class ViewerScene {
     this.envWatchdog = setTimeout(() => {
       this.envWatchdog = null;
       if (this.disposed || env.isReady()) return;
-      notify(
-        `environment map failed to load (${url}) — metallic materials will look dark`,
-        "error",
-      );
+      notify(t("toast.envFail", { url }), "error");
     }, 8000);
   }
 
@@ -265,14 +263,16 @@ export class ViewerScene {
         setTimeout(() => check(attempt + 1), 2000);
         return;
       }
-      const names = bad
-        .slice(0, 3)
-        .map((t) => t.name || "(unnamed)")
-        .join(", ");
+      const names =
+        bad
+          .slice(0, 3)
+          .map((tex) => tex.name || "(unnamed)")
+          .join(", ") + (bad.length > 3 ? "…" : "");
       notify(
-        `${bad.length} texture${bad.length === 1 ? "" : "s"} failed to load: ${names}${
-          bad.length > 3 ? "…" : ""
-        }`,
+        t("toast.texAudit", {
+          n: bad.length,
+          names: names,
+        }),
         "error",
       );
     };

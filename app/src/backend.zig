@@ -66,6 +66,8 @@ pub const Backend = struct {
 
     pub const nanoui_params = .{
         .openDialog = .{},
+        .openDialogAt = .{"dir"},
+        .dropFile = .{ "name", "b64" },
         .pickSavePath = .{"name"},
         .exportTo = .{ "src", "dst" },
         .listDir = .{"path"},
@@ -89,7 +91,24 @@ pub const Backend = struct {
     /// Native open panel: `{"path":"<abs>"}` on a pick, `{"path":null}` on
     /// cancel. Runs modally on the main thread, like every bound method.
     pub fn openDialog(self: *Backend, call: *nanoui.Call) !json.Raw {
-        return self.openDialogImpl(call.arena);
+        return self.openDialogImpl(call.arena, null);
+    }
+
+    /// Same as `openDialog`, but the panel starts in `dir` when it names an
+    /// existing directory; a missing/non-directory/null/blank `dir` falls
+    /// back to the default location silently.
+    pub fn openDialogAt(self: *Backend, call: *nanoui.Call, dir: ?[]const u8) !json.Raw {
+        return self.openDialogImpl(call.arena, dir);
+    }
+
+    /// Saves a dropped file (the page holds only its bytes, not a path) into
+    /// `<out_dir>/drops/` so it can be opened through the normal path-based
+    /// flow: `{"path":"<abs>"}`. `name` is the browser file name (sanitized,
+    /// `model.glb` when blank); `b64` the file's base64 bytes. Synchronous on
+    /// the main thread — fine for moderate sizes, megabyte-scale drops may
+    /// stall the UI for a beat.
+    pub fn dropFile(self: *Backend, call: *nanoui.Call, name: []const u8, b64: []const u8) !json.Raw {
+        return self.dropFileImpl(call.arena, name, b64);
     }
 
     /// Native save panel: `{"path":"<abs>"}` on a pick, `{"path":null}` on
@@ -250,12 +269,15 @@ pub const Backend = struct {
 
     // ---- implementations --------------------------------------------------
 
-    fn openDialogImpl(self: *Backend, a: std.mem.Allocator) !json.Raw {
+    fn openDialogImpl(self: *Backend, a: std.mem.Allocator, dir: ?[]const u8) !json.Raw {
         // nanoui's dialog module owns the NSOpenPanel: NSOpenPanel on macOS,
         // the desktop portal on Linux, the common item dialog on Windows. It
         // is documented for use from a bound method (main thread, runModal).
+        // `directory` seeds the panel's starting folder when non-empty.
+        const start = self.resolveOpenDir(dir);
         const paths = nanoui.dialog.open(self.gpa, .{
             .title = "Open model",
+            .directory = start orelse "",
             .extensions = &.{ "glb", "gltf" },
         }) catch null;
         defer {
@@ -263,6 +285,47 @@ pub const Backend = struct {
         }
         const picked: ?[]const u8 = if (paths) |p| (if (p.len > 0) p[0] else null) else null;
         return pathResultRaw(a, picked);
+    }
+
+    /// Validates a starting directory for the open panel: the trimmed `dir`
+    /// when it opens as a directory, null otherwise (missing, not a
+    /// directory, blank). Never errors — callers fall back silently.
+    fn resolveOpenDir(self: *Backend, dir: ?[]const u8) ?[]const u8 {
+        const d = std.mem.trim(u8, dir orelse return null, " \t\r\n");
+        if (d.len == 0) return null;
+        var h = std.Io.Dir.cwd().openDir(self.io, d, .{}) catch return null;
+        h.close(self.io);
+        return d;
+    }
+
+    /// Decodes `b64` and writes it to `<out_dir>/drops/<epoch_ms>_<name>`:
+    /// `{"path":"<abs>"}`. Every allocation comes from `a` (the call's
+    /// arena); source files are never touched — only the drops dir is
+    /// written. Errors come back as `{"error":..}`.
+    fn dropFileImpl(self: *Backend, a: std.mem.Allocator, name: []const u8, b64: []const u8) !json.Raw {
+        const max_b64: usize = std.base64.standard.Encoder.calcSize(max_load_bytes);
+        if (b64.len > max_b64) return json.errorRaw(a, "drop too large ({d} bytes of base64)", .{b64.len});
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(b64) catch
+            return json.errorRaw(a, "invalid base64", .{});
+        const bytes = try a.alloc(u8, decoded_len);
+        std.base64.standard.Decoder.decode(bytes, b64) catch
+            return json.errorRaw(a, "invalid base64", .{});
+
+        const safe = try sanitizeDropName(a, name);
+        const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
+        const rel = try std.fmt.allocPrint(
+            a,
+            "{s}/drops/{d}_{s}",
+            .{ out_dir, @divTrunc(nanos, std.time.ns_per_ms), safe },
+        );
+        const parent = std.fs.path.dirname(rel) orelse return json.errorRaw(a, "bad drop path", .{});
+        std.Io.Dir.cwd().createDirPath(self.io, parent) catch |err|
+            return json.errorRaw(a, "drops dir: {s}", .{@errorName(err)});
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = rel, .data = bytes }) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ rel, @errorName(err) });
+        const abs = std.Io.Dir.cwd().realPathFileAlloc(self.io, rel, a) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ rel, @errorName(err) });
+        return pathResultRaw(a, abs);
     }
 
     fn pickSavePathImpl(self: *Backend, a: std.mem.Allocator, name: ?[]const u8) !json.Raw {
@@ -765,9 +828,13 @@ const WindowSink = struct {
         };
     }
 
-    fn progress(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
+    fn progress(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
         const self: *WindowSink = @ptrCast(@alignCast(ctx orelse return));
-        events.Progress.emit(self.window, .{ .step = step, .pct = pct });
+        events.Progress.emit(self.window, .{
+            .step = step,
+            .pct = pct,
+            .sub = if (sub) |s| .{ .label = s.label, .done = s.done, .total = s.total } else null,
+        });
     }
 
     fn log(ctx: ?*anyopaque, line: []const u8) void {
@@ -953,9 +1020,9 @@ const Job = struct {
         };
     }
 
-    fn onProgress(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
+    fn onProgress(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
         const self: *Job = @ptrCast(@alignCast(ctx orelse return));
-        self.postProgress(step, pct);
+        self.postProgress(step, pct, sub);
     }
 
     fn onLog(ctx: ?*anyopaque, line: []const u8) void {
@@ -964,8 +1031,9 @@ const Job = struct {
     }
 
     /// `step` points into this job's arena, which ends with the run: copy it
-    /// and hand it to the main thread.
-    fn postProgress(self: *Job, step: []const u8, pct: f32) void {
+    /// and hand it to the main thread. `sub` is plain counters (the label is
+    /// a static token), so it copies by value.
+    fn postProgress(self: *Job, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
         const app = self.target.app orelse return;
         const window = self.target.window orelse return;
         const copy = self.gpa.dupe(u8, step) catch return;
@@ -975,6 +1043,7 @@ const Job = struct {
             .window = window,
             .step = copy,
             .pct = pct,
+            .sub = if (sub) |s| .{ .label = s.label, .done = s.done, .total = s.total } else null,
         });
         if (!posted) self.gpa.free(copy);
     }
@@ -1044,6 +1113,7 @@ const ProgressMsg = struct {
     window: *nanoui.Window,
     step: []u8,
     pct: f32,
+    sub: ?events.ProgressSub = null,
 
     fn run(ctx: ?*anyopaque) callconv(.c) void {
         const self: *ProgressMsg = @ptrCast(@alignCast(ctx));
@@ -1052,7 +1122,7 @@ const ProgressMsg = struct {
         defer gpa.free(self.step);
         if (shutting_down.load(.acquire)) return;
         if (!windowAlive(self.app, self.window)) return;
-        events.Progress.emit(self.window, .{ .step = self.step, .pct = self.pct });
+        events.Progress.emit(self.window, .{ .step = self.step, .pct = self.pct, .sub = self.sub });
     }
 };
 
@@ -1421,6 +1491,36 @@ fn saveFileName(name: ?[]const u8) []const u8 {
         if (trimmed.len > 0) return trimmed;
     }
     return default_save_name;
+}
+
+/// Longest sanitized drop name, in bytes (not glyphs).
+const max_drop_name: usize = 120;
+
+/// Sanitizes a browser file name for `<out_dir>/drops/`: strips path
+/// components (both `/` and `\` separators), keeps only `[A-Za-z0-9._-]`
+/// (anything else becomes `_`), caps the length, and falls back to
+/// `model.glb` when nothing usable remains (blank, all stripped, `.`/`..`).
+fn sanitizeDropName(a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, name, " \t\r\n");
+    // Basename over both separators: browsers send bare names, but a hostile
+    // or odd page could send a path.
+    var base = trimmed;
+    if (std.mem.lastIndexOfAny(u8, base, "/\\")) |i| base = base[i + 1 ..];
+    const capped = base[0..@min(base.len, max_drop_name)];
+    const buf = try a.alloc(u8, capped.len);
+    var n: usize = 0;
+    for (capped) |ch| {
+        const ok = std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '_' or ch == '-';
+        buf[n] = if (ok) ch else '_';
+        n += 1;
+    }
+    const out = buf[0..n];
+    if (out.len == 0 or std.mem.eql(u8, out, ".") or std.mem.eql(u8, out, "..")) {
+        a.free(buf);
+        return try a.dupe(u8, "model.glb");
+    }
+    // A name of only dots (e.g. "...") is harmless on disk, keep it.
+    return out;
 }
 
 /// Copies `src` to `dst` for `exportTo`: missing parents of `dst` are
@@ -2012,6 +2112,110 @@ test "saveFileName blanks fall back to the default" {
     try testing.expectEqualStrings("model.opt.glb", saveFileName("   "));
     try testing.expectEqualStrings("box.opt.glb", saveFileName("box.opt.glb"));
     try testing.expectEqualStrings("box.opt.glb", saveFileName("  box.opt.glb\n"));
+}
+
+test "sanitizeDropName strips paths and weird chars" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("box.glb", try sanitizeDropName(a, "../../etc/box.glb"));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, "C:\\Users\\x\\model.glb"));
+    try testing.expectEqualStrings("my_model__1_.glb", try sanitizeDropName(a, "my model (1).glb"));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, ""));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, "   "));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, ".."));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, "."));
+    try testing.expectEqualStrings("model.glb", try sanitizeDropName(a, "../"));
+    // Length capped at max_drop_name bytes.
+    const long = try a.alloc(u8, 200);
+    @memset(long, 'a');
+    const capped = try sanitizeDropName(a, long);
+    try testing.expectEqual(max_drop_name, capped.len);
+}
+
+test "dropFile writes bytes under out_dir/drops and reads back" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    _ = std.base64.standard.Encoder.encode(b64, fixture);
+
+    const r = try b.dropFileImpl(a, "../weird name (1).glb", b64);
+    try testing.expect(std.mem.startsWith(u8, r.text, "{\"path\":\""));
+
+    const Parsed = struct { path: []const u8 };
+    const parsed = try std.json.parseFromSlice(Parsed, a, r.text, .{});
+    defer parsed.deinit();
+    const path = parsed.value.path;
+    // Lands in the drops dir, keeps a sanitized tail of the browser name.
+    try testing.expect(std.mem.indexOf(u8, path, "drops") != null);
+    try testing.expect(std.mem.endsWith(u8, path, "_weird_name__1_.glb"));
+    try testing.expect(std.fs.path.isAbsolute(path));
+
+    const back = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, fixture, back);
+    std.Io.Dir.cwd().deleteFile(testing.io, path) catch {};
+
+    // A blank name falls back to model.glb.
+    const r2 = try b.dropFileImpl(a, "  ", b64);
+    const parsed2 = try std.json.parseFromSlice(Parsed, a, r2.text, .{});
+    defer parsed2.deinit();
+    try testing.expect(std.mem.endsWith(u8, parsed2.value.path, "_model.glb"));
+    std.Io.Dir.cwd().deleteFile(testing.io, parsed2.value.path) catch {};
+}
+
+test "dropFile rejects invalid base64" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    for ([_][]const u8{ "!!!", "####", "a" }) |bad| {
+        const r = try b.dropFileImpl(a, "box.glb", bad);
+        try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") != null);
+        try testing.expect(std.mem.indexOf(u8, r.text, "invalid base64") != null);
+    }
+}
+
+test "resolveOpenDir accepts only existing directories" {
+    var b = testBackend();
+    try testing.expectEqualStrings("presets", b.resolveOpenDir("presets").?);
+    try testing.expectEqualStrings("presets", b.resolveOpenDir("  presets\n").?);
+    try testing.expect(b.resolveOpenDir(null) == null);
+    try testing.expect(b.resolveOpenDir("   ") == null);
+    try testing.expect(b.resolveOpenDir("test/fixtures/nope-dir") == null);
+    // A file is not a directory.
+    try testing.expect(b.resolveOpenDir("test/fixtures/box.glb") == null);
+}
+
+test "progress payload omits a null sub and carries a set one" {
+    var plain_buf: [128]u8 = undefined;
+    var plain_w = std.Io.Writer.fixed(&plain_buf);
+    try std.json.Stringify.value(.{ .step = "textures", .pct = @as(f32, 0.5) }, .{}, &plain_w);
+
+    var bare_buf: [128]u8 = undefined;
+    var bare_w = std.Io.Writer.fixed(&bare_buf);
+    try std.json.Stringify.value(events.ProgressPayload{ .step = "textures", .pct = 0.5 }, .{}, &bare_w);
+    // Byte-compatible with the pre-sub shape: no "sub" key at all.
+    try testing.expectEqualStrings(plain_w.buffered(), bare_w.buffered());
+    try testing.expect(std.mem.indexOf(u8, bare_w.buffered(), "sub") == null);
+
+    var sub_buf: [256]u8 = undefined;
+    var sub_w = std.Io.Writer.fixed(&sub_buf);
+    try std.json.Stringify.value(events.ProgressPayload{
+        .step = "textures",
+        .pct = 0.5,
+        .sub = .{ .label = "texture", .done = 3, .total = 7 },
+    }, .{}, &sub_w);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sub_w.buffered(),
+        "\"sub\":{\"label\":\"texture\",\"done\":3,\"total\":7}",
+    ) != null);
 }
 
 /// Seeds `.zig-cache/tmp/<tmp>/in/box.glb` with the fixture bytes.

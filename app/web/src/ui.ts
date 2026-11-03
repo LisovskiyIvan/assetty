@@ -1,4 +1,5 @@
 /** Tiny DOM helpers — keeps the tab modules readable without a framework. */
+import { t } from "./i18n";
 
 type Attrs = Record<string, unknown>;
 
@@ -107,6 +108,11 @@ export function psnrBadge(psnr: number): HTMLElement {
 
 /** Hint shown by tabs that need a model before they can do anything. */
 export const OPEN_HINT = "Open a model first (⌘O)";
+
+/** Localized version of {@link OPEN_HINT} — call at render time. */
+export function openHintText(): string {
+  return t("viewer.openHint");
+}
 
 /** Centered empty state with an optional call-to-action button. */
 export function emptyState(

@@ -59,7 +59,26 @@ pub const Report = struct {
     total_secs: f64 = 0,
 }; // arena-owned, no deinit needed
 
-pub const ProgressFn = *const fn (ctx: ?*anyopaque, step: []const u8, pct: f32) void;
+pub const ProgressFn = *const fn (ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?ProgressSub) void;
+
+/// Optional per-step detail for a progress update, e.g. the textures step's
+/// "texture 3/7" counter. `label` is a stable ASCII token the page maps to a
+/// localized frame ("texture"); the callback must be thread-safe, as the
+/// parallel encode loop reports completions from worker threads.
+pub const ProgressSub = struct {
+    label: []const u8,
+    done: u32,
+    total: u32,
+};
+
+/// Where a run is inside its preset: which step is encoding, out of how many.
+/// Lets a long step (textures) interpolate `pct` between its own start and
+/// the next step's.
+pub const ProgScope = struct {
+    opts: Options,
+    index: usize,
+    n_steps: usize,
+};
 
 pub const Options = struct {
     preset: preset.Preset,
@@ -180,7 +199,11 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
             },
             // step 4: encode embedded png/jpeg images to KTX2 (basisu)
             .textures => |p| blk: {
-                const res = encodeTextures(a, loaded, p, opts.preset.target) catch |err| {
+                const res = encodeTextures(a, loaded, p, opts.preset.target, .{
+                    .opts = opts,
+                    .index = i,
+                    .n_steps = n_steps,
+                }) catch |err| {
                     break :blk .{
                         .kind = kind,
                         .applied = false,
@@ -425,6 +448,12 @@ const ParCtx = struct {
     /// image sizes balance out without chunking.
     next: std.atomic.Value(usize) = .init(0),
     outs: []EncOutcome,
+    /// Textures-step scope for per-completion progress; null in unit tests.
+    prog: ?ProgScope = null,
+    total: u32 = 0,
+    /// Images disposed so far (pre-skipped slots start the count; workers add
+    /// each finished encode). Only touched via atomics: workers race here.
+    done: std.atomic.Value(u32) = .init(0),
 };
 
 const Worker = struct {
@@ -473,6 +502,11 @@ fn workerMain(w: *Worker) void {
         if (i >= ctx.jobs.len) return;
         ctx.outs[i] = encodeOneJob(scratch, ctx.jobs[i]);
         _ = w.arena.reset(.retain_capacity);
+        // One completion tick per finished encode (failures count too: the
+        // join loop reclassifies them as skips). Concurrent workers may emit
+        // out of order; the page keeps the max `done` it has seen.
+        const d = ctx.done.fetchAdd(1, .monotonic) + 1;
+        emitTexProgress(ctx.prog, d, ctx.total);
     }
 }
 
@@ -484,8 +518,14 @@ fn encodeThreadCount(n_images: usize) usize {
     return @min(@min(cpus, max_parallel_encodes), n_images);
 }
 
-fn encodeTextures(a: std.mem.Allocator, loaded: parse.Loaded, p: preset.TextureParams, target: preset.Target) !TexEncResult {
-    return encodeTexturesWith(a, loaded, p, target, max_parallel_encodes);
+fn encodeTextures(
+    a: std.mem.Allocator,
+    loaded: parse.Loaded,
+    p: preset.TextureParams,
+    target: preset.Target,
+    prog: ?ProgScope,
+) !TexEncResult {
+    return encodeTexturesWith(a, loaded, p, target, max_parallel_encodes, prog);
 }
 
 /// `thread_cap` exists for tests: 1 forces the original fully sequential path.
@@ -495,6 +535,7 @@ fn encodeTexturesWith(
     p: preset.TextureParams,
     target: preset.Target,
     thread_cap: usize,
+    prog: ?ProgScope,
 ) !TexEncResult {
     var res: TexEncResult = .{};
     const base_mode = modeForFormat(p.format, target);
@@ -522,9 +563,9 @@ fn encodeTexturesWith(
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
     const n_threads = @min(thread_cap, encodeThreadCount(images.len));
     if (n_threads <= 1) {
-        try encodeImagesSequential(a, loaded.cdata, p, target, images, &gb, &pending, &res, details_ptr);
+        try encodeImagesSequential(a, loaded.cdata, p, target, images, &gb, &pending, &res, details_ptr, prog);
     } else {
-        try encodeImagesParallel(a, loaded.cdata, p, target, images, &gb, &pending, &res, n_threads, details_ptr);
+        try encodeImagesParallel(a, loaded.cdata, p, target, images, &gb, &pending, &res, n_threads, details_ptr, prog);
     }
     if (details_ptr != null) res.details = try details.toOwnedSlice(a);
 
@@ -559,6 +600,19 @@ fn appendDetail(
     });
 }
 
+/// One progress tick for the textures step: `done/total` images disposed
+/// (encoded or skipped), `pct` interpolated inside the step's span. Null
+/// scope (unit tests calling the encode directly) is a no-op.
+fn emitTexProgress(prog: ?ProgScope, done: u32, total: u32) void {
+    const ps = prog orelse return;
+    if (total == 0) return;
+    notifySub(ps.opts, "textures", subPct(ps.index, ps.n_steps, done, total), .{
+        .label = "texture",
+        .done = done,
+        .total = total,
+    });
+}
+
 /// Original one-image-at-a-time loop, kept for the single-image fast path and
 /// as the reference behaviour (same allocations in `a`, same view order).
 fn encodeImagesSequential(
@@ -571,7 +625,10 @@ fn encodeImagesSequential(
     pending: *std.ArrayList(PendingView),
     res: *TexEncResult,
     details: ?*std.ArrayList(TextureImageOutcome),
+    prog: ?ProgScope,
 ) !void {
+    const total: u32 = @intCast(images.len);
+    var done: u32 = 0;
     for (images, 0..) |*im, idx| {
         const index: u32 = @intCast(idx);
         const eff = resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri));
@@ -580,17 +637,23 @@ fn encodeImagesSequential(
             res.mixed = true;
             // Untouched: buffer_view still points at the source bytes.
             try appendDetail(a, details, index, im.name, true, "as-is");
+            done += 1;
+            emitTexProgress(prog, done, total);
             continue;
         }
         if (eff.format != p.format) res.mixed = true;
         const bytes = embeddedImageBytes(cd, im) orelse {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
+            done += 1;
+            emitTexProgress(prog, done, total);
             continue;
         };
         var dec = decode.decodeRgba(a, bytes) orelse {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
+            done += 1;
+            emitTexProgress(prog, done, total);
             continue;
         };
         defer dec.deinit(a);
@@ -618,6 +681,8 @@ fn encodeImagesSequential(
         }) catch {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
+            done += 1;
+            emitTexProgress(prog, done, total);
             continue;
         };
 
@@ -627,6 +692,8 @@ fn encodeImagesSequential(
         try pending.append(a, .{ .img = im, .view_idx = vi, .normal = eff_normal });
         try appendDetail(a, details, index, im.name, false, @tagName(eff.format));
         res.encoded += 1;
+        done += 1;
+        emitTexProgress(prog, done, total);
     }
 }
 
@@ -644,6 +711,7 @@ fn encodeImagesParallel(
     res: *TexEncResult,
     n_threads: usize,
     details: ?*std.ArrayList(TextureImageOutcome),
+    prog: ?ProgScope,
 ) !void {
     const Slot = union(enum) { skip, job: usize };
     var slots = try a.alloc(Slot, images.len);
@@ -679,14 +747,23 @@ fn encodeImagesParallel(
             for (images, 0..) |*im, i|
                 try appendDetail(a, d, @intCast(i), im.name, true, "as-is");
         }
+        // Nothing to encode: the step is already fully disposed.
+        emitTexProgress(prog, @intCast(images.len), @intCast(images.len));
         return;
     }
 
     var ctx: ParCtx = .{
         .jobs = jobs.items,
         .outs = try a.alloc(EncOutcome, jobs.items.len),
+        .prog = prog,
+        .total = @intCast(images.len),
     };
     @memset(ctx.outs, .{});
+    // Slots skipped up front (no embedded bytes, explicit skip) count as
+    // disposed before the workers start, so `done` ends at `total`.
+    const pre: u32 = @intCast(images.len - jobs.items.len);
+    ctx.done.store(pre, .monotonic);
+    emitTexProgress(prog, pre, ctx.total);
     // Encoder/transcoder init is a global one-time cost; do it before spawning
     // so workers don't serialise on it.
     _ = encode_ktx.init();
@@ -745,7 +822,20 @@ fn encodeImagesParallel(
 }
 
 fn notify(opts: Options, step: []const u8, pct: f32) void {
-    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct);
+    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct, null);
+}
+
+fn notifySub(opts: Options, step: []const u8, pct: f32, sub: ProgressSub) void {
+    if (opts.progress) |cb| cb(opts.progress_ctx, step, pct, sub);
+}
+
+/// `pct` for `done/total` inside step `index` of `n_steps`: linearly between
+/// that step's start and the next step's.
+fn subPct(index: usize, n_steps: usize, done: u32, total: u32) f32 {
+    if (n_steps == 0 or total == 0) return 0;
+    const base: f32 = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(n_steps));
+    const span: f32 = 1.0 / @as(f32, @floatFromInt(n_steps));
+    return base + span * @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total));
 }
 
 /// `Stats.image_stats[].name` points into the loader's arena. Copy any names
@@ -784,7 +874,8 @@ const ProgressLog = struct {
     saw_write: bool = false,
 };
 
-fn progressCb(ctx: ?*anyopaque, step: []const u8, pct: f32) void {
+fn progressCb(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?ProgressSub) void {
+    _ = sub;
     const log: *ProgressLog = @ptrCast(@alignCast(ctx.?));
     log.count += 1;
     log.last_step = step;
@@ -968,6 +1059,64 @@ fn testGradient(a: std.mem.Allocator, w: u32, h: u32, seed: u8) ![]u8 {
 // Every encoded image must carry a KTX2 view, in image order, with strictly
 // increasing BIN offsets, and (since basisu's per-encode thread count is the
 // same either way) bytes identical to the sequential result.
+test "textures: progress carries per-image done/total" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Three small images: fast, but enough to tick the counter.
+    const dim: u32 = 64;
+    const pngs = try a.alloc([]const u8, 3);
+    for (pngs, 0..) |*png, i| {
+        const px = try testGradient(a, dim, dim, @intCast(41 * (i + 1)));
+        png.* = try decode.encodePngRgba(a, px, dim, dim);
+    }
+    const in_path = ".zig-cache/pipeline_runner_texprog.glb";
+    const out_path = ".zig-cache/pipeline_runner_texprog.opt.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = in_path, .data = try testGlbWithImages(a, pngs) });
+    defer std.Io.Dir.cwd().deleteFile(io, in_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    const Capture = struct {
+        // Plain atomics: the parallel encode loop reports from workers.
+        subs: std.atomic.Value(u32) = .init(0),
+        total: std.atomic.Value(u32) = .init(0),
+        saw_final: std.atomic.Value(bool) = .init(false),
+        saw_label: std.atomic.Value(bool) = .init(false),
+        bad_range: std.atomic.Value(bool) = .init(false),
+        fn cb(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?ProgressSub) void {
+            _ = pct;
+            if (!std.mem.eql(u8, step, "textures")) return;
+            const s = sub orelse return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = self.subs.fetchAdd(1, .monotonic);
+            self.total.store(s.total, .monotonic);
+            if (s.done > s.total) self.bad_range.store(true, .monotonic);
+            if (s.done == s.total) self.saw_final.store(true, .monotonic);
+            if (std.mem.eql(u8, s.label, "texture")) self.saw_label.store(true, .monotonic);
+        }
+    };
+    var cap: Capture = .{};
+
+    const steps = [_]preset.Step{.{ .textures = .{} }};
+    const rep = try run(io, a, in_path, .{
+        .preset = .{ .name = "texprog", .target = .mobile, .steps = &steps },
+        .out_path = out_path,
+        .progress_ctx = &cap,
+        .progress = Capture.cb,
+    });
+    try testing.expect(rep.steps[0].applied);
+
+    // At least one textures tick carried a sub counter that stayed in range
+    // and ran to completion (3/3) with the stable "texture" label.
+    try testing.expect(cap.subs.load(.monotonic) >= 3);
+    try testing.expectEqual(@as(u32, 3), cap.total.load(.monotonic));
+    try testing.expect(!cap.bad_range.load(.monotonic));
+    try testing.expect(cap.saw_final.load(.monotonic));
+    try testing.expect(cap.saw_label.load(.monotonic));
+}
+
 test "textures overrides: resolve order and matching" {
     const ovs = [_]preset.TextureOverride{
         .{ .image = 1, .format = .uastc, .quality = 200 },
@@ -1035,7 +1184,7 @@ test "textures overrides: skip keeps source bytes, name override changes format"
     const base_params: preset.TextureParams = .{ .quality = 64, .generate_mips = false };
     var base_loaded = try parse.loadFile(io, a, in_path);
     defer base_loaded.deinit();
-    const base = try encodeTexturesWith(a, base_loaded, base_params, .mobile, 1);
+    const base = try encodeTexturesWith(a, base_loaded, base_params, .mobile, 1, null);
     try testing.expectEqual(@as(u32, 2), base.encoded);
     try testing.expectEqual(@as(u32, 0), base.skipped);
     try testing.expect(!base.mixed);
@@ -1049,7 +1198,7 @@ test "textures overrides: skip keeps source bytes, name override changes format"
     const ov_params: preset.TextureParams = .{ .quality = 64, .generate_mips = false, .overrides = &ovs };
     var ov_loaded = try parse.loadFile(io, a, in_path);
     defer ov_loaded.deinit();
-    const ov = try encodeTexturesWith(a, ov_loaded, ov_params, .mobile, 1);
+    const ov = try encodeTexturesWith(a, ov_loaded, ov_params, .mobile, 1, null);
     try testing.expectEqual(@as(u32, 1), ov.encoded);
     try testing.expectEqual(@as(u32, 1), ov.skipped);
     try testing.expect(ov.mixed);
@@ -1076,7 +1225,7 @@ test "textures overrides: skip keeps source bytes, name override changes format"
     // Parallel path agrees with the sequential reference.
     var par_loaded = try parse.loadFile(io, a, in_path);
     defer par_loaded.deinit();
-    const par = try encodeTexturesWith(a, par_loaded, ov_params, .mobile, 4);
+    const par = try encodeTexturesWith(a, par_loaded, ov_params, .mobile, 4, null);
     try testing.expectEqual(ov.encoded, par.encoded);
     try testing.expectEqual(ov.skipped, par.skipped);
     try testing.expectEqual(ov.details.len, par.details.len);
@@ -1114,7 +1263,7 @@ test "textures: 4 images encode in parallel, image order preserved" {
     var seq_loaded = try parse.loadFile(io, a, in_path);
     defer seq_loaded.deinit();
     const seq_t0 = testNowMs();
-    const seq = try encodeTexturesWith(a, seq_loaded, tex_params, .mobile, 1);
+    const seq = try encodeTexturesWith(a, seq_loaded, tex_params, .mobile, 1, null);
     const seq_ms = testNowMs() - seq_t0;
     try testing.expectEqual(@as(u32, 4), seq.encoded);
     try testing.expectEqual(@as(u32, 0), seq.skipped);
@@ -1135,7 +1284,7 @@ test "textures: 4 images encode in parallel, image order preserved" {
     var par_loaded = try parse.loadFile(io, a, in_path);
     defer par_loaded.deinit();
     const par_t0 = testNowMs();
-    const par = try encodeTexturesWith(a, par_loaded, tex_params, .mobile, 4);
+    const par = try encodeTexturesWith(a, par_loaded, tex_params, .mobile, 4, null);
     const par_ms = testNowMs() - par_t0;
     // Informational only (the CI box is not quiet), never asserted.
     std.debug.print("4x1024 encode: seq {d} ms, par {d} ms\n", .{ seq_ms, par_ms });

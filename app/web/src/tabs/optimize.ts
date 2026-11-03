@@ -1,6 +1,7 @@
 import { app } from "../app";
 import { isBusyError } from "../bridge";
 import { buildOptimizeForm, closeFieldHelp, fieldHelpButton } from "../optimizeForm";
+import { onLang, t } from "../i18n";
 import {
   getSettings,
   getTextureOverrides,
@@ -19,7 +20,6 @@ import {
   section,
   copyText,
   emptyState,
-  OPEN_HINT,
 } from "../ui";
 import { isMissingMethodError, notify, onLog } from "../notify";
 import { ViewerScene, linkCameras } from "../viewer";
@@ -33,17 +33,17 @@ export function isEncodableImage(img: ImageInfo): boolean {
 
 interface RowSpec {
   key: string;
-  label: string;
+  labelKey: string;
   bytes?: boolean;
   deltaKey?: string;
 }
 
 const ROWS: RowSpec[] = [
-  { key: "triangles", label: "triangles" },
-  { key: "vertices", label: "vertices" },
-  { key: "draw_calls", label: "draw calls" },
-  { key: "vram_total", label: "VRAM est", bytes: true, deltaKey: "vram_bytes" },
-  { key: "disk_total", label: "disk size", bytes: true, deltaKey: "disk_bytes" },
+  { key: "triangles", labelKey: "opt.rowTriangles" },
+  { key: "vertices", labelKey: "opt.rowVertices" },
+  { key: "draw_calls", labelKey: "opt.rowDraws" },
+  { key: "vram_total", labelKey: "opt.rowVram", bytes: true, deltaKey: "vram_bytes" },
+  { key: "disk_total", labelKey: "opt.rowDisk", bytes: true, deltaKey: "disk_bytes" },
 ];
 
 /** Named presets only prefill the per-step controls (the result is saved as settings). */
@@ -166,15 +166,16 @@ export function mountOptimize(): TabHandle {
   const main = el("div", { class: "tab-main" });
 
   const dual = el("div", { class: "dual" });
-  const mkPane = (title: string, paneClass: string) => {
+  const mkPane = (key: string, paneClass: string) => {
     const wrap = el("div", { class: `canvas-wrap ${paneClass}` });
     const canvas = el("canvas");
-    wrap.append(canvas, el("div", { class: "canvas-label", text: title }));
+    const paneLabel = el("div", { class: "canvas-label", text: t(key) });
+    wrap.append(canvas, paneLabel);
     dual.append(wrap);
-    return { wrap, canvas };
+    return { wrap, canvas, paneLabel };
   };
-  const leftPane = mkPane("original", "pane-left");
-  const rightPane = mkPane("optimized", "pane-top");
+  const leftPane = mkPane("opt.original", "pane-left");
+  const rightPane = mkPane("opt.optimized", "pane-top");
 
   /** Before/after view mode. "side" is the classic two canvases; "split"
    * stacks both scenes in one viewport with a draggable wipe divider (the
@@ -187,18 +188,18 @@ export function mountOptimize(): TabHandle {
 
   const sideBtn = el("button", {
     class: "small active",
-    text: "Side by side",
-    title: "show the source and the result next to each other",
+    text: t("opt.sideBySide"),
+    title: t("opt.sideTitle"),
   });
   const splitBtn = el("button", {
     class: "small",
-    text: "Split slider",
-    title: "Run optimize to compare",
+    text: t("opt.splitSlider"),
+    title: t("opt.splitNeedResult"),
     disabled: true,
   });
   const splitHint = el("span", {
     class: "hint",
-    text: "before/after canvases stay in sync while you orbit",
+    text: t("opt.syncHint"),
   });
   const modeSeg = el("div", { class: "segmented compare-seg" }, sideBtn, splitBtn);
   const toolbar = el(
@@ -215,22 +216,27 @@ export function mountOptimize(): TabHandle {
   const splitLine = el("div", { class: "split-line" });
   const splitGrip = el(
     "button",
-    { class: "split-grip", title: "drag to wipe between source and result" },
+    { class: "split-grip", title: t("opt.splitDragTitle") },
     el("span", { class: "split-knob", text: "⟷" }),
   );
+  const splitChipLeft = el("div", { class: "split-chip left", text: t("opt.chipSource") });
+  const splitChipRight = el("div", { class: "split-chip right", text: t("opt.chipOptimized") });
   const splitUi = el(
     "div",
     { class: "split-ui" },
     splitLine,
-    el("div", { class: "split-chip left", text: "SOURCE" }),
-    el("div", { class: "split-chip right", text: "OPTIMIZED" }),
+    splitChipLeft,
+    splitChipRight,
     splitGrip,
   );
   dual.append(splitUi);
   // No bottom panel here: progress + report live in the right panel.
   main.append(toolbar, dual);
 
-  const openHint = emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() });
+  const openHint = emptyState(t("viewer.openHint"), {
+    label: t("common.open"),
+    onClick: () => void app.pickAndOpen(),
+  });
   openHint.classList.add("overlay");
   openHint.hidden = true;
   main.append(openHint);
@@ -240,10 +246,10 @@ export function mountOptimize(): TabHandle {
     const label = openHint.querySelector(".empty-state-text");
     if (label) {
       label.textContent =
-        !app.sourcePath && app.viewPath
-          ? "No source model — open one (⌘O) or use as source"
-          : OPEN_HINT;
+        !app.sourcePath && app.viewPath ? t("viewer.noSourceHint") : t("viewer.openHint");
     }
+    const btn = openHint.querySelector("button");
+    if (btn) btn.textContent = t("common.open");
     if (!app.sourcePath) openHint.hidden = false;
   }
 
@@ -319,13 +325,17 @@ export function mountOptimize(): TabHandle {
     dual.classList.toggle("split", split);
     sideBtn.classList.toggle("active", !split);
     splitBtn.classList.toggle("active", split);
+    sideBtn.textContent = t("opt.sideBySide");
+    sideBtn.title = t("opt.sideTitle");
+    splitBtn.textContent = t("opt.splitSlider");
     splitBtn.disabled = lastResult === null;
-    splitBtn.title = lastResult
-      ? "wipe between source (left) and result (right)"
-      : "Run optimize to compare";
-    splitHint.textContent = split
-      ? "drag ⟷ to compare — left SOURCE, right OPTIMIZED"
-      : "before/after canvases stay in sync while you orbit";
+    splitBtn.title = lastResult ? t("opt.splitWipeTitle") : t("opt.splitNeedResult");
+    splitHint.textContent = split ? t("opt.splitHint") : t("opt.syncHint");
+    splitGrip.title = t("opt.splitDragTitle");
+    splitChipLeft.textContent = t("opt.chipSource");
+    splitChipRight.textContent = t("opt.chipOptimized");
+    leftPane.paneLabel.textContent = t("opt.original");
+    rightPane.paneLabel.textContent = t("opt.optimized");
     setSplitSync(split && left !== null && right !== null);
     if (split) applySplit();
     else rightPane.wrap.style.clipPath = "";
@@ -395,21 +405,15 @@ export function mountOptimize(): TabHandle {
   // only used as a fallback if the host predates `optimizeCustom`.
   let activePreset = "";
 
-  const sourceLabel = el("div", {
-    class: "mono muted wrap",
-    text: `Source: ${app.sourcePath ?? "no file selected"}`,
-  });
-  const viewNote = el("div", {
-    class: "amber-note",
-    text: "Viewing a different file (results are not the source)",
-  });
+  const sourceLabel = el("div", { class: "mono muted wrap" });
+  const viewNote = el("div", { class: "amber-note" });
   viewNote.hidden = true;
   const presetRow = el("div", { class: "preset-row" });
-  const runBtn = el("button", { class: "primary", text: "Run optimize", disabled: true });
-  const exportBtn = el("button", { text: "Export", disabled: true });
+  const runBtn = el("button", { class: "primary", disabled: true });
+  const exportBtn = el("button", { disabled: true });
   /** Compact progress strip: lives with the Run button so it stays visible. */
   const progressFill = el("div");
-  const progressMeta = el("span", { class: "run-progress-meta", text: "idle · 0%" });
+  const progressMeta = el("span", { class: "run-progress-meta" });
   const progressBar = el("div", { class: "progress grow" }, progressFill);
   const logLine = el("div", { class: "logline mono", text: "—" });
   /** Pre-run guard: shown when the source has no encodable images left. */
@@ -417,24 +421,34 @@ export function mountOptimize(): TabHandle {
   guardBox.hidden = true;
 
   function syncSourceHead(): void {
-    sourceLabel.textContent = `Source: ${app.sourcePath ?? "no file selected"}`;
+    sourceLabel.textContent = app.sourcePath
+      ? t("opt.sourceLabel", { path: app.sourcePath })
+      : t("opt.sourceLabel", { path: t("opt.noFile") });
     sourceLabel.title = app.sourcePath ?? "";
+    viewNote.textContent = t("opt.diverged");
     const diverged = !!app.viewPath && !!app.sourcePath && app.viewPath !== app.sourcePath;
     viewNote.hidden = !diverged;
-    if (diverged) viewNote.title = `viewing ${app.viewPath}`;
+    if (diverged) viewNote.title = t("opt.viewing", { path: app.viewPath ?? "" });
   }
   syncSourceHead();
 
+  const optSectionHead = el("span");
   side.append(
-    section(
-      "Optimize",
-      sourceLabel,
-      viewNote,
-      guardBox,
-      presetRow,
-      el("div", { class: "row" }, runBtn, exportBtn),
-      el("div", { class: "row run-progress" }, progressBar, progressMeta),
-      logLine,
+    el(
+      "div",
+      { class: "panel" },
+      el("div", { class: "panel-head" }, optSectionHead),
+      el(
+        "div",
+        { class: "panel-body" },
+        sourceLabel,
+        viewNote,
+        guardBox,
+        presetRow,
+        el("div", { class: "row" }, runBtn, exportBtn),
+        el("div", { class: "row run-progress" }, progressBar, progressMeta),
+        logLine,
+      ),
     ),
   );
 
@@ -442,49 +456,65 @@ export function mountOptimize(): TabHandle {
 
   const stepsPanel = el("div", { class: "panel" });
   const stepsBody = el("div", { class: "panel-body form" });
-  stepsPanel.append(el("div", { class: "panel-head" }, el("span", { text: "Steps" })), stepsBody);
+  const stepsHead = el("span");
+  stepsPanel.append(el("div", { class: "panel-head" }, stepsHead), stepsBody);
   side.append(stepsPanel);
 
-  const form = buildOptimizeForm(stepsBody, { get: steps, edit });
+  const texExtra = el("div", { class: "tex-extra" });
+
+  /** (Re)builds the shared step form in the active language. */
+  let form = buildOptimizeForm(stepsBody, { get: steps, edit });
+  function buildForm(): void {
+    clear(stepsBody);
+    form = buildOptimizeForm(stepsBody, { get: steps, edit });
+    // Inside the textures step block so the chips read as part of the step;
+    // falls back to a standalone block if the form layout ever changes.
+    for (const block of Array.from(stepsBody.querySelectorAll(".step-block"))) {
+      if (block.querySelector(".step-name")?.textContent === "textures") {
+        block.append(texExtra);
+        break;
+      }
+    }
+    if (!texExtra.parentElement) stepsPanel.append(texExtra);
+  }
+  buildForm();
 
   /* --------------------------------------- textures: auto presets + overrides */
 
   /** Seeds for the textures BASE params (per-texture overrides stay untouched). */
   const TEXTURE_AUTO: Array<{
-    name: string;
+    nameKey: string;
     format: TextureFormat;
     quality: number;
     max_size: number;
     mips: boolean;
-    tip: string;
+    tipKey: string;
   }> = [
     {
-      name: "mobile",
+      nameKey: "opt.autoMobile",
       format: "etc1s",
       quality: 128,
       max_size: 1024,
       mips: true,
-      tip: "mobile: ETC1S q128, max 1024px, mips on — small downloads",
+      tipKey: "opt.autoMobileTip",
     },
     {
-      name: "desktop",
+      nameKey: "opt.autoDesktop",
       format: "etc1s",
       quality: 160,
       max_size: 0,
       mips: true,
-      tip: "desktop: ETC1S q160, original size, mips on — max fidelity",
+      tipKey: "opt.autoDesktopTip",
     },
     {
-      name: "web",
+      nameKey: "opt.autoWeb",
       format: "etc1s",
       quality: 96,
       max_size: 2048,
       mips: true,
-      tip: "web: ETC1S q96, max 2048px, mips on — fast streaming",
+      tipKey: "opt.autoWebTip",
     },
   ];
-
-  const texExtra = el("div", { class: "tex-extra" });
 
   function syncTexExtra(): void {
     clear(texExtra);
@@ -492,12 +522,12 @@ export function mountOptimize(): TabHandle {
       el(
         "div",
         { class: "chip-row" },
-        el("span", { class: "muted", text: "auto:" }),
+        el("span", { class: "muted", text: t("opt.autoLabel") }),
         ...TEXTURE_AUTO.map((p) =>
           el("button", {
             class: "small",
-            text: p.name,
-            title: p.tip,
+            text: t(p.nameKey),
+            title: t(p.tipKey),
             onclick: () => {
               edit((s) => {
                 s.textures.format = p.format;
@@ -516,18 +546,15 @@ export function mountOptimize(): TabHandle {
         el("span", {
           text: (() => {
             const n = textureOverridesCount(app.sourcePath);
-            return n > 0
-              ? `${n} per-texture override${n === 1 ? "" : "s"} (apply to source)`
-              : "no per-texture overrides";
+            return n > 0 ? t("opt.overridesCount", { n }) : t("opt.noOverrides");
           })(),
-          title:
-            "overrides are model-scoped (per_model[sourcePath]) and merge into the textures step",
+          title: t("opt.overridesTitle"),
         }),
         " ",
         el("button", {
           class: "small",
-          text: "Edit in Textures tab",
-          title: "open the Textures tab to edit per-image overrides",
+          text: t("opt.editInTextures"),
+          title: t("opt.editInTexturesTitle"),
           onclick: () => {
             window.dispatchEvent(new CustomEvent("assetty:select-tab", { detail: "textures" }));
           },
@@ -537,56 +564,68 @@ export function mountOptimize(): TabHandle {
     );
   }
 
-  // Inside the textures step block so the chips read as part of the step;
-  // falls back to a standalone block if the form layout ever changes.
-  for (const block of Array.from(stepsBody.querySelectorAll(".step-block"))) {
-    if (block.querySelector(".step-name")?.textContent === "textures") {
-      block.append(texExtra);
-      break;
-    }
-  }
-  if (!texExtra.parentElement) stepsPanel.append(texExtra);
   syncTexExtra();
+
+  function syncStatic(): void {
+    optSectionHead.textContent = t("opt.section");
+    stepsHead.textContent = t("opt.stepsTitle");
+    reportHead.textContent = t("opt.report");
+    syncCompareUI();
+    syncSourceHead();
+    syncEmptyHint();
+    runBtn.textContent = running ? t("opt.running") : t("opt.run");
+    exportBtn.textContent = exporting ? t("opt.exporting") : t("opt.export");
+    exportNote.textContent = t("opt.exportNote");
+    renderProgress();
+  }
 
   function syncAll(): void {
     form.sync();
     syncTexExtra();
     runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
-    syncSourceHead();
-    syncEmptyHint();
+    exportBtn.disabled = running || exporting || !lastResult;
+    syncStatic();
   }
   syncAll();
 
   /* ------------------------------------------------------------------ report */
 
-  const reportPanel = section(
-    "Report",
-    el("div", { class: "empty", text: "run an optimization to see before/after" }),
+  const reportHead = el("span");
+  const reportBodyHost = el("div", { class: "panel-body" });
+  const reportPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, reportHead),
+    reportBodyHost,
   );
   side.append(reportPanel);
 
   /** Back to the empty state: a new run supersedes the previous report. */
   function resetReport(): void {
-    reportPanel.replaceChildren(
-      el("div", { class: "panel-head" }, el("span", { text: "Report" })),
-      el(
-        "div",
-        { class: "panel-body" },
-        el("div", { class: "empty", text: "run an optimization to see before/after" }),
-      ),
-    );
+    reportHead.textContent = t("opt.report");
+    reportBodyHost.replaceChildren(el("div", { class: "empty", text: t("opt.reportEmpty") }));
   }
-  side.append(
-    el("div", {
-      class: "hint",
-      text: "Results are written to .zig-cache/…; the source file is never modified. Use Save as… to place a copy.",
-    }),
-  );
+  resetReport();
+  const exportNote = el("div", { class: "hint", text: t("opt.exportNote") });
+  side.append(exportNote);
+
+  /** Last progress state, so a language switch can re-render the strip. */
+  let progressStep = "";
+  let progressPct = 0;
+
+  function renderProgress(): void {
+    progressMeta.textContent =
+      progressStep || progressPct > 0
+        ? `${progressStep || t("opt.working")} · ${Math.round(progressPct)}%`
+        : t("opt.progressIdle");
+    progressFill.style.width = `${progressPct}%`;
+  }
 
   function setProgress(step: string, pct: number): void {
     const clamped = Math.max(0, Math.min(100, pct));
-    progressMeta.textContent = `${step || "working…"} · ${Math.round(clamped)}%`;
-    progressFill.style.width = `${clamped}%`;
+    progressStep = step;
+    progressPct = clamped;
+    renderProgress();
   }
 
   function setLog(message: string): void {
@@ -596,7 +635,7 @@ export function mountOptimize(): TabHandle {
 
   function setRunning(on: boolean): void {
     running = on;
-    runBtn.textContent = on ? "Running…" : "Run optimize";
+    runBtn.textContent = on ? t("opt.running") : t("opt.run");
     runBtn.disabled = on || !app.bridge.live || !app.sourcePath;
     exportBtn.disabled = on || exporting || !lastResult;
     progressBar.classList.toggle("running", on);
@@ -604,7 +643,7 @@ export function mountOptimize(): TabHandle {
 
   function setExporting(on: boolean): void {
     exporting = on;
-    exportBtn.textContent = on ? "Exporting…" : "Export";
+    exportBtn.textContent = on ? t("opt.exporting") : t("opt.export");
     exportBtn.disabled = running || on || !lastResult;
   }
 

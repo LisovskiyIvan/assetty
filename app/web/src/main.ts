@@ -9,10 +9,12 @@ import {
   loadSettings,
   onSettingsChange,
   saveSettings,
+  setLanguage,
   settingsToJson,
   themeMode,
   toggleTheme,
 } from "./settings";
+import { lang, onLang, setLang, t } from "./i18n";
 import { clear, el, fmtBytes, fmtCompact, statChip } from "./ui";
 import type { StatChip } from "./ui";
 import { mountViewer } from "./tabs/viewer";
@@ -50,11 +52,11 @@ function surfaceDecoderFailures(): void {
 
 type TabId = "viewer" | "optimize" | "textures" | "settings";
 
-const TAB_DEFS: Array<{ id: TabId; label: string; mount: () => TabHandle }> = [
-  { id: "viewer", label: "Viewer", mount: mountViewer },
-  { id: "optimize", label: "Optimize", mount: mountOptimize },
-  { id: "textures", label: "Textures", mount: mountTextures },
-  { id: "settings", label: "Settings", mount: mountSettings },
+const TAB_DEFS: Array<{ id: TabId; key: string; mount: () => TabHandle }> = [
+  { id: "viewer", key: "topbar.viewer", mount: mountViewer },
+  { id: "optimize", key: "topbar.optimize", mount: mountOptimize },
+  { id: "textures", key: "topbar.textures", mount: mountTextures },
+  { id: "settings", key: "topbar.settings", mount: mountSettings },
 ];
 
 /* ---------------------------------------------------------------- shell DOM */
@@ -66,8 +68,8 @@ const modePill = el("span", { class: "pill" });
 
 const openBtn = el("button", {
   class: "primary",
-  text: "Open…",
-  title: "Open model (⌘O)",
+  text: t("topbar.open"),
+  title: t("topbar.openTitle"),
   onclick: () => void app.pickAndOpen(),
 });
 
@@ -79,27 +81,72 @@ const inspectorDock = createInspectorDock(() => syncInspectorChrome());
 
 const inspectorBtn = el("button", {
   class: "small",
-  text: "Inspector",
-  title: "Toggle the Babylon inspector for the viewer scene (⌘I)",
+  text: t("topbar.inspector"),
+  title: t("topbar.inspectorTitle"),
   onclick: () => void toggleInspector(),
 });
 
 const themeBtn = el("button", {
   class: "small theme-toggle",
   text: "☾",
-  title: "Switch to light theme",
+  title: t("topbar.themeToLight"),
   onclick: () => toggleTheme(),
 });
+
+/** Segmented EN | RU switch, sitting next to the theme quick-toggle. */
+const langEnBtn = el("button", {
+  class: "small",
+  text: "EN",
+  title: "English",
+  onclick: () => switchLanguage("en"),
+});
+const langRuBtn = el("button", {
+  class: "small",
+  text: "RU",
+  title: "Русский",
+  onclick: () => switchLanguage("ru"),
+});
+const langSwitch = el("div", { class: "segmented lang-switch" }, langEnBtn, langRuBtn);
+
+function switchLanguage(next: "en" | "ru"): void {
+  if (lang() === next) return;
+  setLang(next);
+  setLanguage(next);
+}
+
+function syncLangSwitch(): void {
+  const active = lang();
+  langEnBtn.classList.toggle("active", active === "en");
+  langRuBtn.classList.toggle("active", active === "ru");
+}
 
 function syncThemeButton(): void {
   const light = themeMode() === "light";
   themeBtn.textContent = light ? "☀" : "☾";
-  themeBtn.title = light ? "Switch to dark theme" : "Switch to light theme";
+  themeBtn.title = light ? t("topbar.themeToDark") : t("topbar.themeToLight");
   themeBtn.setAttribute("aria-label", themeBtn.title);
 }
 
 onSettingsChange(syncThemeButton);
+onLang(() => {
+  syncThemeButton();
+  syncLangSwitch();
+  openBtn.textContent = t("topbar.open");
+  openBtn.title = t("topbar.openTitle");
+  inspectorBtn.textContent = t("topbar.inspector");
+  inspectorBtn.title = t("topbar.inspectorTitle");
+  infoBtn.title = t("topbar.recent");
+  popoverTitle.textContent = t("topbar.recent");
+  popoverCount.textContent = t("topbar.last20");
+  for (const btn of Array.from(tabBar.children)) {
+    const def = TAB_DEFS.find((d) => d.id === (btn as HTMLElement).dataset.tab);
+    if (def) btn.textContent = t(def.key);
+  }
+  renderBanner();
+  renderLog();
+});
 syncThemeButton();
+syncLangSwitch();
 
 function syncInspectorChrome(): void {
   const open = inspectorDock.isOpen;
@@ -148,15 +195,12 @@ status.disk.el.dataset.chip = "disk";
 /* ------------------------------------------------ statusbar: log popover */
 
 const logList = el("div", { class: "log-list" });
+const popoverTitle = el("span", { text: t("topbar.recent") });
+const popoverCount = el("span", { class: "muted mono", text: t("topbar.last20") });
 const logPopover = el(
   "div",
-  { class: "status-popover", title: "recent messages" },
-  el(
-    "div",
-    { class: "popover-head" },
-    el("span", { text: "recent messages" }),
-    el("span", { class: "muted mono", text: "last 20" }),
-  ),
+  { class: "status-popover", title: t("topbar.recent") },
+  el("div", { class: "popover-head" }, popoverTitle, popoverCount),
   logList,
 );
 logPopover.hidden = true;
@@ -165,7 +209,7 @@ function renderLog(): void {
   clear(logList);
   const entries = logHistory();
   if (entries.length === 0) {
-    logList.append(el("div", { class: "empty", text: "no messages yet" }));
+    logList.append(el("div", { class: "empty", text: t("topbar.noMessages") }));
     return;
   }
   logList.append(
@@ -190,7 +234,7 @@ renderLog();
 const infoBtn = el("button", {
   class: "status-info",
   text: "ⓘ",
-  title: "recent messages",
+  title: t("topbar.recent"),
   onclick: (ev: Event) => {
     ev.stopPropagation();
     logPopover.hidden = !logPopover.hidden;
@@ -207,7 +251,8 @@ document.addEventListener("click", (ev) => {
 
 onLog((message, kind) => {
   infoBtn.classList.toggle("has-error", kind === "error");
-  infoBtn.title = kind === "error" ? `error: ${message}` : `last: ${message}`;
+  infoBtn.title =
+    kind === "error" ? t("topbar.errorMsg", { message }) : t("topbar.lastMsg", { message });
   if (!logPopover.hidden) renderLog();
 });
 
@@ -218,7 +263,7 @@ appRoot.append(
     { class: "topbar" },
     el("span", { class: "brand", text: "assetty" }),
     tabBar,
-    el("div", { class: "topbar-actions" }, modePill, themeBtn, inspectorBtn, openBtn),
+    el("div", { class: "topbar-actions" }, modePill, langSwitch, themeBtn, inspectorBtn, openBtn),
   ),
   banner,
   content,
@@ -236,23 +281,26 @@ document.body.append(appRoot);
 
 /* ------------------------------------------------------------------ banner */
 
-if (!app.bridge.live) {
-  banner.classList.add("show");
-  banner.append(
-    el("strong", { text: "assetty-app host not detected — demo mode. " }),
-    el("span", {
-      text: "Layout is seeded with static JSON; the file picker is disabled. Run the window through ",
-    }),
-    el("code", { text: "assetty-app" }),
-    el("span", { text: " (or " }),
-    el("code", { text: "zig build run" }),
-    el("span", { text: ") to talk to Zig." }),
-  );
-  modePill.classList.add("demo");
-  modePill.textContent = "demo";
-} else {
-  modePill.textContent = app.bridge.source;
+function renderBanner(): void {
+  clear(banner);
+  banner.classList.toggle("show", !app.bridge.live);
+  if (!app.bridge.live) {
+    banner.append(
+      el("strong", { text: t("topbar.demoTitle") }),
+      el("span", { text: t("topbar.demoBody1") }),
+      el("code", { text: "assetty-app" }),
+      el("span", { text: t("topbar.demoBody2") }),
+      el("code", { text: "zig build run" }),
+      el("span", { text: t("topbar.demoBody3") }),
+    );
+    modePill.classList.add("demo");
+    modePill.textContent = t("topbar.demoPill");
+  } else {
+    modePill.textContent = app.bridge.source;
+  }
 }
+
+renderBanner();
 
 /* -------------------------------------------------------------------- tabs */
 
@@ -275,7 +323,10 @@ function selectTab(id: TabId): void {
       content.append(handle.el);
     } catch (err) {
       content.append(
-        el("div", { class: "empty", text: `failed to mount ${id}: ${(err as Error).message}` }),
+        el("div", {
+          class: "empty",
+          text: t("topbar.mountFailed", { id, message: (err as Error).message }),
+        }),
       );
       return;
     }
@@ -300,7 +351,7 @@ for (const def of TAB_DEFS) {
     el("button", {
       class: "tab",
       dataset: { tab: def.id },
-      text: def.label,
+      text: t(def.key),
       onclick: () => selectTab(def.id),
     }),
   );
@@ -379,7 +430,7 @@ window.addEventListener("keydown", (ev) => {
 
 void checkKtx2Assets().then((missing) => {
   if (missing.length > 0) {
-    notify(`KTX2 decoders unavailable: ${missing.join(", ")}`, "error", 9000);
+    notify(t("topbar.ktx2Missing", { list: missing.join(", ") }), "error", 9000);
   }
 });
 
@@ -395,6 +446,8 @@ void checkKtx2Assets().then((missing) => {
   selectTab,
   theme: () => themeMode(),
   toggleTheme,
+  lang: () => lang(),
+  setLang: (next: "en" | "ru") => switchLanguage(next),
   settings: () => settingsToJson(),
   applySettingsText,
   saveSettings,

@@ -4,6 +4,7 @@
  * state — see `settings.ts` for the persisted schema.
  */
 import { el } from "./ui";
+import { t } from "./i18n";
 import type { OptimizeSteps, TextureFormat } from "./settings";
 
 export interface OptimizeFormOptions {
@@ -125,8 +126,10 @@ function toggleFieldHelp(anchor: HTMLElement, id: string): void {
     return;
   }
   closeFieldHelp();
-  const text = FIELD_HELP[id];
-  if (!text) return;
+  if (!FIELD_HELP[id]) return;
+  // Localized at open time, so a language switch applies to the next open
+  // even without a rebuild (the tabs also rebuild the form on `lang`).
+  const text = t(`help.${id}`);
   wireHelpOnce();
   const pop = el("div", { class: "field-help-pop", text });
   pop.setAttribute("role", "note");
@@ -162,10 +165,10 @@ export function fieldHelpButton(id: string): HTMLElement {
     class: "help-btn",
     type: "button",
     text: "?",
-    title: "what does this do?",
+    title: t("help.whatDoes"),
     dataset: { help: id },
   });
-  btn.setAttribute("aria-label", `help: ${id}`);
+  btn.setAttribute("aria-label", t("help.aria", { id }));
   btn.addEventListener("click", (ev) => {
     // The button may sit inside a <label>: never toggle the control.
     ev.preventDefault();
@@ -175,12 +178,14 @@ export function fieldHelpButton(id: string): HTMLElement {
   return btn;
 }
 
-const TEXTURE_MAX_SIZES: Array<[string, number]> = [
-  ["no resize", 0],
-  ["512", 512],
-  ["1024", 1024],
-  ["2048", 2048],
-];
+function maxSizeOptions(): Array<[string, string]> {
+  return [
+    [t("common.noResize"), "0"],
+    ["512", "512"],
+    ["1024", "1024"],
+    ["2048", "2048"],
+  ];
+}
 
 const TEXTURE_FORMATS: Array<[string, TextureFormat]> = [
   ["auto", "auto"],
@@ -363,7 +368,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
   }
 
   /* ----------------------------------------------------------------- prune */
-  stepBlock("prune", "prune", "unused nodes / materials / textures", () => [
+  stepBlock("prune", "prune", t("opt.hint.prune"), () => [
     el(
       "div",
       { class: "checks" },
@@ -398,7 +403,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
   ]);
 
   /* ----------------------------------------------------------------- dedup */
-  stepBlock("dedup", "dedup", "share identical data", () => [
+  stepBlock("dedup", "dedup", t("opt.hint.dedup"), () => [
     el(
       "div",
       { class: "checks" },
@@ -433,7 +438,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
   ]);
 
   /* ------------------------------------------------------------------ weld */
-  stepBlock("weld", "weld", "merge duplicate vertices", () => [
+  stepBlock("weld", "weld", t("opt.hint.weld"), () => [
     field(
       "tolerance",
       numberInput(
@@ -452,10 +457,10 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
   ]);
 
   /* ------------------------------------------------------------------ join */
-  stepBlock("join", "join", "merge primitives sharing a material", () => [], "join");
+  stepBlock("join", "join", t("opt.hint.join"), () => [], "join");
 
   /* -------------------------------------------------------------- textures */
-  stepBlock("textures", "textures", "KTX2 / basis encode", () => [
+  stepBlock("textures", "textures", t("opt.hint.textures"), () => [
     field(
       "format",
       select(
@@ -487,7 +492,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     field(
       "max size",
       select(
-        TEXTURE_MAX_SIZES.map(([label, value]): [string, string] => [label, String(value)]),
+        maxSizeOptions().map(([label, value]): [string, string] => [label, value]),
         () => String(opts.get().textures.max_size),
         (value) =>
           edit((steps) => {
@@ -512,7 +517,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
   ]);
 
   /* -------------------------------------------------------------- quantize */
-  stepBlock("quantize", "quantize", "attribute bit packing", () => [
+  stepBlock("quantize", "quantize", t("opt.hint.quantize"), () => [
     field(
       "position bits",
       select(
@@ -580,7 +585,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     weightUv.disabled = !on;
   });
 
-  stepBlock("simplify", "simplify", "decimate triangles", () => [
+  stepBlock("simplify", "simplify", t("opt.hint.simplify"), () => [
     field(
       "keep",
       slider(

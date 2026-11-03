@@ -41,6 +41,7 @@
 
 import * as demo from "./demo";
 import { isMissingMethodError, notify } from "./notify";
+import { t } from "./i18n";
 import { toast } from "./ui";
 import type {
   DiffReport,
@@ -682,10 +683,7 @@ export class Bridge {
       return { started: false, result: await this.demo.optimizeCustom(path, specJson, onProgress) };
     }
     if (!this.native?.methods.includes("optimizeCustom")) {
-      notify(
-        `backend has no optimizeCustom() — running the "${fallbackPreset}" preset instead`,
-        "error",
-      );
+      notify(t("toast.noOptimizeCustom", { preset: fallbackPreset }), "error");
       return this.optimize(path, fallbackPreset, onProgress);
     }
     try {
@@ -693,7 +691,7 @@ export class Bridge {
     } catch (err) {
       if (isMissingMethodError(err)) {
         notify(
-          `custom optimize unavailable (${(err as Error).message}) — running "${fallbackPreset}" instead`,
+          t("toast.customFallback", { message: (err as Error).message, preset: fallbackPreset }),
           "error",
         );
         return this.optimize(path, fallbackPreset, onProgress);
@@ -842,11 +840,11 @@ export class Bridge {
    */
   async openDialog(): Promise<OpenDialogResult> {
     if (!this.live) {
-      toast("run via assetty binary", "error");
+      toast(t("toast.runViaBinary"), "error");
       return { path: null };
     }
     if (!this.native || !this.native.methods.includes("openDialog")) {
-      toast("openDialog not available — rebuild the assetty binary", "error");
+      toast(t("toast.noOpenDialog"), "error");
       return { path: null };
     }
     const res = parseMaybeJson<unknown>(await this.raw("openDialog", []));
@@ -864,11 +862,11 @@ export class Bridge {
    */
   async pickSavePath(name?: string): Promise<OpenDialogResult> {
     if (!this.live) {
-      toast("run via assetty binary", "error");
+      toast(t("toast.runViaBinary"), "error");
       return { path: null };
     }
     if (!this.native || !this.native.methods.includes("pickSavePath")) {
-      toast("pickSavePath not available — rebuild the assetty binary", "error");
+      toast(t("toast.noSavePath"), "error");
       return { path: null };
     }
     const suggestion = name?.trim() ? name : "model.opt.glb";
@@ -886,7 +884,7 @@ export class Bridge {
    * `exportDone`; rejects when another pipeline job owns the gate.
    */
   async exportTo(src: string, dst: string): Promise<{ started: true }> {
-    if (!this.live) throw new Error("demo mode — export needs the assetty binary");
+    if (!this.live) throw new Error(t("toast.demoExport"));
     const res = parseMaybeJson<unknown>(await this.raw("exportTo", [src, dst]));
     if (isStartedAck(res)) return { started: true };
     throw new Error("export not acknowledged by the host");
