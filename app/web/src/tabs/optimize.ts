@@ -259,6 +259,9 @@ export function mountOptimize(): TabHandle {
   /** Last progress state, so a language switch can re-render the strip. */
   let progressStep = "";
   let progressPct = 0;
+  /** Texture sub-progress (optimize-textures step): `{done,total}`, max kept. */
+  let progressDone = -1;
+  let progressTotal = 0;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
   /** Removes the split-mode master→slave camera sync (null when inactive). */
@@ -604,18 +607,35 @@ export function mountOptimize(): TabHandle {
 
   /** Renders the progress strip from the last known state. */
   function renderProgress(): void {
-    progressMeta.textContent =
+    const base =
       progressStep || progressPct > 0
         ? `${progressStep || t("opt.working")} · ${Math.round(progressPct)}%`
         : t("opt.progressIdle");
+    progressMeta.textContent =
+      progressDone >= 0
+        ? `${base} · ${t("progress.texture", { done: progressDone, total: progressTotal })}`
+        : base;
     progressFill.style.width = `${progressPct}%`;
   }
 
-  function setProgress(step: string, pct: number): void {
+  function setProgress(step: string, pct: number, sub?: { done: number; total: number }): void {
     const clamped = Math.max(0, Math.min(100, pct));
     progressStep = step;
     progressPct = clamped;
+    if (sub) {
+      progressDone = Math.max(progressDone, sub.done);
+      progressTotal = sub.total;
+    } else {
+      // Outside the textures step the payload carries no sub: revert to plain.
+      resetSub();
+    }
     renderProgress();
+  }
+
+  /** Clears the texture sub-progress (new run / finished job). */
+  function resetSub(): void {
+    progressDone = -1;
+    progressTotal = 0;
   }
 
   function setLog(message: string): void {
@@ -695,6 +715,7 @@ export function mountOptimize(): TabHandle {
 
   function finishJobError(message: string): void {
     stopJob();
+    resetSub();
     setProgress(t("common.failed"), 0);
     notify(t("opt.failedMsg", { message }), "error");
   }
@@ -863,6 +884,7 @@ export function mountOptimize(): TabHandle {
     }
     lastResult = event.result;
     stopJob();
+    resetSub();
     setProgress(t("common.done"), 100);
     renderReport(event.result);
     noteResult(event.result);
@@ -1011,6 +1033,7 @@ export function mountOptimize(): TabHandle {
     /* The run supersedes the previous result: drop it before doing any work. */
     lastResult = null;
     resetReport();
+    resetSub();
     setProgress(t("opt.starting"), 0);
     try {
       const call = await app.bridge.optimizeCustom(
@@ -1018,7 +1041,12 @@ export function mountOptimize(): TabHandle {
         specJson,
         activePreset || "desktop",
         (p) => {
-          if (running) setProgress(p.step || t("opt.runningShort"), p.pct);
+          if (running)
+            setProgress(
+              p.step || t("opt.runningShort"),
+              p.pct,
+              p.sub?.label === "texture" ? { done: p.sub.done, total: p.sub.total } : undefined,
+            );
         },
       );
       if (call.started) {
@@ -1042,6 +1070,7 @@ export function mountOptimize(): TabHandle {
       // Older hosts: the call itself returned the finished report.
       lastResult = call.result;
       stopJob();
+      resetSub();
       setProgress(t("common.done"), 100);
       renderReport(call.result);
       noteResult(call.result);

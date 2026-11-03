@@ -54,6 +54,10 @@ const en: Dict = {
   "topbar.errorMsg": "error: {message}",
   "topbar.mountFailed": "failed to mount {id}: {message}",
   "topbar.ktx2Missing": "KTX2 decoders unavailable: {list}",
+  "topbar.openCaret": "Recent folders",
+  "topbar.noRecentDirs": "no recent folders",
+  "topbar.recentLoading": "loading…",
+  "topbar.noModelsInDir": "no models here",
 
   // common
   "common.open": "Open…",
@@ -355,6 +359,15 @@ const en: Dict = {
   "toast.inspNoScene": "Inspector — no scene",
   "toast.inspMeshes": "Inspector — {n} meshes",
 
+  // drag & drop open
+  "drop.dropToOpen": "Drop to open",
+  "drop.opening": "Opening {name}…",
+  "drop.badExt": "{name} is not a model (.glb/.gltf only)",
+  "drop.failed": "drop failed: {message}",
+
+  // background texture progress ("texture 3/7")
+  "progress.texture": "texture {done}/{total}",
+
   // field help button chrome
   "help.whatDoes": "what does this do?",
   "help.aria": "help: {id}",
@@ -438,6 +451,10 @@ const ru: Dict = {
   "topbar.errorMsg": "ошибка: {message}",
   "topbar.mountFailed": "не удалось подключить {id}: {message}",
   "topbar.ktx2Missing": "декодеры KTX2 недоступны: {list}",
+  "topbar.openCaret": "Недавние папки",
+  "topbar.noRecentDirs": "нет недавних папок",
+  "topbar.recentLoading": "загрузка…",
+  "topbar.noModelsInDir": "моделей нет",
 
   "common.open": "Открыть…",
   "common.cancel": "Отмена",
@@ -732,6 +749,13 @@ const ru: Dict = {
   "toast.inspectorCloseFail": "не закрыть инспектор: {message}",
   "toast.inspNoScene": "Инспектор — нет сцены",
   "toast.inspMeshes": "Инспектор — мешей: {n}",
+
+  "drop.dropToOpen": "Отпустите, чтобы открыть",
+  "drop.opening": "Открытие {name}…",
+  "drop.badExt": "{name} — не модель (только .glb/.gltf)",
+  "drop.failed": "ошибка сброса: {message}",
+
+  "progress.texture": "текстура {done}/{total}",
 
   "help.whatDoes": "что это делает?",
   "help.aria": "справка: {id}",

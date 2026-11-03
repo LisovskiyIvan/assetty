@@ -45,6 +45,7 @@ function schemaSample(): string {
   return `{
   "theme": "dark",
   "language": "en",
+  "recent_dirs": ["/models", "/downloads"],
   "optimize": {
     "steps": {
       "prune":    { "enabled": true, "unused_nodes": true,
@@ -102,7 +103,7 @@ export function mountSettings(): TabHandle {
   const infoText = el("span", { text: t("set.info") });
   const infoSchema = el("span", {
     class: "mono",
-    text: "{ theme, language, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
+    text: "{ theme, language, recent_dirs, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
   });
   const info = el("div", { class: "hint settings-info" }, infoText, infoSchema);
 

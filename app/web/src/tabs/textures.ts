@@ -65,6 +65,9 @@ export function mountTextures(): TabHandle {
   const applyBtn = el("button", { class: "primary", text: t("tex.apply") });
   const applyParams = el("span", { class: "muted mono" });
   const applyStatus = el("span", { class: "muted mono", text: t("common.idle") });
+  /** Compact "texture 3/7" line while a textures-only run is in flight. */
+  const applySubLine = el("div", { class: "hint mono" });
+  applySubLine.hidden = true;
   /** Which file each action targets (preview sees the view, apply reads the source). */
   const previewActs = el("div", { class: "hint muted mono" });
   const applyActs = el("div", { class: "hint muted mono" });
@@ -77,6 +80,7 @@ export function mountTextures(): TabHandle {
     { class: "panel-body" },
     applyHint,
     el("div", { class: "row" }, applyBtn, applyParams),
+    applySubLine,
     applyActs,
     overridesNote,
     firstRunHint,
@@ -1038,6 +1042,25 @@ export function mountTextures(): TabHandle {
   let applySeq = 0;
   let applyTimer: ReturnType<typeof setTimeout> | null = null;
   let stopApplyProgress: (() => void) | null = null;
+  /** Texture sub-progress for the in-flight apply (max kept, -1 = none). */
+  let applyDone = -1;
+  let applyTotal = 0;
+
+  function renderApplySub(): void {
+    if (applyRunning && applyDone >= 0) {
+      applySubLine.hidden = false;
+      applySubLine.textContent = t("progress.texture", { done: applyDone, total: applyTotal });
+    } else {
+      applySubLine.hidden = true;
+      applySubLine.textContent = "";
+    }
+  }
+
+  function resetApplySub(): void {
+    applyDone = -1;
+    applyTotal = 0;
+    renderApplySub();
+  }
   /** True while an exportTo copy is in flight; `pendingDst` matches its event. */
   let exporting = false;
   let pendingDst: string | null = null;
@@ -1101,6 +1124,7 @@ export function mountTextures(): TabHandle {
     stopApplyProgress?.();
     stopApplyProgress = null;
     applyRunning = false;
+    resetApplySub();
     syncApplyBar();
   }
 
@@ -1240,6 +1264,9 @@ export function mountTextures(): TabHandle {
     }
     const token = ++applySeq;
     applyRunning = true;
+    applyDone = -1;
+    applyTotal = 0;
+    renderApplySub();
     applyBtn.disabled = true;
     applyBtn.textContent = t("tex.applying");
     setApplyStatus(t("tex.stStarting"));
@@ -1247,8 +1274,16 @@ export function mountTextures(): TabHandle {
     const specJson = JSON.stringify({ steps: [{ textures: textureStep(override) }] });
     try {
       const call = await app.bridge.optimizeCustom(path, specJson, "desktop", (p) => {
-        if (token === applySeq && applyRunning)
+        if (token === applySeq && applyRunning) {
           setApplyStatus(`${p.step || t("opt.runningShort")} ${p.pct}%`);
+          if (p.sub?.label === "texture") {
+            applyDone = Math.max(applyDone, p.sub.done);
+            applyTotal = p.sub.total;
+            renderApplySub();
+          } else {
+            resetApplySub();
+          }
+        }
       });
       if (token !== applySeq || !applyRunning) return; // superseded while awaiting
       if (call.started) {
@@ -1327,6 +1362,7 @@ export function mountTextures(): TabHandle {
       applyBtn.textContent = t("tex.applying");
     }
     syncApplyBar();
+    renderApplySub();
     renderList();
     renderSide();
   });
@@ -1355,6 +1391,7 @@ export function mountTextures(): TabHandle {
     stopApplyProgress?.();
     stopApplyProgress = null;
     applyRunning = false;
+    resetApplySub();
     exporting = false;
     pendingDst = null;
     syncApplyBar();

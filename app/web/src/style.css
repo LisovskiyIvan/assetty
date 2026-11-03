@@ -1773,6 +1773,107 @@ tr.skipped td {
   right: 10px;
 }
 
+/* --- open split button + recent-dirs menu --- */
+.open-split {
+  display: inline-flex;
+  flex: none;
+  min-width: 0;
+}
+
+.open-split .primary:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 0;
+}
+
+.open-split .caret {
+  padding: 6px 8px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.recent-menu {
+  position: absolute;
+  top: 46px;
+  right: 12px;
+  z-index: 150;
+  width: min(340px, calc(100vw - 24px));
+  max-height: min(50vh, 380px);
+  overflow: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px var(--shadow-strong);
+  padding: 4px;
+}
+
+.recent-menu[hidden] {
+  display: none;
+}
+
+.recent-dir,
+.recent-file {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-dir:hover,
+.recent-file:hover:not(:disabled) {
+  background: var(--accent-dim);
+  border: 0;
+}
+
+.recent-files {
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+  margin-left: 10px;
+}
+
+.recent-files[hidden] {
+  display: none;
+}
+
+.recent-empty,
+.recent-loading {
+  padding: 8px 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* --- full-window drop overlay --- */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  background: var(--overlay-strong);
+  border: 3px dashed var(--accent-border);
+  border-radius: 12px;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent-fg);
+  pointer-events: none;
+}
+
+.drop-overlay[hidden] {
+  display: none;
+}
+
 /* --- optimize report: per-image rows of the textures step --- */
 .step-image {
   display: grid;

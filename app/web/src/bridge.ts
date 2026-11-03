@@ -61,6 +61,7 @@ import type {
 export interface ProgressEvent {
   step: string;
   pct: number;
+  sub?: { label: string; done: number; total: number };
 }
 
 /** Result of the native file picker. `path` is null when the user cancels. */
@@ -114,6 +115,9 @@ const METHOD_NAMES = [
   "presetSave",
   "settingsLoad",
   "settingsSave",
+  "dropFile",
+  "openDialogAt",
+  "listDir",
 ] as const;
 
 type AnyFn = (...args: unknown[]) => unknown;
@@ -634,7 +638,19 @@ export class Bridge {
     if (!onProgress) return () => {};
     return this.on("progress", (payload) => {
       const p = (payload ?? {}) as Record<string, unknown>;
-      onProgress({ step: String(p.step ?? ""), pct: asNumber(p.pct ?? p.progress) });
+      const event: ProgressEvent = {
+        step: String(p.step ?? ""),
+        pct: asNumber(p.pct ?? p.progress),
+      };
+      const sub = p.sub as Record<string, unknown> | undefined;
+      if (sub && typeof sub === "object") {
+        const done = asNumber(sub.done, NaN);
+        const total = asNumber(sub.total, NaN);
+        if (Number.isFinite(done) && Number.isFinite(total)) {
+          event.sub = { label: String(sub.label ?? ""), done, total };
+        }
+      }
+      onProgress(event);
     });
   }
 
@@ -853,6 +869,61 @@ export class Bridge {
     const obj = res as Record<string, unknown>;
     const p = obj.path ?? obj.file;
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
+  }
+
+  async openDialogAt(dir?: string | null): Promise<OpenDialogResult> {
+    if (!this.live) {
+      toast(t("toast.runViaBinary"), "error");
+      return { path: null };
+    }
+    if (this.native && this.native.methods.includes("openDialogAt")) {
+      const seed = dir?.trim() ? dir.trim() : null;
+      const res = parseMaybeJson<unknown>(await this.raw("openDialogAt", seed ? [seed] : []));
+      if (res == null) return { path: null };
+      if (typeof res === "string") return { path: res.trim() || null };
+      const obj = res as Record<string, unknown>;
+      const p = obj.path ?? obj.file;
+      return { path: p == null || String(p).trim() === "" ? null : String(p) };
+    }
+    return this.openDialog();
+  }
+
+  /**
+   * Writes dropped bytes to `.zig-cache/assetty-app/drops/` on the host.
+   * Resolves `{ path }` to the staged file (errors arrive as thrown Errors).
+   */
+  async dropFile(name: string, b64: string): Promise<OpenDialogResult> {
+    if (!this.live) {
+      toast(t("toast.runViaBinary"), "error");
+      return { path: `/demo/${name}` };
+    }
+    if (!this.native || !this.native.methods.includes("dropFile")) {
+      throw new Error("backend has no dropFile()");
+    }
+    const res = parseMaybeJson<unknown>(await this.raw("dropFile", [name, b64]));
+    if (res == null) return { path: null };
+    if (typeof res === "string") return { path: res.trim() || null };
+    const obj = res as Record<string, unknown>;
+    const p = obj.path ?? obj.file;
+    return { path: p == null || String(p).trim() === "" ? null : String(p) };
+  }
+
+  /** Lists directory entries (absolute paths) seeded for the recent-dirs menu. */
+  async listDir(dir: string): Promise<string[]> {
+    if (!this.live) return [];
+    if (!this.native || !this.native.methods.includes("listDir")) return [];
+    const res = parseMaybeJson<unknown>(await this.raw("listDir", [dir]));
+    const pick = (v: unknown): string[] => {
+      if (Array.isArray(v)) return v.map(String);
+      if (v && typeof v === "object") {
+        const o = v as Record<string, unknown>;
+        for (const key of ["files", "entries", "paths", "children"]) {
+          if (Array.isArray(o[key])) return (o[key] as unknown[]).map(String);
+        }
+      }
+      return [];
+    };
+    return pick(res);
   }
 
   /**

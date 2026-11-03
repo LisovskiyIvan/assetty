@@ -2,6 +2,7 @@
 import { Bridge } from "./bridge";
 import { t } from "./i18n";
 import { toast } from "./ui";
+import { getRecentDirs, recordRecentDirFor } from "./settings";
 import type { Info } from "./types";
 import type { ViewerScene } from "./viewer";
 
@@ -49,8 +50,13 @@ export class App {
 
   /** Opens the native picker and returns the chosen path (null on cancel/failure). */
   async pickPath(): Promise<string | null> {
+    return this.pickPathAt(getRecentDirs()[0] ?? null);
+  }
+
+  /** Native picker seeded at `dir` (null = default location). */
+  async pickPathAt(dir: string | null): Promise<string | null> {
     try {
-      const res = await this.bridge.openDialog();
+      const res = await this.bridge.openDialogAt(dir);
       return res.path;
     } catch (err) {
       toast(t("toast.openFailed", { message: (err as Error).message }), "error");
@@ -58,7 +64,7 @@ export class App {
     }
   }
 
-  /** Native picker + the shared "model opened" state update. */
+  /** Native picker (seeded at the most recent dir) + shared "model opened" state. */
   async pickAndOpen(): Promise<string | null> {
     const path = await this.pickPath();
     if (!path) return null;
@@ -72,6 +78,11 @@ export class App {
     this.viewPath = path;
     // The previous model's info no longer describes what is on screen.
     this.info = null;
+    try {
+      recordRecentDirFor(path);
+    } catch {
+      // recent-dirs bookkeeping must never break an open
+    }
     this.emit("source", { path });
     this.emit("view", { path });
     this.emit("path", { path });
@@ -87,6 +98,11 @@ export class App {
   useAsSource(path: string): void {
     this.sourcePath = path;
     this.info = null;
+    try {
+      recordRecentDirFor(path);
+    } catch {
+      // recent-dirs bookkeeping must never break an open
+    }
     this.emit("source", { path });
     this.emit("path", { path });
   }

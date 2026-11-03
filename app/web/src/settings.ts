@@ -9,6 +9,7 @@
  * {
  *   "theme": "dark" | "light",
  *   "language": "en" | "ru",
+ *   "recent_dirs": string[] (absolute dirs, most-recent-first, cap 8),
  *   "optimize": {
  *     "steps": {
  *       "prune":    { "enabled": true, "unused_nodes": true, "unused_materials": true, "unused_textures": true },
@@ -143,6 +144,7 @@ export interface OptimizeSteps {
 export interface Settings {
   theme: ThemeMode;
   language: Language;
+  recent_dirs: string[];
   optimize: { steps: OptimizeSteps; per_model: Record<string, PerModelEntry> };
 }
 
@@ -163,6 +165,7 @@ export function defaultSettings(): Settings {
   return {
     theme: "dark",
     language: detectLanguage(),
+    recent_dirs: [],
     optimize: {
       steps: {
         prune: {
@@ -410,6 +413,7 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
 
   out.theme = readEnum(raw, "theme", out.theme, THEMES, "theme", strict);
   out.language = readEnum(raw, "language", out.language, LANGUAGES, "language", strict);
+  out.recent_dirs = readRecentDirs(raw, strict);
 
   const optimize = readObject(raw, "optimize", "optimize", strict);
   const stepsRaw = readObject(optimize, "steps", "optimize.steps", strict);
@@ -693,6 +697,67 @@ function sanitizeTextureOverride(
     out[key] = v;
   }
   return Object.keys(out).length > 0 ? out : null;
+}
+
+function isAbsDir(p: string): boolean {
+  return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p);
+}
+
+export const RECENT_DIRS_LIMIT = 8;
+
+/** Normalizes `recent_dirs`: absolute dirs only, deduped, most-recent-first, cap 8. */
+function readRecentDirs(raw: Record<string, unknown>, strict: boolean): string[] {
+  const value = raw["recent_dirs"];
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    if (strict) throw new SettingsError("recent_dirs must be an array of strings");
+    return [];
+  }
+  if (strict) {
+    for (const entry of value) {
+      if (typeof entry !== "string")
+        throw new SettingsError("recent_dirs must be an array of strings");
+    }
+  }
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed || !isAbsDir(trimmed) || out.includes(trimmed)) continue;
+    out.push(trimmed);
+    if (out.length >= RECENT_DIRS_LIMIT) break;
+  }
+  return out;
+}
+
+/** Most-recent-first absolute dirs (frontend-owned, cap 8). */
+export function getRecentDirs(): string[] {
+  return current.recent_dirs.slice();
+}
+
+/** Records a source dir: most-recent-first, deduped, cap 8, absolute only. */
+export function pushRecentDir(dir: string | null | undefined): void {
+  if (!dir || !isAbsDir(dir)) return;
+  updateSettings((settings) => {
+    settings.recent_dirs = [dir, ...settings.recent_dirs.filter((d) => d !== dir)].slice(
+      0,
+      RECENT_DIRS_LIMIT,
+    );
+  });
+}
+
+/** dirname() of a source path (null when there is no dir part). */
+export function dirnameOf(path: string): string | null {
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  if (idx <= 0) return null;
+  const dir = trimmed.slice(0, idx);
+  return isAbsDir(dir) ? dir : null;
+}
+
+/** Records `dirname(sourcePath)` after every successful source open. */
+export function recordRecentDirFor(sourcePath: string): void {
+  pushRecentDir(dirnameOf(sourcePath));
 }
 
 function readPerModel(

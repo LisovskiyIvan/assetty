@@ -11,6 +11,7 @@ import {
   saveSettings,
   setLanguage,
   settingsToJson,
+  getRecentDirs,
   themeMode,
   toggleTheme,
 } from "./settings";
@@ -73,6 +74,211 @@ const openBtn = el("button", {
   onclick: () => void app.pickAndOpen(),
 });
 
+/* Split affordance: main button opens at the most recent dir, ▾ lists recents. */
+const caretBtn = el("button", {
+  class: "primary caret",
+  text: "▾",
+  title: t("topbar.openCaret"),
+  ["aria-label"]: t("topbar.openCaret"),
+  onclick: (ev: Event) => {
+    ev.stopPropagation();
+    void toggleRecentMenu();
+  },
+});
+const openSplit = el("div", { class: "open-split" }, openBtn, caretBtn);
+const recentMenu = el("div", { class: "recent-menu" });
+recentMenu.hidden = true;
+
+function shortName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+function closeRecentMenu(): void {
+  recentMenu.hidden = true;
+  clear(recentMenu);
+}
+
+async function toggleRecentMenu(): Promise<void> {
+  if (!recentMenu.hidden) {
+    closeRecentMenu();
+    return;
+  }
+  await renderRecentMenu();
+  recentMenu.hidden = false;
+}
+
+async function renderRecentMenu(): Promise<void> {
+  clear(recentMenu);
+  const dirs = getRecentDirs();
+  if (dirs.length === 0) {
+    recentMenu.append(el("div", { class: "recent-empty", text: t("topbar.noRecentDirs") }));
+    return;
+  }
+  for (const dir of dirs) {
+    const row = el("button", {
+      class: "recent-dir",
+      text: shortName(dir),
+      title: dir,
+    });
+    const filesHost = el("div", { class: "recent-files" });
+    filesHost.hidden = true;
+    let loaded = false;
+    let loading = false;
+    row.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (!filesHost.hidden) {
+        filesHost.hidden = true;
+        return;
+      }
+      // Collapse the other dirs' lists.
+      for (const other of Array.from(recentMenu.querySelectorAll(".recent-files"))) {
+        (other as HTMLElement).hidden = true;
+      }
+      filesHost.hidden = false;
+      if (loaded || loading) return;
+      loading = true;
+      clear(filesHost);
+      filesHost.append(el("div", { class: "recent-loading", text: t("topbar.recentLoading") }));
+      void app.bridge
+        .listDir(dir)
+        .then((entries) => {
+          loading = false;
+          loaded = true;
+          clear(filesHost);
+          const models = entries
+            .filter((p) => /\.(glb|gltf)$/i.test(p))
+            .sort((a, b) => a.localeCompare(b))
+            .slice(0, 12);
+          if (models.length === 0) {
+            filesHost.append(el("div", { class: "recent-empty", text: t("topbar.noModelsInDir") }));
+            return;
+          }
+          for (const file of models) {
+            filesHost.append(
+              el("button", {
+                class: "recent-file",
+                text: shortName(file),
+                title: file,
+                onclick: (ev2: Event) => {
+                  ev2.stopPropagation();
+                  closeRecentMenu();
+                  app.openSource(file);
+                },
+              }),
+            );
+          }
+        })
+        .catch(() => {
+          loading = false;
+          loaded = false;
+          clear(filesHost);
+          filesHost.append(el("div", { class: "recent-empty", text: t("topbar.noModelsInDir") }));
+        });
+    });
+    recentMenu.append(el("div", { class: "recent-group" }, row, filesHost));
+  }
+}
+
+document.addEventListener("click", (ev) => {
+  if (recentMenu.hidden) return;
+  const target = ev.target as Node | null;
+  if (target && (recentMenu.contains(target) || caretBtn.contains(target))) return;
+  closeRecentMenu();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && !recentMenu.hidden) closeRecentMenu();
+});
+
+/* -------------------------------------------------- drag & drop to open */
+
+function isModelName(name: string): boolean {
+  return /\.(glb|gltf)$/i.test(name);
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+const dropOverlay = el(
+  "div",
+  { class: "drop-overlay" },
+  el("span", { text: t("drop.dropToOpen") }),
+);
+dropOverlay.hidden = true;
+let dragDepth = 0;
+
+function hasFilesTransfer(ev: DragEvent): boolean {
+  const types = ev.dataTransfer?.types;
+  if (!types) return false;
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === "Files") return true;
+  }
+  return false;
+}
+
+window.addEventListener("dragenter", (ev) => {
+  if (!hasFilesTransfer(ev)) return;
+  ev.preventDefault();
+  dragDepth++;
+  dropOverlay.hidden = false;
+  const label = dropOverlay.querySelector("span");
+  if (label) label.textContent = t("drop.dropToOpen");
+});
+window.addEventListener("dragover", (ev) => {
+  if (!hasFilesTransfer(ev)) return;
+  ev.preventDefault();
+  if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+});
+window.addEventListener("dragleave", (ev) => {
+  if (!hasFilesTransfer(ev)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) dropOverlay.hidden = true;
+});
+window.addEventListener("drop", (ev) => {
+  if (!hasFilesTransfer(ev)) {
+    dragDepth = 0;
+    dropOverlay.hidden = true;
+    return;
+  }
+  ev.preventDefault();
+  dragDepth = 0;
+  dropOverlay.hidden = true;
+  const files = ev.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  void handleDroppedFile(files[0]);
+});
+
+async function handleDroppedFile(file: File): Promise<void> {
+  if (!isModelName(file.name)) {
+    notify(t("drop.badExt", { name: file.name }), "error");
+    return;
+  }
+  let slowTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+    slowTimer = null;
+    notify(t("drop.opening", { name: file.name }), "info");
+  }, 300);
+  try {
+    const buf = await file.arrayBuffer();
+    const b64 = bytesToB64(new Uint8Array(buf));
+    const res = await app.bridge.dropFile(file.name, b64);
+    if (!res.path) return; // cancel-ish
+    app.openSource(res.path);
+  } catch (err) {
+    notify(t("drop.failed", { message: (err as Error).message }), "error");
+  } finally {
+    if (slowTimer) {
+      clearTimeout(slowTimer);
+      slowTimer = null;
+    }
+  }
+}
+
 /** The inspector belongs to the Viewer scene: closed by default, it opens
  * only on a successful viewer model load (see the `assetty:viewer-loaded`
  * hook below) and hides whenever the user leaves the Viewer tab. Returning
@@ -133,6 +339,9 @@ onLang(() => {
   syncLangSwitch();
   openBtn.textContent = t("topbar.open");
   openBtn.title = t("topbar.openTitle");
+  caretBtn.title = t("topbar.openCaret");
+  caretBtn.setAttribute("aria-label", t("topbar.openCaret"));
+  if (!recentMenu.hidden) void renderRecentMenu();
   inspectorBtn.textContent = t("topbar.inspector");
   inspectorBtn.title = t("topbar.inspectorTitle");
   infoBtn.title = t("topbar.recent");
@@ -263,7 +472,7 @@ appRoot.append(
     { class: "topbar" },
     el("span", { class: "brand", text: "assetty" }),
     tabBar,
-    el("div", { class: "topbar-actions" }, modePill, langSwitch, themeBtn, inspectorBtn, openBtn),
+    el("div", { class: "topbar-actions" }, modePill, langSwitch, themeBtn, inspectorBtn, openSplit),
   ),
   banner,
   content,
@@ -278,6 +487,8 @@ appRoot.append(
   ),
 );
 document.body.append(appRoot);
+appRoot.append(recentMenu);
+document.body.append(dropOverlay);
 
 /* ------------------------------------------------------------------ banner */
 
