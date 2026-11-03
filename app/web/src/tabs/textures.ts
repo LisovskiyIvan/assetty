@@ -2,6 +2,7 @@ import { app } from "../app";
 import { isBusyError } from "../bridge";
 import { isMissingMethodError, notify } from "../notify";
 import { closeFieldHelp, fieldHelpButton } from "../optimizeForm";
+import { onLang, t } from "../i18n";
 import {
   el,
   fmtBytes,
@@ -13,7 +14,6 @@ import {
   clear,
   copyText,
   emptyState,
-  OPEN_HINT,
   statChip,
   statChipNode,
 } from "../ui";
@@ -56,53 +56,46 @@ interface CompareImages {
 export function mountTextures(): TabHandle {
   const root = el("div", { class: "tab-body textures-tab" });
   const main = el("div", { class: "tab-main" });
-  const head = el(
-    "div",
-    { class: "panel-head" },
-    el("span", { text: "images" }),
-    el("span", { class: "muted mono", text: "images: view · apply: source" }),
-  );
+  const headLabel = el("span", { text: t("tex.images") });
+  const headNote = el("span", { class: "muted mono", text: t("tex.viewApply") });
+  const head = el("div", { class: "panel-head" }, headLabel, headNote);
   const listHost = el("div", { class: "texture-list" });
 
   /* Apply-to-model toolbar: sits above the list, next to the preview hint. */
-  const applyBtn = el("button", { class: "primary", text: "Apply to model…" });
+  const applyBtn = el("button", { class: "primary", text: t("tex.apply") });
   const applyParams = el("span", { class: "muted mono" });
-  const applyStatus = el("span", { class: "muted mono", text: "idle" });
+  const applyStatus = el("span", { class: "muted mono", text: t("common.idle") });
   /** Which file each action targets (preview sees the view, apply reads the source). */
   const previewActs = el("div", { class: "hint muted mono" });
   const applyActs = el("div", { class: "hint muted mono" });
   const overridesNote = el("div", { class: "hint muted mono" });
   const applyResultHost = el("div");
+  const applyHint = el("div", { class: "hint", text: t("tex.previewDry") });
+  const firstRunHint = el("div", { class: "hint", text: t("tex.firstRun") });
   const applyBar = el(
     "div",
     { class: "panel-body" },
-    el("div", {
-      class: "hint",
-      text: "Preview = dry run. The model file is not modified. To write KTX2 into a new file use Apply to model.",
-    }),
+    applyHint,
     el("div", { class: "row" }, applyBtn, applyParams),
     applyActs,
     overridesNote,
-    el("div", {
-      class: "hint",
-      text: "First run on 7×2048² textures takes ~30–40s; re-running on KTX2 is fast (skipped).",
-    }),
+    firstRunHint,
     el("div", { class: "hint" }, applyStatus),
     applyResultHost,
   );
 
   function basenameShort(path: string | null): string {
-    if (!path) return "—";
+    if (!path) return t("common.noFile");
     const parts = path.split(/[\\/]/).filter(Boolean);
     return parts.length > 0 ? parts[parts.length - 1] : path;
   }
 
   /** Refresh the "acts on <path>" lines under Preview / Apply. */
   function syncActsOn(): void {
-    previewActs.textContent = `preview acts on view: ${basenameShort(app.viewPath)}`;
-    previewActs.title = app.viewPath ?? "no file viewed";
-    applyActs.textContent = `apply acts on source: ${basenameShort(app.sourcePath)}`;
-    applyActs.title = app.sourcePath ?? "no source model";
+    previewActs.textContent = t("tex.previewActs", { name: basenameShort(app.viewPath) });
+    previewActs.title = app.viewPath ?? t("tex.noFileViewed");
+    applyActs.textContent = t("tex.applyActs", { name: basenameShort(app.sourcePath) });
+    applyActs.title = app.sourcePath ?? t("tex.noSource");
   }
   syncActsOn();
   main.append(head, applyBar, listHost);
@@ -138,7 +131,7 @@ export function mountTextures(): TabHandle {
 
   const encodeBtn = el("button", {
     class: "primary",
-    text: "Preview KTX2",
+    text: t("tex.encodeBtn"),
     disabled: true,
   });
 
@@ -160,7 +153,7 @@ export function mountTextures(): TabHandle {
   /* ---------------------------------------------------------------- detail pane */
 
   function previewLoadingInner(): HTMLElement {
-    return el("div", { class: "detail-loading" }, el("span", { class: "spin" }), "decoding image…");
+    return el("div", { class: "detail-loading" }, el("span", { class: "spin" }), t("tex.decoding"));
   }
 
   function renderPreviewInner(img: ImageInfo, shot: TexturePreview): HTMLElement {
@@ -180,13 +173,13 @@ export function mountTextures(): TabHandle {
       el(
         "div",
         { class: "preview-meta" },
-        el("div", { class: "hint", text: "as stored in the asset" }),
+        el("div", { class: "hint", text: t("tex.asStored") }),
         kv([
-          ["format", img.format],
-          ["size", dims],
-          ["disk", fmtBytes(img.disk)],
-          ["vram", fmtBytes(img.vram)],
-          ["mips", img.has_mips ? "yes" : "no"],
+          [t("tex.kvFormat"), img.format],
+          [t("tex.kvSize"), dims],
+          [t("tex.kvDisk"), fmtBytes(img.disk)],
+          [t("tex.kvVram"), fmtBytes(img.vram)],
+          [t("tex.kvMips"), img.has_mips ? t("tex.yes") : t("tex.no")],
         ]),
       ),
     );
@@ -206,37 +199,41 @@ export function mountTextures(): TabHandle {
   }
 
   function metricsRow(img: ImageInfo, res: EncodeResult): HTMLElement {
-    const mips = res.mip_levels != null ? String(res.mip_levels) : img.has_mips ? "yes" : "no";
+    const mips =
+      res.mip_levels != null ? String(res.mip_levels) : img.has_mips ? t("tex.yes") : t("tex.no");
     return el(
       "div",
       { class: "stat-row" },
-      deltaChip("disk", img.disk, res.ktx2_size),
+      deltaChip(t("tex.kvDisk"), img.disk, res.ktx2_size),
       statChipNode("PSNR", psnrBadge(res.psnr)),
-      deltaChip("VRAM est", img.vram, res.vram_after),
-      statChip("mips", mips).el,
-      res.width && res.height ? statChip("source", `${res.width}×${res.height}`).el : null,
+      deltaChip(t("tex.kvVram"), img.vram, res.vram_after),
+      statChip(t("tex.kvMips"), mips).el,
+      res.width && res.height ? statChip(t("tex.kvSource"), `${res.width}×${res.height}`).el : null,
     );
   }
 
   function appliedLine(res: EncodeResult): HTMLElement {
     const settings = res.settings;
     const parts: string[] = [];
-    if (settings?.format) parts.push(`format ${settings.format}`);
-    if (settings?.quality != null) parts.push(`quality ${settings.quality}`);
+    if (settings?.format) parts.push(t("tex.fFormat", { v: settings.format }));
+    if (settings?.quality != null) parts.push(t("tex.fQuality", { v: settings.quality }));
     if (settings?.max_size != null) {
-      parts.push(`max_size ${settings.max_size === 0 ? "original" : settings.max_size}`);
+      parts.push(
+        settings.max_size === 0 ? t("tex.fMaxOrig") : t("tex.fMaxSize", { v: settings.max_size }),
+      );
     }
     if (settings?.generate_mips != null) {
-      parts.push(`mips ${settings.generate_mips ? "on" : "off"}`);
+      parts.push(settings.generate_mips ? t("tex.fMipsOn") : t("tex.fMipsOff"));
     }
-    if (parts.length === 0 && res.format) parts.push(`codec ${res.format.toLowerCase()}`);
+    if (parts.length === 0 && res.format)
+      parts.push(t("tex.fCodec", { v: res.format.toLowerCase() }));
     return el(
       "div",
       { class: "applied-line" },
-      el("span", { class: "k", text: "applied" }),
+      el("span", { class: "k", text: t("tex.applied") }),
       el("span", {
         class: "v",
-        text: parts.length > 0 ? parts.join(" · ") : "not reported by this host",
+        text: parts.length > 0 ? parts.join(" · ") : t("tex.notReported"),
       }),
     );
   }
@@ -264,17 +261,17 @@ export function mountTextures(): TabHandle {
     const beforeUrl = loaded?.before ?? previewUrl(img.index);
     const afterUrl = loaded?.after ?? null;
     const out: HTMLElement[] = [
-      el("div", { class: "section-title", text: `Compare — ${compareTitle(res)}` }),
+      el("div", { class: "section-title", text: t("tex.compare", { title: compareTitle(res) }) }),
       el(
         "div",
         { class: "row" },
         el("button", {
           class: "small",
-          text: "Apply to model…",
-          title: "Write KTX2 with these preview settings into a new file",
+          text: t("tex.applyShortcut"),
+          title: t("tex.applyShortcutTitle"),
           onclick: () => void startApply(res.settings),
         }),
-        el("div", { class: "hint", text: "writes KTX2 with these settings" }),
+        el("div", { class: "hint", text: t("tex.writesWith") }),
       ),
     ];
     if (beforeUrl || afterUrl) {
@@ -282,11 +279,15 @@ export function mountTextures(): TabHandle {
         el(
           "div",
           { class: "compare-grid" },
-          comparePane("Original", beforeUrl, loaded ? "preview unavailable" : "loading…"),
+          comparePane(
+            t("tex.original"),
+            beforeUrl,
+            loaded ? t("tex.previewUnavailable") : t("tex.loadingPreviewsShort"),
+          ),
           comparePane(
             compareTitle(res),
             afterUrl,
-            loaded ? "host returned metrics only" : "loading…",
+            loaded ? t("tex.hostMetricsOnly") : t("tex.loadingPreviewsShort"),
           ),
         ),
       );
@@ -294,9 +295,7 @@ export function mountTextures(): TabHandle {
       out.push(
         el("div", {
           class: "hint",
-          text: loaded
-            ? "no before/after previews — this host returned metrics only"
-            : "loading previews…",
+          text: loaded ? t("tex.noPreviews") : t("tex.loadingPreviews"),
         }),
       );
     }
@@ -307,16 +306,16 @@ export function mountTextures(): TabHandle {
   /* ------------------------------------------------------------------- list */
 
   function rowBadge(img: ImageInfo): HTMLElement {
-    if (img.skipped) return el("span", { class: "badge dim", text: "skipped" });
+    if (img.skipped) return el("span", { class: "badge dim", text: t("tex.skipped") });
     if (activeEncode?.index === img.index) {
-      return el("span", { class: "badge yellow", text: "previewing…" });
+      return el("span", { class: "badge yellow", text: t("tex.previewing") });
     }
     if (previewing === img.index) {
-      return el("span", { class: "badge dim", text: "loading…" });
+      return el("span", { class: "badge dim", text: t("tex.loading") });
     }
     return img.has_mips
-      ? el("span", { class: "badge green", text: "mips" })
-      : el("span", { class: "badge dim", text: "no mips" });
+      ? el("span", { class: "badge green", text: t("tex.mips") })
+      : el("span", { class: "badge dim", text: t("tex.noMips") });
   }
 
   /** Deviation from base params for one row (`uastc · 512 · q200`, `skipped`). */
@@ -324,10 +323,10 @@ export function mountTextures(): TabHandle {
     const src = app.sourcePath;
     const dev = src ? describeTextureDeviation(src, img.index, img.name) : null;
     const badge = el("span", {
-      class: `badge ${dev === "skipped" ? "dim" : "accent"}`,
+      class: `badge ${dev === t("tex.skipped") ? "dim" : "accent"}`,
       text: dev ?? "",
       dataset: { ovbadge: String(img.index) },
-      title: "per-texture override (deviation from base params)",
+      title: t("tex.ovTitle"),
     });
     badge.hidden = !dev;
     return badge;
@@ -336,6 +335,7 @@ export function mountTextures(): TabHandle {
   /** Updates row + side-panel badges in place (no rebuild, so editors keep focus). */
   function refreshOverrideBadges(): void {
     const src = app.sourcePath;
+    const skippedLabel = t("tex.skipped");
     for (const node of Array.from(listHost.querySelectorAll("[data-ovbadge]"))) {
       const badge = node as HTMLElement;
       const img = images.find((i) => i.index === Number(badge.dataset.ovbadge));
@@ -343,8 +343,8 @@ export function mountTextures(): TabHandle {
       badge.hidden = !dev;
       if (dev) {
         badge.textContent = dev;
-        badge.classList.toggle("dim", dev === "skipped");
-        badge.classList.toggle("accent", dev !== "skipped");
+        badge.classList.toggle("dim", dev === skippedLabel);
+        badge.classList.toggle("accent", dev !== skippedLabel);
       }
     }
     for (const node of Array.from(side.querySelectorAll("[data-sidebadge]"))) {
@@ -354,8 +354,8 @@ export function mountTextures(): TabHandle {
       badge.hidden = !dev;
       if (dev) {
         badge.textContent = dev;
-        badge.classList.toggle("dim", dev === "skipped");
-        badge.classList.toggle("accent", dev !== "skipped");
+        badge.classList.toggle("dim", dev === skippedLabel);
+        badge.classList.toggle("accent", dev !== skippedLabel);
       }
     }
   }
@@ -364,17 +364,20 @@ export function mountTextures(): TabHandle {
     clear(listHost);
     if (images.length === 0) {
       if (app.sourcePath) {
-        listHost.append(el("div", { class: "empty", text: "no images in this asset" }));
+        listHost.append(el("div", { class: "empty", text: t("tex.noImages") }));
       } else if (app.viewPath) {
         listHost.append(
-          emptyState("No source model — open one (⌘O) or use as source", {
-            label: "Open…",
+          emptyState(t("viewer.noSourceHint"), {
+            label: t("common.open"),
             onClick: () => void app.pickAndOpen(),
           }),
         );
       } else {
         listHost.append(
-          emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() }),
+          emptyState(t("viewer.openHint"), {
+            label: t("common.open"),
+            onClick: () => void app.pickAndOpen(),
+          }),
         );
       }
       return;
@@ -418,12 +421,12 @@ export function mountTextures(): TabHandle {
           el(
             "tr",
             null,
-            el("th", { text: "#" }),
-            el("th", { text: "name" }),
-            el("th", { text: "format" }),
-            el("th", { class: "num", text: "size" }),
-            el("th", { class: "num", text: "disk" }),
-            el("th", { class: "num", text: "vram" }),
+            el("th", { text: t("tex.colNum") }),
+            el("th", { text: t("tex.colName") }),
+            el("th", { text: t("tex.colFormat") }),
+            el("th", { class: "num", text: t("tex.colSize") }),
+            el("th", { class: "num", text: t("tex.colDisk") }),
+            el("th", { class: "num", text: t("tex.colVram") }),
             el("th", { text: "" }),
           ),
         ),
@@ -438,12 +441,12 @@ export function mountTextures(): TabHandle {
   function effectiveFor(img: ImageInfo): EncodeSettings {
     const src = app.sourcePath;
     if (!src) {
-      const t = getSettings().optimize.steps.textures;
+      const b = getSettings().optimize.steps.textures;
       return {
-        format: t.format,
-        quality: t.quality,
-        max_size: t.max_size,
-        generate_mips: t.generate_mips,
+        format: b.format,
+        quality: b.quality,
+        max_size: b.max_size,
+        generate_mips: b.generate_mips,
       };
     }
     const eff = effectiveTextureParams(src, img.index, img.name);
@@ -482,14 +485,20 @@ export function mountTextures(): TabHandle {
     ["no", "no"],
   ];
 
+  /** Localized caption for an override option value. */
+  function ovLabel(group: "format" | "size" | "binary" | "ternary", value: string): string {
+    if (value === "base") return t("common.base");
+    if (group === "size" && value === "original") return t("common.original");
+    if (group === "binary") return value === "on" ? t("common.on") : t("common.off");
+    if (group === "ternary") return value === "yes" ? t("common.yes") : t("common.no");
+    return value;
+  }
+
   /** Expandable per-texture editor. Overrides are stored per source model. */
   function overrideEditor(img: ImageInfo): HTMLElement {
     const src = app.sourcePath;
     if (!src) {
-      return el("div", {
-        class: "hint",
-        text: "Open a source model to edit per-texture overrides (overrides apply to source).",
-      });
+      return el("div", { class: "hint", text: t("tex.openSourceHint") });
     }
     const base = getSettings().optimize.steps.textures;
     const found = textureOverrideForImage(src, img.index);
@@ -519,13 +528,15 @@ export function mountTextures(): TabHandle {
     const mkSelect = (
       label: string,
       options: Array<[string, string]>,
+      group: "format" | "size" | "binary" | "ternary",
       get: () => string,
       set: (value: string) => void,
       title?: string,
       helpId?: string,
     ): HTMLElement => {
       const node = el("select", { class: "compact", title });
-      for (const [text, value] of options) node.append(el("option", { value, text }));
+      for (const [text, value] of options)
+        node.append(el("option", { value, text: ovLabel(group, text) }));
       node.value = get();
       node.addEventListener("change", () => {
         set(node.value);
@@ -540,12 +551,13 @@ export function mountTextures(): TabHandle {
       mkSelect(
         "format",
         OV_FORMATS,
+        "format",
         () => draft.format ?? "base",
         (v) => {
           if (v === "base") delete draft.format;
           else draft.format = v as TextureFormat;
         },
-        `base: ${base.format}`,
+        t("tex.baseTitle", { v: base.format }),
       ),
     );
 
@@ -555,8 +567,8 @@ export function mountTextures(): TabHandle {
       max: 255,
       step: 1,
       class: "compact",
-      title: `base: ${base.quality} (empty = inherit)`,
-      placeholder: `base ${base.quality}`,
+      title: t("tex.baseTitle", { v: base.quality }),
+      placeholder: t("tex.baseTitle", { v: base.quality }),
     });
     qualityInput.value = draft.quality !== undefined ? String(draft.quality) : "";
     qualityInput.addEventListener("change", () => {
@@ -573,37 +585,40 @@ export function mountTextures(): TabHandle {
       mkSelect(
         "max size",
         OV_SIZES,
+        "size",
         () => (draft.max_size !== undefined ? String(draft.max_size) : "base"),
         (v) => {
           if (v === "base") delete draft.max_size;
           else draft.max_size = Number(v);
         },
-        `base: ${base.max_size === 0 ? "original" : base.max_size}`,
+        t("tex.baseTitle", { v: base.max_size === 0 ? t("common.original") : base.max_size }),
       ),
       mkSelect(
         "mips",
         OV_BINARY,
+        "binary",
         () => (draft.generate_mips === undefined ? "base" : draft.generate_mips ? "on" : "off"),
         (v) => {
           if (v === "base") delete draft.generate_mips;
           else draft.generate_mips = v === "on";
         },
-        `base: ${base.generate_mips ? "on" : "off"}`,
+        base.generate_mips ? t("tex.baseMipsOn") : t("tex.baseMipsOff"),
       ),
       mkSelect(
         "normal",
         OV_TERNARY,
+        "ternary",
         () => (draft.normal_map === undefined ? "base" : draft.normal_map ? "yes" : "no"),
         (v) => {
           if (v === "base") delete draft.normal_map;
           else draft.normal_map = v === "yes";
         },
-        "normal_map: hint for the encoder",
+        t("tex.normalHint"),
         "textures.normal_map",
       ),
     );
 
-    const skipBox = el("input", { type: "checkbox", title: "leave as-is (not encoded)" });
+    const skipBox = el("input", { type: "checkbox", title: t("tex.skipHint") });
     skipBox.checked = draft.skip === true;
     skipBox.addEventListener("change", () => {
       if (skipBox.checked) draft.skip = true;
@@ -613,9 +628,9 @@ export function mountTextures(): TabHandle {
     form.append(
       el(
         "label",
-        { class: "inline-check", title: "skip: leave as-is (not encoded)" },
+        { class: "inline-check", title: t("tex.skipHint") },
         skipBox,
-        el("span", { text: "SKIP" }),
+        el("span", { text: t("tex.skipLabel") }),
       ),
     );
 
@@ -624,13 +639,13 @@ export function mountTextures(): TabHandle {
       { class: "row spread" },
       el("span", {
         class: "muted mono",
-        text: `override image ${img.index} — applies to source`,
-        title: `stored under per_model[${src}]`,
+        text: t("tex.ovForImage", { index: img.index }),
+        title: t("tex.ovStored", { src }),
       }),
       el("button", {
         class: "small",
-        text: "Reset",
-        title: "clear this row's override",
+        text: t("common.reset"),
+        title: t("tex.ovReset"),
         onclick: () => {
           clearTextureOverride(src, img.index);
           renderList();
@@ -653,7 +668,7 @@ export function mountTextures(): TabHandle {
       wrap.append(
         el("div", {
           class: "hint",
-          text: `also matched by ${nameBased.length} name-based override(s) from JSON`,
+          text: t("tex.ovNameMatched", { n: nameBased.length }),
         }),
       );
     }
@@ -666,17 +681,20 @@ export function mountTextures(): TabHandle {
     clear(side);
     const img = images.find((i) => i.index === selected);
     if (!img) {
-      side.append(section("Texture", el("div", { class: "empty", text: "select a texture" })));
+      side.append(
+        section(t("tex.detailTitle"), el("div", { class: "empty", text: t("tex.selectTexture") })),
+      );
       encodeBtn.disabled = true;
       return;
     }
     const src = app.sourcePath;
     const dev = src ? describeTextureDeviation(src, img.index, img.name) : null;
+    const skippedLabel = t("tex.skipped");
     const devBadge = el("span", {
-      class: `badge ${dev === "skipped" ? "dim" : "accent"}`,
+      class: `badge ${dev === skippedLabel ? "dim" : "accent"}`,
       text: dev ?? "",
       dataset: { sidebadge: String(img.index) },
-      title: "per-texture override (deviation from base params)",
+      title: t("tex.ovTitle"),
     });
     devBadge.hidden = !dev;
     /* One coherent panel: header (ellipsized name) + a single padded body
@@ -686,35 +704,38 @@ export function mountTextures(): TabHandle {
     const body = el(
       "div",
       { class: "panel-body" },
-      el("div", { class: "hint mono", text: `image ${img.index}` }),
+      el("div", { class: "hint mono", text: t("tex.imageN", { index: img.index }) }),
       kv([
-        ["format", img.effective_format ?? img.format],
-        ["stored", img.format],
-        ["size", `${img.width}×${img.height}`],
-        ["disk", fmtBytes(img.disk)],
-        ["vram est", fmtBytes(img.vram)],
-        ["mips", img.has_mips ? "yes" : "no"],
+        [t("tex.kvFormat"), img.effective_format ?? img.format],
+        [t("tex.kvStored"), img.format],
+        [t("tex.kvSize"), `${img.width}×${img.height}`],
+        [t("tex.kvDisk"), fmtBytes(img.disk)],
+        [t("tex.kvVram"), fmtBytes(img.vram)],
+        [t("tex.kvMips"), img.has_mips ? t("tex.yes") : t("tex.no")],
       ]),
     );
 
     /* Preview thumbnail (existing flow: loading / error / decoded image). */
     if (previewing === img.index) {
-      body.append(el("div", { class: "section-title", text: "Preview" }), previewLoadingInner());
+      body.append(
+        el("div", { class: "section-title", text: t("tex.preview") }),
+        previewLoadingInner(),
+      );
     } else if (previewError && previewErrorIndex === img.index) {
       body.append(
-        el("div", { class: "section-title", text: "Preview" }),
-        el("div", { class: "empty", text: `preview failed: ${previewError}` }),
+        el("div", { class: "section-title", text: t("tex.preview") }),
+        el("div", { class: "empty", text: t("tex.previewFail", { message: previewError }) }),
       );
     } else if (preview && preview.index === img.index) {
       body.append(
-        el("div", { class: "section-title", text: "Preview" }),
+        el("div", { class: "section-title", text: t("tex.preview") }),
         renderPreviewInner(img, preview),
       );
     }
 
     /* Per-texture editor, moved here verbatim from the old inline row. */
     body.append(
-      el("div", { class: "section-title", text: "Texture settings" }),
+      el("div", { class: "section-title", text: t("tex.texSettings") }),
       overrideEditor(img),
     );
 
@@ -723,12 +744,12 @@ export function mountTextures(): TabHandle {
       previewActs,
       el("div", {
         class: "hint",
-        text: "dry run — the model file is not modified",
+        text: t("tex.dryRunHint"),
       }),
     ];
     const result = results.get(img.index);
     if (activeEncode?.index === img.index) {
-      dryRun.push(el("span", { class: "badge yellow", text: "previewing…" }));
+      dryRun.push(el("span", { class: "badge yellow", text: t("tex.previewing") }));
     } else if (result) {
       dryRun.push(
         el(
@@ -738,18 +759,18 @@ export function mountTextures(): TabHandle {
           psnrBadge(result.psnr),
         ),
         kv([
-          ["ktx2 size", fmtBytes(result.ktx2_size)],
-          ["vram after", fmtBytes(result.vram_after)],
-          ["disk delta", signedBytes(result.ktx2_size - img.disk)],
-          ["vram delta", signedBytes(result.vram_after - img.vram)],
+          [t("tex.kvKtx2"), fmtBytes(result.ktx2_size)],
+          [t("tex.kvVramAfter"), fmtBytes(result.vram_after)],
+          [t("tex.kvDiskDelta"), signedBytes(result.ktx2_size - img.disk)],
+          [t("tex.kvVramDelta"), signedBytes(result.vram_after - img.vram)],
         ]),
       );
     } else {
-      dryRun.push(el("div", { class: "muted", text: "not encoded yet" }));
+      dryRun.push(el("div", { class: "muted", text: t("tex.notEncoded") }));
     }
-    encodeBtn.textContent = activeEncode === null ? "Preview KTX2" : "previewing…";
+    encodeBtn.textContent = activeEncode === null ? t("tex.encodeBtn") : t("tex.previewing");
     encodeBtn.disabled = !app.bridge.live || activeEncode !== null;
-    body.append(el("div", { class: "section-title", text: "Preview (dry run)" }), ...dryRun);
+    body.append(el("div", { class: "section-title", text: t("tex.dryRun") }), ...dryRun);
     if (result) body.append(...compareNodes(img, result));
     side.append(
       el(
@@ -766,7 +787,7 @@ export function mountTextures(): TabHandle {
             el("button", {
               class: "small",
               text: "✕",
-              title: "deselect (Esc)",
+              title: t("tex.deselect"),
               onclick: () => deselect(),
             }),
           ),
@@ -791,11 +812,11 @@ export function mountTextures(): TabHandle {
       previewTimer = null;
       if (seq !== previewSeq || previewing !== index) return;
       previewing = null;
-      previewError = "no completion event (timed out)";
+      previewError = t("tex.timeoutMsg");
       previewErrorIndex = index;
       renderList();
       renderSide();
-      notify("texture preview timed out — no completion event", "error");
+      notify(t("tex.previewTimeout"), "error");
     }, PREVIEW_TIMEOUT_MS);
   }
 
@@ -803,7 +824,7 @@ export function mountTextures(): TabHandle {
     clearPreviewTimer();
     previewing = null;
     preview = { ...result, index };
-    previewError = result.b64 ? null : "empty image returned";
+    previewError = result.b64 ? null : t("tex.previewUnavailable");
     previewErrorIndex = result.b64 ? null : index;
     renderList();
     renderSide();
@@ -839,15 +860,15 @@ export function mountTextures(): TabHandle {
       clearPreviewTimer();
       const missing = isMissingMethodError(err);
       const busy = isBusyError(err);
-      const message = busy ? "a background job is still running" : (err as Error).message;
-      previewError = missing ? "not supported by this host" : message;
+      const message = busy ? t("tex.previewBusy") : (err as Error).message;
+      previewError = missing ? t("tex.notSupported") : message;
       previewErrorIndex = index;
       notify(
         missing
-          ? "texture preview unavailable — rebuild the assetty binary"
+          ? t("tex.previewNoHost")
           : busy
-            ? "a background job is running — preview unavailable right now"
-            : `preview failed: ${message}`,
+            ? t("tex.previewBusy")
+            : t("tex.previewFail", { message }),
         "error",
       );
       renderList();
@@ -902,7 +923,14 @@ export function mountTextures(): TabHandle {
     renderList();
     renderSide();
     if (selected === index) void loadCompare(index, result);
-    notify(`image ${index}: ${fmtBytes(result.ktx2_size)} @ ${result.psnr.toFixed(1)} dB`, "ok");
+    notify(
+      t("tex.encodeDone", {
+        index,
+        size: fmtBytes(result.ktx2_size),
+        psnr: result.psnr.toFixed(1),
+      }),
+      "ok",
+    );
   }
 
   async function loadCompare(index: number, result: EncodeResult): Promise<void> {
@@ -941,7 +969,7 @@ export function mountTextures(): TabHandle {
           activeEncode = null;
           renderList();
           renderSide();
-          notify("texture encode timed out — no completion event", "error");
+          notify(t("tex.encodeTimeout"), "error");
         }, ENCODE_TIMEOUT_MS);
         return;
       }
@@ -953,8 +981,8 @@ export function mountTextures(): TabHandle {
       renderSide();
       notify(
         isBusyError(err)
-          ? "texture encode already running — wait for it to finish"
-          : `encode failed: ${(err as Error).message}`,
+          ? t("tex.encodeBusy")
+          : t("tex.encodeFail", { message: (err as Error).message }),
         "error",
       );
     }
@@ -971,7 +999,7 @@ export function mountTextures(): TabHandle {
       previewErrorIndex = current;
       renderList();
       renderSide();
-      notify(`preview failed: ${event.error}`, "error");
+      notify(t("tex.previewFail", { message: event.error }), "error");
       return;
     }
     applyPreview(event.index >= 0 ? event.index : current, event.result);
@@ -994,7 +1022,7 @@ export function mountTextures(): TabHandle {
       clearEncodeState();
       renderList();
       renderSide();
-      notify(`encode failed: ${event.error}`, "error");
+      notify(t("tex.encodeFail", { message: event.error }), "error");
       return;
     }
     applyEncode(event.index >= 0 ? event.index : active.index, event.result);
@@ -1018,13 +1046,13 @@ export function mountTextures(): TabHandle {
    *  by a preview's applied settings (the compare-pane shortcut), plus this
    *  source model's per-texture overrides merged in array order. */
   function textureStep(override?: EncodeSettings): Record<string, unknown> {
-    const t = getSettings().optimize.steps.textures;
+    const b = getSettings().optimize.steps.textures;
     const spec: Record<string, unknown> = {
-      format: override?.format ?? t.format,
-      quality: override?.quality ?? t.quality,
+      format: override?.format ?? b.format,
+      quality: override?.quality ?? b.quality,
       rdo_lambda: 1,
-      generate_mips: override?.generate_mips ?? t.generate_mips,
-      max_size: override?.max_size ?? t.max_size,
+      generate_mips: override?.generate_mips ?? b.generate_mips,
+      max_size: override?.max_size ?? b.max_size,
     };
     if (override?.normal_map !== undefined) spec.normal_map = override.normal_map;
     const src = app.sourcePath;
@@ -1034,11 +1062,11 @@ export function mountTextures(): TabHandle {
   }
 
   function describeTextureParams(): string {
-    const t = getSettings().optimize.steps.textures;
-    const size = t.max_size === 0 ? "orig" : String(t.max_size);
+    const b = getSettings().optimize.steps.textures;
+    const size = b.max_size === 0 ? t("common.original") : String(b.max_size);
     const n = textureOverridesCount(app.sourcePath);
-    const base = `${t.format} · q${t.quality} · ${size} · mips ${t.generate_mips ? "on" : "off"}`;
-    return n > 0 ? `${base} · ${n} override${n === 1 ? "" : "s"}` : base;
+    const base = `${b.format} · q${b.quality} · ${size} · mips ${b.generate_mips ? t("common.on") : t("common.off")}`;
+    return n > 0 ? `${base} · ${t("tex.paramsOv", { n })}` : base;
   }
 
   function fmtSecs(secs: number | undefined): string {
@@ -1056,12 +1084,12 @@ export function mountTextures(): TabHandle {
     const n = textureOverridesCount(src);
     overridesNote.textContent = src
       ? n > 0
-        ? `overrides apply to source: ${n} for this model`
-        : "overrides apply to source: none for this model"
-      : "overrides apply to source: no source model";
-    overridesNote.title = src ?? "";
+        ? t("tex.overridesCount", { n })
+        : t("tex.overridesNone")
+      : t("tex.overridesNone");
+    overridesNote.title = src ?? t("tex.noSource");
     applyBtn.disabled = applyRunning || !app.sourcePath;
-    if (!applyRunning) applyBtn.textContent = "Apply to model…";
+    if (!applyRunning) applyBtn.textContent = t("tex.apply");
     syncActsOn();
   }
 
@@ -1078,7 +1106,7 @@ export function mountTextures(): TabHandle {
 
   function finishApplyError(message: string): void {
     stopApplyJob();
-    setApplyStatus("failed");
+    setApplyStatus(t("common.failed"));
     notify(message, "error");
   }
 
@@ -1087,50 +1115,55 @@ export function mountTextures(): TabHandle {
     const before = res.report.before.disk_total ?? res.report.before.disk_bytes;
     const after = res.report.after.disk_total ?? res.report.after.disk_bytes;
     const metrics =
-      before != null && after != null ? `disk ${fmtBytes(before)} → ${fmtBytes(after)}` : "done";
+      before != null && after != null
+        ? `disk ${fmtBytes(before)} → ${fmtBytes(after)}`
+        : t("common.done");
     const secs = fmtSecs(res.report.total_secs);
     applyResultHost.append(
       el(
         "div",
         { class: "row" },
-        el("span", { class: "badge green", text: "KTX2 written" }),
+        el("span", { class: "badge green", text: t("tex.ktx2Written") }),
         el("span", { class: "mono wrap", text: res.out_path, title: res.out_path }),
       ),
-      el("div", { class: "hint", text: `${metrics} · total ${secs}` }),
+      el("div", { class: "hint", text: `${metrics} · ${t("tex.total", { secs })}` }),
       el(
         "div",
         { class: "row" },
         el("button", {
           class: "small primary",
-          text: "View result",
-          title: "Load the KTX2 file into the viewer (the optimize source is unchanged)",
+          text: t("common.view"),
+          title: t("opt.viewTitle"),
           onclick: () => {
             app.setView(res.out_path);
-            notify(`viewing ${res.out_path}`, "ok");
+            notify(t("opt.viewing", { path: res.out_path }), "ok");
           },
         }),
         el("button", {
           class: "small",
-          text: "Use as source",
-          title: "Run further experiments starting from this result",
+          text: t("common.useAsSource"),
+          title: t("opt.useTitle"),
           onclick: () => {
             app.useAsSource(res.out_path);
-            notify(`source: ${res.out_path}`, "ok");
+            notify(t("opt.sourceSet", { path: res.out_path }), "ok");
           },
         }),
         el("button", {
           class: "small",
-          text: "Save as…",
-          title: "Copy this result wherever you want it (the source model is never modified)",
+          text: t("common.saveAs"),
+          title: t("opt.saveTitle"),
           onclick: () => void saveAs(res.out_path),
         }),
         el("button", {
           class: "small",
-          text: "Reveal path",
-          title: res.out_path,
+          text: t("tex.reveal"),
+          title: t("tex.revealTitle", { path: res.out_path }),
           onclick: async () => {
             const ok = await copyText(res.out_path);
-            notify(ok ? `copied ${res.out_path}` : res.out_path, ok ? "ok" : "info");
+            notify(
+              ok ? t("common.copied", { path: res.out_path }) : res.out_path,
+              ok ? "ok" : "info",
+            );
           },
         }),
       ),
@@ -1139,9 +1172,9 @@ export function mountTextures(): TabHandle {
 
   function finishApply(res: OptimizeResult): void {
     stopApplyJob();
-    setApplyStatus("done");
+    setApplyStatus(t("common.done"));
     renderApplyResult(res);
-    notify(`KTX2 written to ${res.out_path}`, "ok");
+    notify(t("tex.writtenTo", { path: res.out_path }), "ok");
   }
 
   /** Last segment of a path (the save panel's suggested file name). */
@@ -1157,73 +1190,74 @@ export function mountTextures(): TabHandle {
    */
   async function saveAs(outPath: string): Promise<void> {
     if (exporting) {
-      notify("export already running — wait for it to finish", "error");
+      notify(t("opt.exportBusy"), "error");
       return;
     }
     let pick: { path: string | null };
     try {
       pick = await app.bridge.pickSavePath(basename(outPath));
     } catch (err) {
-      notify(`save dialog failed: ${(err as Error).message}`, "error");
+      notify(t("opt.saveDlgFail", { message: (err as Error).message }), "error");
       return;
     }
     if (!pick.path) return; // cancel
     if (!app.bridge.live) {
-      notify("demo mode — export needs the assetty binary", "error");
+      notify(t("opt.exportDemo"), "error");
       return;
     }
     exporting = true;
     pendingDst = pick.path;
-    setApplyStatus(`exporting to ${pick.path}…`);
+    setApplyStatus(t("tex.stExporting", { path: pick.path }));
     try {
       await app.bridge.exportTo(outPath, pick.path);
     } catch (err) {
       pendingDst = null;
       exporting = false;
-      setApplyStatus("failed");
+      setApplyStatus(t("common.failed"));
       if (isBusyError(err)) {
-        notify("export already running — wait for it to finish", "error");
+        notify(t("opt.exportBusy"), "error");
       } else if (isMissingMethodError(err)) {
-        notify("export unavailable — rebuild the assetty binary", "error");
+        notify(t("opt.exportNoHost"), "error");
       } else {
-        notify(`export failed: ${(err as Error).message}`, "error");
+        notify(t("opt.exportFail", { message: (err as Error).message }), "error");
       }
     }
   }
 
   async function startApply(override?: EncodeSettings): Promise<void> {
     if (!app.bridge.live) {
-      notify("demo mode — apply needs the assetty binary", "error");
+      notify(t("tex.applyDemo"), "error");
       return;
     }
     const path = app.sourcePath;
     if (!path) {
-      notify("no source model — open one (⌘O) or use as source", "error");
+      notify(t("tex.applyNoSource"), "error");
       return;
     }
     if (applyRunning) {
-      notify("apply already running — wait for it to finish", "error");
+      notify(t("tex.applyBusy"), "error");
       return;
     }
     const token = ++applySeq;
     applyRunning = true;
     applyBtn.disabled = true;
-    applyBtn.textContent = "Applying…";
-    setApplyStatus("starting…");
+    applyBtn.textContent = t("tex.applying");
+    setApplyStatus(t("tex.stStarting"));
     clear(applyResultHost);
     const specJson = JSON.stringify({ steps: [{ textures: textureStep(override) }] });
     try {
       const call = await app.bridge.optimizeCustom(path, specJson, "desktop", (p) => {
-        if (token === applySeq && applyRunning) setApplyStatus(`${p.step || "running…"} ${p.pct}%`);
+        if (token === applySeq && applyRunning)
+          setApplyStatus(`${p.step || t("opt.runningShort")} ${p.pct}%`);
       });
       if (token !== applySeq || !applyRunning) return; // superseded while awaiting
       if (call.started) {
         stopApplyProgress = call.stopProgress;
-        setApplyStatus("running…");
+        setApplyStatus(t("tex.stRunning"));
         applyTimer = setTimeout(() => {
           applyTimer = null;
           if (token !== applySeq) return;
-          finishApplyError("apply timed out — no completion event within 10 minutes");
+          finishApplyError(t("tex.applyTimeout"));
         }, APPLY_TIMEOUT_MS);
         return;
       }
@@ -1232,11 +1266,11 @@ export function mountTextures(): TabHandle {
     } catch (err) {
       if (token !== applySeq) return;
       stopApplyJob();
-      setApplyStatus("failed");
+      setApplyStatus(t("common.failed"));
       notify(
         isBusyError(err)
-          ? "apply already running — wait for it to finish"
-          : `apply failed: ${(err as Error).message}`,
+          ? t("tex.applyBusy")
+          : t("tex.applyFail", { message: (err as Error).message }),
         "error",
       );
     }
@@ -1247,7 +1281,7 @@ export function mountTextures(): TabHandle {
   const offApplyDone = app.bridge.onOptimizeDone((event) => {
     if (!applyRunning) return;
     if (!event.ok) {
-      finishApplyError(`apply failed: ${event.error}`);
+      finishApplyError(t("tex.applyFail", { message: event.error }));
       return;
     }
     finishApply(event.result);
@@ -1260,13 +1294,13 @@ export function mountTextures(): TabHandle {
       if (event.ok && event.dst === pendingDst) {
         pendingDst = null;
         exporting = false;
-        setApplyStatus("done");
-        notify(`saved to ${event.dst}`, "ok");
+        setApplyStatus(t("common.done"));
+        notify(t("opt.savedTo", { path: event.dst }), "ok");
       } else if (!event.ok) {
         pendingDst = null;
         exporting = false;
-        setApplyStatus("failed");
-        notify(`export failed: ${event.error}`, "error");
+        setApplyStatus(t("common.failed"));
+        notify(t("opt.exportFail", { message: event.error }), "error");
       }
     }
   });
@@ -1277,6 +1311,24 @@ export function mountTextures(): TabHandle {
       renderSide();
     }
     syncApplyBar();
+  });
+
+  // Instant language switch: every string in this tab re-renders from the
+  // active dictionary (the row editor keeps no static text of its own).
+  const offLang = onLang(() => {
+    headLabel.textContent = t("tex.images");
+    headNote.textContent = t("tex.viewApply");
+    applyHint.textContent = t("tex.previewDry");
+    firstRunHint.textContent = t("tex.firstRun");
+    if (!applyRunning) {
+      applyBtn.textContent = t("tex.apply");
+      setApplyStatus(t("common.idle"));
+    } else {
+      applyBtn.textContent = t("tex.applying");
+    }
+    syncApplyBar();
+    renderList();
+    renderSide();
   });
 
   /* ------------------------------------------------------------------ reload */
@@ -1316,7 +1368,7 @@ export function mountTextures(): TabHandle {
         const res = await app.bridge.textures(path ?? "/demo/DamagedHelmet.glb");
         images = res.images.slice().sort((a, b) => a.index - b.index);
       } catch (err) {
-        notify(`textures failed: ${(err as Error).message}`, "error");
+        notify(t("tex.texturesFail", { message: (err as Error).message }), "error");
       }
     }
     /* Keep the selection when the same image survives the reload, else deselect. */
@@ -1359,6 +1411,7 @@ export function mountTextures(): TabHandle {
       offApplyDone();
       offExportDone();
       offApplySettings();
+      offLang();
       clearEncodeState();
       clearPreviewTimer();
       if (applyTimer) {

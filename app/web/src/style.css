@@ -1106,6 +1106,13 @@ tr.selected {
   line-height: 1.2;
 }
 
+/* --- language switch: segmented EN | RU next to the theme toggle --- */
+.lang-switch button {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
 /* --- settings tab --- */
 .settings-scroll {
   flex: 1 1 auto;

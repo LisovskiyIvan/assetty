@@ -1,25 +1,28 @@
 import { app } from "../app";
 import { buildOptimizeForm, closeFieldHelp } from "../optimizeForm";
+import { onLang, t } from "../i18n";
 import {
   applySettingsText,
   getSettings,
+  languageMode,
   onSettingsChange,
   onSettingsStatus,
   reloadSettings,
   saveSettings,
+  setLanguage,
   settingsToJson,
   setTheme,
   themeMode,
   updateSettings,
 } from "../settings";
-import type { SettingsStatus, ThemeMode } from "../settings";
-import { clear, el, section } from "../ui";
+import type { Language, SettingsStatus, ThemeMode } from "../settings";
+import { clear, el } from "../ui";
 import type { TabHandle } from "./types";
 
 /**
  * Settings tab: a UI-first editor for `assetty.settings.json`.
  *
- * - theme (dark/light) and the optimize step defaults apply in-app on every
+ * - theme / language and the optimize step defaults apply in-app on every
  *   change and are debounce-saved (500 ms) through `settingsSave(text)`;
  * - the JSON textarea is the escape hatch: "Apply JSON" parses the whole file,
  *   clamps numbers to their UI ranges and reports errors inline;
@@ -33,8 +36,15 @@ const THEME_LABELS: Array<[ThemeMode, string]> = [
   ["light", "light"],
 ];
 
-const SCHEMA_SAMPLE = `{
+const LANG_LABELS: Array<[Language, string]> = [
+  ["en", "EN"],
+  ["ru", "RU"],
+];
+
+function schemaSample(): string {
+  return `{
   "theme": "dark",
+  "language": "en",
   "optimize": {
     "steps": {
       "prune":    { "enabled": true, "unused_nodes": true,
@@ -62,17 +72,20 @@ const SCHEMA_SAMPLE = `{
   }
 }
 `;
+}
 
 function statusText(status: SettingsStatus): string {
   switch (status.state) {
     case "loading":
-      return "loading assetty.settings.json…";
+      return t("set.stLoading");
     case "saving":
-      return "saving…";
+      return t("set.stSaving");
     case "saved":
-      return status.message ?? "saved";
+      if (status.message === "reloaded from file") return t("set.stReloaded");
+      if (status.message === "up-to-date") return t("set.stUpToDate");
+      return t("set.stSaved");
     case "error":
-      return `error: ${status.message ?? "save failed"}`;
+      return t("set.stError", { message: status.message ?? t("set.stSaveFail") });
     default:
       return "";
   }
@@ -83,26 +96,19 @@ export function mountSettings(): TabHandle {
   const main = el("div", { class: "tab-main" });
   const scroll = el("div", { class: "settings-scroll" });
 
-  const head = el(
-    "div",
-    { class: "panel-head" },
-    el("span", { text: "Settings" }),
-    el("span", { class: "muted mono", text: "assetty.settings.json" }),
-  );
-  const info = el(
-    "div",
-    { class: "hint settings-info" },
-    el("span", {
-      text: "Persisted to assetty.settings.json in the working directory (demo mode: localStorage). Every change applies immediately and saves after 500 ms. Schema: ",
-    }),
-    el("span", {
-      class: "mono",
-      text: "{ theme, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
-    }),
-  );
+  const headLabel = el("span", { text: t("set.title") });
+  const headFile = el("span", { class: "muted mono", text: t("set.file") });
+  const head = el("div", { class: "panel-head" }, headLabel, headFile);
+  const infoText = el("span", { text: t("set.info") });
+  const infoSchema = el("span", {
+    class: "mono",
+    text: "{ theme, language, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
+  });
+  const info = el("div", { class: "hint settings-info" }, infoText, infoSchema);
 
   /* ---------------------------------------------------------------- theme */
 
+  const themeHead = el("span");
   const themeRow = el("div", { class: "segmented" });
   const themeButtons: Array<{ mode: ThemeMode; button: HTMLButtonElement }> = [];
   for (const [mode, label] of THEME_LABELS) {
@@ -116,30 +122,65 @@ export function mountSettings(): TabHandle {
       entry.button.classList.toggle("active", entry.mode === active);
   }
 
+  /* --------------------------------------------------------------- language */
+
+  const langHead = el("span");
+  const langRow = el("div", { class: "segmented" });
+  const langButtons: Array<{ lang: Language; button: HTMLButtonElement }> = [];
+  for (const [lang, label] of LANG_LABELS) {
+    const button = el("button", { class: "small", text: label, onclick: () => setLanguage(lang) });
+    langButtons.push({ lang, button });
+    langRow.append(button);
+  }
+  const langHint = el("div", { class: "hint" });
+  function syncLangButtons(): void {
+    const active = languageMode();
+    for (const entry of langButtons) entry.button.classList.toggle("active", entry.lang === active);
+  }
+
   /* ---------------------------------------------------- optimize defaults */
 
+  const defaultsHead = el("span");
+  const defaultsHint = el("div", { class: "hint" });
   const defaultsBody = el("div", { class: "form" });
-  const defaultsForm = buildOptimizeForm(defaultsBody, {
+  let defaultsForm = buildOptimizeForm(defaultsBody, {
     get: () => getSettings().optimize.steps,
     edit: (mutate) =>
       updateSettings((settings) => {
         mutate(settings.optimize.steps);
       }),
   });
+  function buildDefaultsForm(): void {
+    clear(defaultsBody);
+    defaultsForm = buildOptimizeForm(defaultsBody, {
+      get: () => getSettings().optimize.steps,
+      edit: (mutate) =>
+        updateSettings((settings) => {
+          mutate(settings.optimize.steps);
+        }),
+    });
+  }
 
   /* ----------------------------------------------------------- JSON editor */
 
+  const jsonHead = el("span");
+  const jsonHint = el("div", { class: "hint" });
   const json = el("textarea", {
     class: "settings-json",
     spellcheck: false,
-    title: "edit the whole settings file by hand",
+    title: t("set.jsonTitle"),
   });
   json.value = settingsToJson();
   const jsonError = el("div", { class: "settings-error" });
-  const applyBtn = el("button", { class: "primary", text: "Apply JSON", disabled: true });
-  const saveBtn = el("button", { text: "Save now" });
-  const reloadBtn = el("button", { text: "Reload from file" });
+  const applyBtn = el("button", { class: "primary", disabled: true });
+  const saveBtn = el("button");
+  const reloadBtn = el("button");
   const statusLine = el("span", { class: "hint muted", text: "" });
+
+  /** Last persisted status (re-rendered on language switch). */
+  let lastStatus: SettingsStatus = { state: "idle" };
+  /** Last explicit save outcome (null = untouched since mount). */
+  let saveOk: boolean | null = null;
 
   let dirty = false;
 
@@ -172,38 +213,46 @@ export function mountSettings(): TabHandle {
 
   saveBtn.addEventListener("click", async () => {
     const ok = await saveSettings();
-    statusLine.textContent = ok ? "saved" : "save failed (see error above)";
+    saveOk = ok;
+    statusLine.textContent = ok ? t("set.savedNow") : t("set.saveFail");
   });
 
   reloadBtn.addEventListener("click", async () => {
     const ok = await reloadSettings();
-    if (ok) defaultsForm.sync();
+    if (ok) {
+      defaultsForm.sync();
+      syncLangButtons();
+    }
     resetEditor();
   });
 
-  scroll.append(
-    section(
-      "Theme",
-      themeRow,
-      el("div", {
-        class: "hint",
-        text: "The UI switches CSS custom properties immediately; the Babylon inspector opens with the matching theme.",
-      }),
-    ),
-    section(
-      "Optimize defaults",
-      el("div", {
-        class: "hint",
-        text: "Used to prefill the Optimize tab. Only checked steps are sent, and every edit is saved after 500 ms.",
-      }),
-      defaultsBody,
-    ),
-    section(
-      "Settings JSON",
-      el("div", {
-        class: "hint",
-        text: "Edit the whole file by hand. Apply parses the text, clamps numbers to their UI ranges and reports errors inline.",
-      }),
+  const themeHint = el("div", { class: "hint" });
+  const themePanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, themeHead),
+    el("div", { class: "panel-body" }, themeRow, themeHint),
+  );
+  const langPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, langHead),
+    el("div", { class: "panel-body" }, langRow, langHint),
+  );
+  const defaultsPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, defaultsHead),
+    el("div", { class: "panel-body" }, defaultsHint, defaultsBody),
+  );
+  const jsonPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, jsonHead),
+    el(
+      "div",
+      { class: "panel-body" },
+      jsonHint,
       json,
       jsonError,
       el(
@@ -214,39 +263,44 @@ export function mountSettings(): TabHandle {
       ),
     ),
   );
+  scroll.append(themePanel, langPanel, defaultsPanel, jsonPanel);
 
   main.append(head, info, scroll);
 
   /* ------------------------------------------------------- presets (zon) */
 
+  const presetsHead = el("span");
   const side = el("div", { class: "tab-side" });
   const listHost = el("div", { class: "panel-body" });
   const presetZon = el("textarea", {
     spellcheck: false,
     style: { minHeight: "140px" },
   });
-  presetZon.value = "// select a preset below";
+  presetZon.value = t("set.presetPick");
   presetZon.disabled = true;
-  const presetSaveBtn = el("button", { class: "small", text: "Save preset", disabled: true });
-  const presetReloadBtn = el("button", { class: "small", text: "Reload preset", disabled: true });
+  const presetSaveBtn = el("button", { class: "small", disabled: true });
+  const presetReloadBtn = el("button", { class: "small", disabled: true });
   const presetStatus = el("span", { class: "hint muted", text: "" });
 
-  side.append(
-    section(
-      "Presets",
-      listHost,
-      presetZon,
-      el("div", { class: "row" }, presetSaveBtn, presetReloadBtn, presetStatus),
-    ),
-    section(
-      "Schema",
-      el("div", {
-        class: "hint",
-        text: "assetty.settings.json — frontend-owned, host validates + writes atomically.",
-      }),
-      el("pre", { class: "mono settings-schema", text: SCHEMA_SAMPLE }),
-    ),
+  const schemaHead = el("span");
+  const schemaHint = el("div", { class: "hint" });
+  const schemaPre = el("pre", { class: "mono settings-schema", text: schemaSample() });
+
+  const presetsPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, presetsHead),
+    listHost,
+    presetZon,
+    el("div", { class: "row" }, presetSaveBtn, presetReloadBtn, presetStatus),
   );
+  const schemaPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, schemaHead),
+    el("div", { class: "panel-body" }, schemaHint, schemaPre),
+  );
+  side.append(presetsPanel, schemaPanel);
 
   root.append(main, side);
 
@@ -262,7 +316,7 @@ export function mountSettings(): TabHandle {
   function renderList(): void {
     clear(listHost);
     if (names.length === 0) {
-      listHost.append(el("div", { class: "muted", text: "no presets found" }));
+      listHost.append(el("div", { class: "muted", text: t("set.noPresets") }));
     }
     for (const name of names) {
       listHost.append(
@@ -293,7 +347,7 @@ export function mountSettings(): TabHandle {
     try {
       names = await app.bridge.presets();
     } catch (err) {
-      app.toast(`presets failed: ${(err as Error).message}`, "error");
+      app.toast(t("set.presetsFail", { message: (err as Error).message }), "error");
       names = [];
     }
     renderList();
@@ -303,11 +357,11 @@ export function mountSettings(): TabHandle {
     active = name;
     renderList();
     presetZon.disabled = true;
-    presetZon.value = "// loading…";
+    presetZon.value = t("set.presetLoading");
     try {
       presetZon.value = await app.bridge.presetLoad(name);
     } catch (err) {
-      presetZon.value = `// load failed: ${(err as Error).message}`;
+      presetZon.value = t("set.presetLoadFail", { message: (err as Error).message });
     } finally {
       presetZon.disabled = false;
       presetSaveBtn.disabled = !app.bridge.live || presetBusy;
@@ -321,9 +375,9 @@ export function mountSettings(): TabHandle {
     presetSaveBtn.disabled = true;
     try {
       await app.bridge.presetSave(active, presetZon.value);
-      setPresetStatus(`saved ${active}.zon`);
+      setPresetStatus(t("set.presetSaved", { name: active }));
     } catch (err) {
-      setPresetStatus(`save failed: ${(err as Error).message}`, true);
+      setPresetStatus(t("set.presetSaveFail", { message: (err as Error).message }), true);
     } finally {
       presetBusy = false;
       presetSaveBtn.disabled = !app.bridge.live;
@@ -336,22 +390,69 @@ export function mountSettings(): TabHandle {
 
   /* -------------------------------------------------------------- wiring */
 
+  /** Applies the active dictionary to every static label in this tab. */
+  function syncStrings(): void {
+    headLabel.textContent = t("set.title");
+    headFile.textContent = t("set.file");
+    infoText.textContent = t("set.info");
+    themeHead.textContent = t("set.theme");
+    themeHint.textContent = t("set.themeHint");
+    langHead.textContent = t("set.language");
+    langHint.textContent = t("set.languageHint");
+    defaultsHead.textContent = t("set.defaults");
+    defaultsHint.textContent = t("set.defaultsHint");
+    jsonHead.textContent = t("set.jsonTitle");
+    jsonHint.textContent = t("set.jsonHint");
+    json.title = t("set.jsonTitle");
+    applyBtn.textContent = t("set.applyJson");
+    saveBtn.textContent = t("set.saveNow");
+    reloadBtn.textContent = t("set.reloadFile");
+    presetsHead.textContent = t("set.presets");
+    schemaHead.textContent = t("set.schema");
+    schemaHint.textContent = t("set.schemaHint");
+    presetSaveBtn.textContent = t("set.savePreset");
+    presetReloadBtn.textContent = t("set.reloadPreset");
+    if (presetZon.disabled && presetZon.value.startsWith("//")) {
+      presetZon.value = active ? t("set.presetLoading") : t("set.presetPick");
+    }
+    statusLine.textContent =
+      saveOk === null ? statusText(lastStatus) : saveOk ? t("set.savedNow") : t("set.saveFail");
+    statusLine.className = lastStatus.state === "error" ? "hint settings-bad" : "hint muted";
+    renderList();
+  }
+
   const offChange = onSettingsChange(() => {
     syncTheme();
+    syncLangButtons();
     // Keep the textarea in sync unless the user is editing it right now.
     if (!dirty && document.activeElement !== json) json.value = settingsToJson();
   });
   const offStatus = onSettingsStatus((status) => {
+    lastStatus = status;
+    saveOk = null;
     statusLine.textContent = statusText(status);
     statusLine.className = status.state === "error" ? "hint settings-bad" : "hint muted";
   });
+  // Instant language switch: rebuild the shared step form, then re-render.
+  const offLang = onLang(() => {
+    buildDefaultsForm();
+    syncStrings();
+    syncTheme();
+    syncLangButtons();
+    if (!dirty) json.value = settingsToJson();
+    if (names.length === 0) void loadNames();
+  });
 
+  syncStrings();
   syncTheme();
+  syncLangButtons();
 
   return {
     el: root,
     activate: () => {
+      syncStrings();
       syncTheme();
+      syncLangButtons();
       defaultsForm.sync();
       if (!dirty) json.value = settingsToJson();
       if (names.length === 0) void loadNames();
@@ -362,6 +463,7 @@ export function mountSettings(): TabHandle {
     dispose: () => {
       offChange();
       offStatus();
+      offLang();
     },
   };
 }

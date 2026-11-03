@@ -10,17 +10,7 @@ import {
   updateSettings,
 } from "../settings";
 import type { OptimizeSteps, TextureFormat } from "../settings";
-import {
-  el,
-  fmtBytes,
-  fmtNum,
-  fmtPct,
-  deltaClass,
-  clear,
-  section,
-  copyText,
-  emptyState,
-} from "../ui";
+import { el, fmtBytes, fmtNum, fmtPct, deltaClass, clear, copyText, emptyState } from "../ui";
 import { isMissingMethodError, notify, onLog } from "../notify";
 import { ViewerScene, linkCameras } from "../viewer";
 import type { ImageInfo, Info, OptimizeResult, Stats } from "../types";
@@ -266,6 +256,9 @@ export function mountOptimize(): TabHandle {
   let exporting = false;
   /** `dst` of the in-flight export; only the matching exportDone notifies. */
   let pendingDst: string | null = null;
+  /** Last progress state, so a language switch can re-render the strip. */
+  let progressStep = "";
+  let progressPct = 0;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
   /** Removes the split-mode master→slave camera sync (null when inactive). */
@@ -586,7 +579,6 @@ export function mountOptimize(): TabHandle {
     exportBtn.disabled = running || exporting || !lastResult;
     syncStatic();
   }
-  syncAll();
 
   /* ------------------------------------------------------------------ report */
 
@@ -608,11 +600,9 @@ export function mountOptimize(): TabHandle {
   resetReport();
   const exportNote = el("div", { class: "hint", text: t("opt.exportNote") });
   side.append(exportNote);
+  syncAll();
 
-  /** Last progress state, so a language switch can re-render the strip. */
-  let progressStep = "";
-  let progressPct = 0;
-
+  /** Renders the progress strip from the last known state. */
   function renderProgress(): void {
     progressMeta.textContent =
       progressStep || progressPct > 0
@@ -660,35 +650,35 @@ export function mountOptimize(): TabHandle {
    */
   async function saveAs(outPath: string): Promise<void> {
     if (exporting) {
-      notify("export already running — wait for it to finish", "error");
+      notify(t("opt.exportBusy"), "error");
       return;
     }
     let pick: { path: string | null };
     try {
       pick = await app.bridge.pickSavePath(basename(outPath));
     } catch (err) {
-      notify(`save dialog failed: ${(err as Error).message}`, "error");
+      notify(t("opt.saveDlgFail", { message: (err as Error).message }), "error");
       return;
     }
     if (!pick.path) return; // cancel
     if (!app.bridge.live) {
-      notify("demo mode — export needs the assetty binary", "error");
+      notify(t("opt.exportDemo"), "error");
       return;
     }
     setExporting(true);
     pendingDst = pick.path;
-    setLog(`exporting to ${pick.path}…`);
+    setLog(t("opt.exportingTo", { path: pick.path }));
     try {
       await app.bridge.exportTo(outPath, pick.path);
     } catch (err) {
       pendingDst = null;
       setExporting(false);
       if (isBusyError(err)) {
-        notify("export already running — wait for it to finish", "error");
+        notify(t("opt.exportBusy"), "error");
       } else if (isMissingMethodError(err)) {
-        notify("export unavailable — rebuild the assetty binary", "error");
+        notify(t("opt.exportNoHost"), "error");
       } else {
-        notify(`export failed: ${(err as Error).message}`, "error");
+        notify(t("opt.exportFail", { message: (err as Error).message }), "error");
       }
     }
   }
@@ -705,8 +695,8 @@ export function mountOptimize(): TabHandle {
 
   function finishJobError(message: string): void {
     stopJob();
-    setProgress("failed", 0);
-    notify(`optimize failed: ${message}`, "error");
+    setProgress(t("common.failed"), 0);
+    notify(t("opt.failedMsg", { message }), "error");
   }
 
   function renderReport(res: OptimizeResult): void {
@@ -722,9 +712,9 @@ export function mountOptimize(): TabHandle {
           el(
             "tr",
             null,
-            el("th", { text: "metric" }),
-            el("th", { class: "num", text: "before" }),
-            el("th", { class: "num", text: "after" }),
+            el("th", { text: t("opt.colMetric") }),
+            el("th", { class: "num", text: t("opt.colBefore") }),
+            el("th", { class: "num", text: t("opt.colAfter") }),
             el("th", { class: "num", text: "Δ" }),
           ),
         ),
@@ -740,7 +730,7 @@ export function mountOptimize(): TabHandle {
             return el(
               "tr",
               null,
-              el("td", { text: row.label }),
+              el("td", { text: t(row.labelKey) }),
               el("td", { class: "num", text: show(b) }),
               el("td", { class: "num", text: show(a) }),
               el("td", { class: `num ${deltaClass(pct)}`, text: fmtPct(pct) }),
@@ -751,7 +741,7 @@ export function mountOptimize(): TabHandle {
     );
 
     if (steps.length > 0) {
-      body.append(el("div", { class: "section-title", text: "steps run" }));
+      body.append(el("div", { class: "section-title", text: t("opt.stepsRun") }));
       const list = el("div", { class: "steps" });
       for (const s of steps) {
         list.append(
@@ -776,9 +766,9 @@ export function mountOptimize(): TabHandle {
                 el("span", { class: "mark", text: im.skipped ? "–" : "·" }),
                 el("span", {
                   text: im.skipped
-                    ? `${label} — skipped`
+                    ? t("opt.imgSkipped", { label })
                     : `${label} → ${im.effective_format ?? im.format ?? "?"}`,
-                  title: im.skipped ? "left as-is (not encoded)" : "effective format",
+                  title: im.skipped ? t("opt.imgSkippedTitle") : t("opt.imgEffectiveTitle"),
                 }),
               ),
             );
@@ -795,7 +785,10 @@ export function mountOptimize(): TabHandle {
         title: `${res.out_path}\nclick to copy`,
         onclick: async () => {
           const ok = await copyText(res.out_path);
-          notify(ok ? `copied ${res.out_path}` : res.out_path, ok ? "ok" : "info");
+          notify(
+            ok ? t("common.copied", { path: res.out_path }) : res.out_path,
+            ok ? "ok" : "info",
+          );
         },
       }),
       el(
@@ -803,42 +796,41 @@ export function mountOptimize(): TabHandle {
         { class: "row" },
         el("button", {
           class: "small primary",
-          text: "View result",
-          title: "Load this result into the viewer (the optimize source is unchanged)",
+          text: t("common.view"),
+          title: t("opt.viewTitle"),
           onclick: () => {
             app.setView(res.out_path);
-            notify(`viewing ${res.out_path}`, "ok");
+            notify(t("opt.viewing", { path: res.out_path }), "ok");
           },
         }),
         el("button", {
           class: "small",
-          text: "Use as source",
-          title: "Run further experiments starting from this result",
+          text: t("common.useAsSource"),
+          title: t("opt.useTitle"),
           onclick: () => {
             app.useAsSource(res.out_path);
-            notify(`source: ${res.out_path}`, "ok");
+            notify(t("opt.sourceSet", { path: res.out_path }), "ok");
           },
         }),
         el("button", {
           class: "small",
-          text: "Save as…",
-          title: "Copy this result wherever you want it (the source model is never modified)",
+          text: t("common.saveAs"),
+          title: t("opt.saveTitle"),
           onclick: () => void saveAs(res.out_path),
         }),
       ),
     );
 
+    reportHead.textContent = t("opt.report");
+    const secs = fmtSecs(res.report.total_secs);
     reportPanel.replaceChildren(
       el(
         "div",
         { class: "panel-head" },
-        el("span", { text: "Report" }),
+        reportHead,
         el("span", {
           class: "muted mono",
-          text: [
-            res.report.preset ?? "custom",
-            fmtSecs(res.report.total_secs) && `total ${fmtSecs(res.report.total_secs)}`,
-          ]
+          text: [res.report.preset ?? "custom", secs && t("opt.totalTime", { secs })]
             .filter(Boolean)
             .join(" · "),
         }),
@@ -856,7 +848,7 @@ export function mountOptimize(): TabHandle {
     try {
       await right.loadBase64(await app.bridge.loadBytes(outPath));
     } catch (err) {
-      notify(`load optimized failed: ${(err as Error).message}`, "error");
+      notify(t("opt.loadOptFail", { message: (err as Error).message }), "error");
     }
   }
 
@@ -871,11 +863,11 @@ export function mountOptimize(): TabHandle {
     }
     lastResult = event.result;
     stopJob();
-    setProgress("done", 100);
+    setProgress(t("common.done"), 100);
     renderReport(event.result);
     noteResult(event.result);
     void loadOptimized(event.result.out_path);
-    notify("optimization finished", "ok");
+    notify(t("opt.finished"), "ok");
   });
 
   // The copy this tab asked for (matched by dst so the Textures tab's exports
@@ -885,12 +877,12 @@ export function mountOptimize(): TabHandle {
       if (event.ok && event.dst === pendingDst) {
         pendingDst = null;
         setExporting(false);
-        setLog(`saved to ${event.dst}`);
-        notify(`saved to ${event.dst}`, "ok");
+        setLog(t("opt.savedTo", { path: event.dst }));
+        notify(t("opt.savedTo", { path: event.dst }), "ok");
       } else if (!event.ok) {
         pendingDst = null;
         setExporting(false);
-        notify(`export failed: ${event.error}`, "error");
+        notify(t("opt.exportFail", { message: event.error }), "error");
       }
     }
   });
@@ -905,11 +897,7 @@ export function mountOptimize(): TabHandle {
       button.classList.toggle("active", (button as HTMLElement).textContent === name);
     }
     syncAll();
-    setLog(
-      prefs
-        ? `preset "${name}" prefilled the step settings`
-        : `preset "${name}" (no known prefill; used as fallback)`,
-    );
+    setLog(prefs ? t("opt.presetPrefill", { name }) : t("opt.presetUnknown", { name }));
   }
 
   async function loadPresets(): Promise<void> {
@@ -925,7 +913,7 @@ export function mountOptimize(): TabHandle {
         el("button", {
           class: `small preset ${name === activePreset ? "active" : ""}`,
           text: name,
-          title: `prefill the steps from the "${name}" preset`,
+          title: t("opt.presetTitle", { name }),
           onclick: () => applyPreset(name),
         }),
       ),
@@ -933,7 +921,7 @@ export function mountOptimize(): TabHandle {
   }
 
   async function loadSource(path: string): Promise<void> {
-    sourceLabel.textContent = `Source: ${path}`;
+    sourceLabel.textContent = t("opt.sourceLabel", { path });
     sourceLabel.title = path;
     syncSourceHead();
     syncEmptyHint();
@@ -944,7 +932,7 @@ export function mountOptimize(): TabHandle {
       else left.loadDemo();
       openHint.hidden = true;
     } catch (err) {
-      notify(`load failed: ${(err as Error).message}`, "error");
+      notify(t("opt.loadFail", { message: (err as Error).message }), "error");
       openHint.hidden = false;
     }
     runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
@@ -974,7 +962,7 @@ export function mountOptimize(): TabHandle {
         { class: "row" },
         el("button", {
           class: "small primary",
-          text: "Run anyway",
+          text: t("common.runAnyway"),
           onclick: () => {
             guardBox.hidden = true;
             guardBox.replaceChildren();
@@ -983,7 +971,7 @@ export function mountOptimize(): TabHandle {
         }),
         el("button", {
           class: "small",
-          text: "Cancel",
+          text: t("common.cancel"),
           onclick: () => {
             guardBox.hidden = true;
             guardBox.replaceChildren();
@@ -1000,11 +988,8 @@ export function mountOptimize(): TabHandle {
     if (steps().textures.enabled) {
       const images = await sourceImages();
       if (images && images.length > 0 && !images.some(isEncodableImage)) {
-        showGuard(
-          "All textures in the source are already KTX2 — texture settings will not apply.",
-          () => void doRun(),
-        );
-        setLog("run blocked: source textures are all KTX2 (confirm to run anyway)");
+        showGuard(t("opt.ktx2Guard"), () => void doRun());
+        setLog(t("opt.guardBlocked"));
         return;
       }
     }
@@ -1016,7 +1001,7 @@ export function mountOptimize(): TabHandle {
     if (!path || running) return;
     const specSteps = buildSpec(steps());
     if (specSteps.length === 0) {
-      notify("pick at least one step", "error");
+      notify(t("opt.pickStep"), "error");
       return;
     }
     const specJson = JSON.stringify({ steps: specSteps });
@@ -1026,14 +1011,14 @@ export function mountOptimize(): TabHandle {
     /* The run supersedes the previous result: drop it before doing any work. */
     lastResult = null;
     resetReport();
-    setProgress("starting…", 0);
+    setProgress(t("opt.starting"), 0);
     try {
       const call = await app.bridge.optimizeCustom(
         path,
         specJson,
         activePreset || "desktop",
         (p) => {
-          if (running) setProgress(p.step || "running…", p.pct);
+          if (running) setProgress(p.step || t("opt.runningShort"), p.pct);
         },
       );
       if (call.started) {
@@ -1045,11 +1030,11 @@ export function mountOptimize(): TabHandle {
           stopProgress = null;
           return;
         }
-        setProgress("running…", 0);
-        setLog("optimization running in the background…");
+        setProgress(t("opt.runningShort"), 0);
+        setLog(t("opt.runningBg"));
         doneTimer = setTimeout(() => {
           doneTimer = null;
-          finishJobError("no completion event within 10 minutes — timed out");
+          finishJobError(t("opt.jobTimeout"));
         }, RUN_TIMEOUT_MS);
         return;
       }
@@ -1057,19 +1042,19 @@ export function mountOptimize(): TabHandle {
       // Older hosts: the call itself returned the finished report.
       lastResult = call.result;
       stopJob();
-      setProgress("done", 100);
+      setProgress(t("common.done"), 100);
       renderReport(call.result);
       noteResult(call.result);
       void loadOptimized(call.result.out_path);
-      notify("optimization finished", "ok");
+      notify(t("opt.finished"), "ok");
     } catch (err) {
       stopJob();
       if (isBusyError(err)) {
-        setProgress("busy", 0);
-        notify("optimize already running — wait for it to finish", "error");
+        setProgress(t("opt.runningShort"), 0);
+        notify(t("opt.busyMsg"), "error");
       } else {
-        setProgress("failed", 0);
-        notify(`optimize failed: ${(err as Error).message}`, "error");
+        setProgress(t("common.failed"), 0);
+        notify(t("opt.failedMsg", { message: (err as Error).message }), "error");
       }
     }
   }
@@ -1091,6 +1076,19 @@ export function mountOptimize(): TabHandle {
   // controls in sync unless this tab is the origin of the change.
   const offSettings = onSettingsChange(() => {
     if (!internalEdit) syncAll();
+  });
+  // Instant language switch: rebuild the shared step form (static labels),
+  // then re-render every dynamic surface incl. the last report.
+  const offLang = onLang(() => {
+    for (const btn of Array.from(root.querySelectorAll(".help-btn"))) {
+      const anchor = btn as HTMLElement;
+      anchor.title = t("help.whatDoes");
+      anchor.setAttribute("aria-label", t("help.aria", { id: anchor.dataset.help ?? "" }));
+    }
+    buildForm();
+    if (lastResult) renderReport(lastResult);
+    else resetReport();
+    syncAll();
   });
 
   return {
@@ -1127,7 +1125,7 @@ export function mountOptimize(): TabHandle {
             openHint.hidden = false;
           }
         } catch (err) {
-          notify(`WebGL unavailable: ${(err as Error).message}`, "error");
+          notify(t("viewer.webglFail", { reason: (err as Error).message }), "error");
         }
       } else {
         left.resume();
@@ -1152,6 +1150,7 @@ export function mountOptimize(): TabHandle {
       offView();
       offLog();
       offSettings();
+      offLang();
       offDone();
       offExport();
       stopJob();
