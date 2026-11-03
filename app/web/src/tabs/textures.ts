@@ -16,7 +16,18 @@ import {
   statChip,
   statChipNode,
 } from "../ui";
-import { getSettings, onSettingsChange } from "../settings";
+import {
+  clearTextureOverride,
+  describeTextureDeviation,
+  effectiveTextureParams,
+  getTextureOverrides,
+  replaceTextureOverride,
+  textureOverrideForImage,
+  textureOverridesCount,
+  getSettings,
+  onSettingsChange,
+} from "../settings";
+import type { TextureFormat, TextureOverride } from "../settings";
 import type {
   EncodeResult,
   EncodeSettings,
@@ -61,6 +72,7 @@ export function mountTextures(): TabHandle {
   /** Which file each action targets (preview sees the view, apply reads the source). */
   const previewActs = el("div", { class: "hint muted mono" });
   const applyActs = el("div", { class: "hint muted mono" });
+  const overridesNote = el("div", { class: "hint muted mono" });
   const applyResultHost = el("div");
   const applyBar = el(
     "div",
@@ -71,6 +83,7 @@ export function mountTextures(): TabHandle {
     }),
     el("div", { class: "row" }, applyBtn, applyParams),
     applyActs,
+    overridesNote,
     el("div", {
       class: "hint",
       text: "First run on 7×2048² textures takes ~30–40s; re-running on KTX2 is fast (skipped).",
@@ -100,6 +113,10 @@ export function mountTextures(): TabHandle {
 
   let images: ImageInfo[] = [];
   let selected = -1;
+  /** Expanded per-texture override editor (one row at a time; index-based). */
+  let expanded: number | null = null;
+  /** True while the row editor commits (skip the full list rebuild). */
+  let selfEdit = false;
 
   /* ------------------------------------------------------------- preview state */
 
@@ -364,6 +381,7 @@ export function mountTextures(): TabHandle {
   /* ------------------------------------------------------------------- list */
 
   function rowBadge(img: ImageInfo): HTMLElement {
+    if (img.skipped) return el("span", { class: "badge dim", text: "skipped" });
     if (activeEncode?.index === img.index) {
       return el("span", { class: "badge yellow", text: "previewing…" });
     }
@@ -373,6 +391,36 @@ export function mountTextures(): TabHandle {
     return img.has_mips
       ? el("span", { class: "badge green", text: "mips" })
       : el("span", { class: "badge dim", text: "no mips" });
+  }
+
+  /** Deviation from base params for one row (`uastc · 512 · q200`, `skipped`). */
+  function deviationBadge(img: ImageInfo): HTMLElement {
+    const src = app.sourcePath;
+    const dev = src ? describeTextureDeviation(src, img.index, img.name) : null;
+    const badge = el("span", {
+      class: `badge ${dev === "skipped" ? "dim" : "accent"}`,
+      text: dev ?? "",
+      dataset: { ovbadge: String(img.index) },
+      title: "per-texture override (deviation from base params)",
+    });
+    badge.hidden = !dev;
+    return badge;
+  }
+
+  /** Updates row badges in place (no rebuild, so the open editor keeps focus). */
+  function refreshOverrideBadges(): void {
+    const src = app.sourcePath;
+    for (const node of Array.from(listHost.querySelectorAll("[data-ovbadge]"))) {
+      const badge = node as HTMLElement;
+      const img = images.find((i) => i.index === Number(badge.dataset.ovbadge));
+      const dev = img && src ? describeTextureDeviation(src, img.index, img.name) : null;
+      badge.hidden = !dev;
+      if (dev) {
+        badge.textContent = dev;
+        badge.classList.toggle("dim", dev === "skipped");
+        badge.classList.toggle("accent", dev !== "skipped");
+      }
+    }
   }
 
   function renderList(): void {
@@ -394,28 +442,62 @@ export function mountTextures(): TabHandle {
       }
       return;
     }
-    const rows = images.map((img) =>
-      el(
-        "tr",
-        {
-          class: `clickable ${img.index === selected ? "selected" : ""} ${
-            img.index === previewing ? "previewing" : ""
-          } ${img.index === activeEncode?.index ? "encoding" : ""}`,
-          onclick: () => selectImage(img.index),
+    const src = app.sourcePath;
+    const body: HTMLElement[] = [];
+    for (const img of images) {
+      const open = expanded === img.index;
+      const expandBtn = el("button", {
+        class: "small chev",
+        text: open ? "▾" : "▸",
+        title: src
+          ? "per-texture overrides for this image (stored per source model)"
+          : "open a source model to edit per-texture overrides",
+        onclick: (ev: Event) => {
+          ev.stopPropagation();
+          expanded = open ? null : img.index;
+          renderList();
         },
-        el("td", { class: "mono", text: String(img.index) }),
-        el("td", { text: img.name ?? "—" }),
-        el("td", { class: "mono", text: img.format }),
-        el("td", { class: "num", text: `${img.width}×${img.height}` }),
-        el("td", { class: "num", text: fmtBytes(img.disk) }),
-        el("td", { class: "num", text: fmtBytes(img.vram) }),
-        el("td", null, rowBadge(img)),
-      ),
-    );
+      });
+      const formatText = img.effective_format ?? img.format;
+      const formatCell = el("td", { class: "mono", text: formatText });
+      if (img.effective_format && img.effective_format !== img.format) {
+        formatCell.title = `stored: ${img.format} → effective: ${img.effective_format}`;
+      }
+      body.push(
+        el(
+          "tr",
+          {
+            class: `clickable ${img.index === selected ? "selected" : ""} ${
+              img.index === previewing ? "previewing" : ""
+            } ${img.index === activeEncode?.index ? "encoding" : ""} ${
+              img.skipped ? "skipped" : ""
+            }`,
+            onclick: () => selectImage(img.index),
+          },
+          el("td", { class: "mono", text: String(img.index) }),
+          el("td", null, el("span", { text: img.name ?? "—" }), " ", deviationBadge(img)),
+          formatCell,
+          el("td", { class: "num", text: `${img.width}×${img.height}` }),
+          el("td", { class: "num", text: fmtBytes(img.disk) }),
+          el("td", { class: "num", text: fmtBytes(img.vram) }),
+          el("td", null, el("div", { class: "row" }, expandBtn, rowBadge(img))),
+        ),
+      );
+      if (open) {
+        body.push(
+          el(
+            "tr",
+            { class: "ov-row" },
+            el("td", { class: "ov-cell", colspan: 7 }, overrideEditor(img)),
+          ),
+        );
+      }
+    }
+    const rows = body;
     listHost.append(
       el(
         "table",
-        null,
+        { class: "texture-table" },
         el(
           "thead",
           null,
@@ -434,6 +516,229 @@ export function mountTextures(): TabHandle {
         el("tbody", null, ...rows),
       ),
     );
+  }
+
+  /* ------------------------------------------- per-texture override editor */
+
+  /** Row's effective params for preview/encode (base + this row's override). */
+  function effectiveFor(img: ImageInfo): EncodeSettings {
+    const src = app.sourcePath;
+    if (!src) {
+      const t = getSettings().optimize.steps.textures;
+      return {
+        format: t.format,
+        quality: t.quality,
+        max_size: t.max_size,
+        generate_mips: t.generate_mips,
+      };
+    }
+    const eff = effectiveTextureParams(src, img.index, img.name);
+    const out: EncodeSettings = {
+      format: eff.format,
+      quality: eff.quality,
+      max_size: eff.max_size,
+      generate_mips: eff.generate_mips,
+    };
+    if (eff.normal_map !== undefined) out.normal_map = eff.normal_map;
+    return out;
+  }
+
+  const OV_FORMATS: Array<[string, string]> = [
+    ["base", "base"],
+    ["auto", "auto"],
+    ["ETC1S", "etc1s"],
+    ["UASTC", "uastc"],
+  ];
+  const OV_SIZES: Array<[string, string]> = [
+    ["base", "base"],
+    ["original", "0"],
+    ["256", "256"],
+    ["512", "512"],
+    ["1024", "1024"],
+    ["2048", "2048"],
+  ];
+  const OV_BINARY: Array<[string, string]> = [
+    ["base", "base"],
+    ["on", "on"],
+    ["off", "off"],
+  ];
+  const OV_TERNARY: Array<[string, string]> = [
+    ["inherit", "base"],
+    ["yes", "yes"],
+    ["no", "no"],
+  ];
+
+  /** Expandable per-texture editor. Overrides are stored per source model. */
+  function overrideEditor(img: ImageInfo): HTMLElement {
+    const src = app.sourcePath;
+    if (!src) {
+      return el("div", {
+        class: "hint",
+        text: "Open a source model to edit per-texture overrides (overrides apply to source).",
+      });
+    }
+    const base = getSettings().optimize.steps.textures;
+    const found = textureOverrideForImage(src, img.index);
+    const draft: TextureOverride = {};
+    if (found) {
+      if (found.format !== undefined) draft.format = found.format;
+      if (found.quality !== undefined) draft.quality = found.quality;
+      if (found.max_size !== undefined) draft.max_size = found.max_size;
+      if (found.generate_mips !== undefined) draft.generate_mips = found.generate_mips;
+      if (found.normal_map !== undefined) draft.normal_map = found.normal_map;
+      if (found.skip !== undefined) draft.skip = found.skip;
+    }
+
+    const commit = (): void => {
+      selfEdit = true;
+      try {
+        replaceTextureOverride(src, { ...draft, image: img.index });
+      } finally {
+        selfEdit = false;
+      }
+      refreshOverrideBadges();
+      syncApplyBar();
+    };
+
+    const form = el("div", { class: "ov-editor" });
+
+    const mkSelect = (
+      label: string,
+      options: Array<[string, string]>,
+      get: () => string,
+      set: (value: string) => void,
+      title?: string,
+    ): HTMLElement => {
+      const node = el("select", { class: "compact", title });
+      for (const [text, value] of options) node.append(el("option", { value, text }));
+      node.value = get();
+      node.addEventListener("change", () => {
+        set(node.value);
+        commit();
+      });
+      return el("label", { class: "ov-field" }, el("span", { text: label }), node);
+    };
+
+    form.append(
+      mkSelect(
+        "format",
+        OV_FORMATS,
+        () => draft.format ?? "base",
+        (v) => {
+          if (v === "base") delete draft.format;
+          else draft.format = v as TextureFormat;
+        },
+        `base: ${base.format}`,
+      ),
+    );
+
+    const qualityInput = el("input", {
+      type: "number",
+      min: 1,
+      max: 255,
+      step: 1,
+      class: "compact",
+      title: `base: ${base.quality} (empty = inherit)`,
+      placeholder: `base ${base.quality}`,
+    });
+    qualityInput.value = draft.quality !== undefined ? String(draft.quality) : "";
+    qualityInput.addEventListener("change", () => {
+      const raw = qualityInput.value.trim();
+      const n = Number(raw);
+      if (!raw || !Number.isFinite(n)) delete draft.quality;
+      else draft.quality = Math.round(Math.min(255, Math.max(1, n)));
+      qualityInput.value = draft.quality !== undefined ? String(draft.quality) : "";
+      commit();
+    });
+    form.append(el("label", { class: "ov-field" }, el("span", { text: "quality" }), qualityInput));
+
+    form.append(
+      mkSelect(
+        "max size",
+        OV_SIZES,
+        () => (draft.max_size !== undefined ? String(draft.max_size) : "base"),
+        (v) => {
+          if (v === "base") delete draft.max_size;
+          else draft.max_size = Number(v);
+        },
+        `base: ${base.max_size === 0 ? "original" : base.max_size}`,
+      ),
+      mkSelect(
+        "mips",
+        OV_BINARY,
+        () => (draft.generate_mips === undefined ? "base" : draft.generate_mips ? "on" : "off"),
+        (v) => {
+          if (v === "base") delete draft.generate_mips;
+          else draft.generate_mips = v === "on";
+        },
+        `base: ${base.generate_mips ? "on" : "off"}`,
+      ),
+      mkSelect(
+        "normal",
+        OV_TERNARY,
+        () => (draft.normal_map === undefined ? "base" : draft.normal_map ? "yes" : "no"),
+        (v) => {
+          if (v === "base") delete draft.normal_map;
+          else draft.normal_map = v === "yes";
+        },
+        "normal_map: hint for the encoder",
+      ),
+    );
+
+    const skipBox = el("input", { type: "checkbox", title: "leave as-is (not encoded)" });
+    skipBox.checked = draft.skip === true;
+    skipBox.addEventListener("change", () => {
+      if (skipBox.checked) draft.skip = true;
+      else delete draft.skip;
+      commit();
+    });
+    form.append(
+      el(
+        "label",
+        { class: "inline-check", title: "skip: leave as-is (not encoded)" },
+        skipBox,
+        el("span", { text: "SKIP" }),
+      ),
+    );
+
+    const head = el(
+      "div",
+      { class: "row spread" },
+      el("span", {
+        class: "muted mono",
+        text: `override image ${img.index} — applies to source`,
+        title: `stored under per_model[${src}]`,
+      }),
+      el("button", {
+        class: "small",
+        text: "Reset",
+        title: "clear this row's override",
+        onclick: () => {
+          clearTextureOverride(src, img.index);
+          renderList();
+          syncApplyBar();
+        },
+      }),
+    );
+
+    const nameBased = getTextureOverrides(src).filter(
+      (o) =>
+        o.image === undefined &&
+        !!o.name &&
+        !!img.name &&
+        img.name.toLowerCase().includes(o.name.toLowerCase()),
+    );
+
+    const wrap = el("div", { class: "ov-wrap" }, head, form);
+    if (nameBased.length > 0) {
+      wrap.append(
+        el("div", {
+          class: "hint",
+          text: `also matched by ${nameBased.length} name-based override(s) from JSON`,
+        }),
+      );
+    }
+    return wrap;
   }
 
   /* ------------------------------------------------------------------ side */
@@ -547,7 +852,12 @@ export function mountTextures(): TabHandle {
     renderList();
     renderDetail();
     try {
-      const call = await app.bridge.texturePreview(path, index);
+      const img = images.find((i) => i.index === index);
+      const call = await app.bridge.texturePreview(
+        path,
+        index,
+        img ? effectiveFor(img) : undefined,
+      );
       if (seq !== previewSeq) return; // another row was clicked meanwhile
       if (call.started) {
         armPreviewTimeout(seq, index);
@@ -644,7 +954,7 @@ export function mountTextures(): TabHandle {
     renderList();
     renderSide();
     try {
-      const call = await app.bridge.textureEncode(path, img.index);
+      const call = await app.bridge.textureEncode(path, img.index, effectiveFor(img));
       if (token !== encodeSeq || activeEncode?.token !== token) return;
       if (call.started) {
         encodeTimer = setTimeout(() => {
@@ -727,22 +1037,30 @@ export function mountTextures(): TabHandle {
   let pendingDst: string | null = null;
 
   /** Texture step from the shared optimize defaults, optionally overridden
-   *  by a preview's applied settings (the compare-pane shortcut). */
+   *  by a preview's applied settings (the compare-pane shortcut), plus this
+   *  source model's per-texture overrides merged in array order. */
   function textureStep(override?: EncodeSettings): Record<string, unknown> {
     const t = getSettings().optimize.steps.textures;
-    return {
+    const spec: Record<string, unknown> = {
       format: override?.format ?? t.format,
       quality: override?.quality ?? t.quality,
       rdo_lambda: 1,
       generate_mips: override?.generate_mips ?? t.generate_mips,
       max_size: override?.max_size ?? t.max_size,
     };
+    if (override?.normal_map !== undefined) spec.normal_map = override.normal_map;
+    const src = app.sourcePath;
+    const list = getTextureOverrides(src);
+    if (list.length > 0) spec.overrides = list.map((o) => ({ ...o }));
+    return spec;
   }
 
   function describeTextureParams(): string {
     const t = getSettings().optimize.steps.textures;
     const size = t.max_size === 0 ? "orig" : String(t.max_size);
-    return `${t.format} · q${t.quality} · ${size} · mips ${t.generate_mips ? "on" : "off"}`;
+    const n = textureOverridesCount(app.sourcePath);
+    const base = `${t.format} · q${t.quality} · ${size} · mips ${t.generate_mips ? "on" : "off"}`;
+    return n > 0 ? `${base} · ${n} override${n === 1 ? "" : "s"}` : base;
   }
 
   function fmtSecs(secs: number | undefined): string {
@@ -756,6 +1074,14 @@ export function mountTextures(): TabHandle {
 
   function syncApplyBar(): void {
     applyParams.textContent = describeTextureParams();
+    const src = app.sourcePath;
+    const n = textureOverridesCount(src);
+    overridesNote.textContent = src
+      ? n > 0
+        ? `overrides apply to source: ${n} for this model`
+        : "overrides apply to source: none for this model"
+      : "overrides apply to source: no source model";
+    overridesNote.title = src ?? "";
     applyBtn.disabled = applyRunning || !app.sourcePath;
     if (!applyRunning) applyBtn.textContent = "Apply to model…";
     syncActsOn();
@@ -967,7 +1293,10 @@ export function mountTextures(): TabHandle {
     }
   });
 
-  const offApplySettings = onSettingsChange(() => syncApplyBar());
+  const offApplySettings = onSettingsChange(() => {
+    if (!selfEdit) renderList();
+    syncApplyBar();
+  });
 
   /* ------------------------------------------------------------------ reload */
 
@@ -975,6 +1304,7 @@ export function mountTextures(): TabHandle {
     const path = app.viewPath;
     images = [];
     selected = -1;
+    expanded = null;
     preview = null;
     previewing = null;
     previewError = null;
@@ -1020,6 +1350,7 @@ export function mountTextures(): TabHandle {
     void reload();
   });
   const offSource = app.on("source", () => {
+    expanded = null;
     syncApplyBar();
     syncActsOn();
     renderList();

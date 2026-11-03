@@ -345,6 +345,12 @@ for (const def of TAB_DEFS) {
   );
 }
 
+// Cross-tab navigation (e.g. Optimize → "Edit in Textures tab").
+window.addEventListener("assetty:select-tab", (ev) => {
+  const id = (ev as CustomEvent).detail as TabId;
+  if (TAB_DEFS.some((t) => t.id === id)) selectTab(id);
+});
+
 /* ---------------------------------------------------------------- status bar */
 
 const updateStatusBar = (): void => {

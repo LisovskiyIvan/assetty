@@ -52,6 +52,9 @@ pub const Report = struct {
     steps: []const StepStatus,
     before: stats.Stats,
     after: stats.Stats,
+    /// Per-image outcomes of the textures step, in image order. Empty when the
+    /// preset has no textures step or no overrides. Arena-owned like the rest.
+    texture_images: []const TextureImageOutcome = &.{},
     /// Wall time of the whole run: load + steps + serialize/write, in seconds.
     total_secs: f64 = 0,
 }; // arena-owned, no deinit needed
@@ -82,6 +85,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     // ---- 2. run the steps ------------------------------------------------
     // `asset` starts as the loaded model; pruning replaces it wholesale.
     var asset = loaded.asset;
+    var tex_images: []const TextureImageOutcome = &.{};
+
     for (opts.preset.steps, 0..) |step, i| {
         const kind: []const u8 = @tagName(std.meta.activeTag(step));
         notify(opts, kind, if (n_steps == 0) 0.0 else @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_steps)));
@@ -182,13 +187,14 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                         .note = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(err)}),
                     };
                 };
+                tex_images = res.details;
                 break :blk .{
                     .kind = kind,
                     .applied = res.encoded > 0,
                     .note = try std.fmt.allocPrint(
                         a,
-                        "{s}: {d} encoded, {d} skipped; {d} -> {d} bytes",
-                        .{ res.mode_note, res.encoded, res.skipped, res.src_bytes, res.ktx_bytes },
+                        "{s}: {d} encoded, {d} skipped{s}; {d} -> {d} bytes",
+                        .{ res.mode_note, res.encoded, res.skipped, if (res.mixed) " (mixed, see texture_images)" else "", res.src_bytes, res.ktx_bytes },
                     ),
                 };
             },
@@ -216,6 +222,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
         .steps = steps,
         .before = before,
         .after = after,
+        .texture_images = tex_images,
         .total_secs = secsBetween(t_start, t_end),
     };
 }
@@ -235,7 +242,116 @@ const TexEncResult = struct {
     src_bytes: u64 = 0,
     ktx_bytes: u64 = 0,
     mode_note: []const u8 = "",
+    /// True when an override changed an effective format or skipped an image.
+    mixed: bool = false,
+    details: []const TextureImageOutcome = &.{},
 };
+
+/// One row of the textures step's per-image report: which image, whether it
+/// was left as-is, and the effective format (`@tagName` of the resolved
+/// `TextureFormat`, or `"as-is"` when skipped).
+pub const TextureImageOutcome = struct {
+    index: u32,
+    name: ?[]const u8 = null,
+    skipped: bool = false,
+    format: []const u8 = "",
+};
+
+/// Base `TextureParams` with every matching override applied in array order
+/// (last match wins). `normal_map` is the explicit override, if any; null
+/// means "auto-detect from the image name".
+pub const EffectiveTex = struct {
+    skip: bool = false,
+    format: preset.TextureFormat,
+    quality: u8,
+    max_size: u32,
+    generate_mips: bool,
+    normal_map: ?bool = null,
+};
+
+/// Resolve the effective params for image `index` with optional cgltf
+/// `name`/`uri`. A matching item's present fields replace the base params;
+/// `skip` is a plain bool so the last matching item's value wins. An item
+/// with neither `image` nor `name` matches nothing.
+pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]const u8, uri: ?[]const u8) EffectiveTex {
+    var eff: EffectiveTex = .{
+        .format = p.format,
+        .quality = p.quality,
+        .max_size = p.max_size,
+        .generate_mips = p.generate_mips,
+    };
+    for (p.overrides) |o| {
+        if (!overrideMatches(o, index, name, uri)) continue;
+        eff.skip = o.skip;
+        if (o.format) |f| eff.format = f;
+        if (o.quality) |q| eff.quality = q;
+        if (o.max_size) |m| eff.max_size = m;
+        if (o.generate_mips) |g| eff.generate_mips = g;
+        if (o.normal_map) |n| eff.normal_map = n;
+    }
+    return eff;
+}
+
+fn overrideMatches(o: preset.TextureOverride, index: u32, name: ?[]const u8, uri: ?[]const u8) bool {
+    var has_selector = false;
+    if (o.image) |ix| {
+        has_selector = true;
+        if (ix != index) return false;
+    }
+    if (o.name.len > 0) {
+        has_selector = true;
+        if (!nameOrUriContains(name, uri, o.name)) return false;
+    }
+    return has_selector;
+}
+
+fn nameOrUriContains(name: ?[]const u8, uri: ?[]const u8, needle: []const u8) bool {
+    if (name) |n| if (containsIgnoreCase(n, needle)) return true;
+    if (uri) |u| if (containsIgnoreCase(u, needle)) return true;
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/// `[*c]` cgltf string to a slice; null stays null.
+fn cStr(s: [*c]const u8) ?[]const u8 {
+    const p = s orelse return null;
+    return std.mem.span(p);
+}
+
+fn dupCStr(a: std.mem.Allocator, s: [*c]const u8) !?[]const u8 {
+    const p = s orelse return null;
+    return try a.dupe(u8, std.mem.span(p));
+}
+
+/// Base-format mode mapping (shared by every image without a format override).
+fn modeForFormat(f: preset.TextureFormat, target: preset.Target) encode_ktx.Mode {
+    return switch (f) {
+        // ETC1S transcodes to ASTC/ETC2/BC1-5 at load — the compact choice
+        .etc1s, .astc => .etc1s,
+        // UASTC transcodes to BC7 (quality path)
+        .uastc, .bc7 => .uastc,
+        .auto => switch (target) {
+            .desktop => .uastc,
+            .mobile, .web => .etc1s,
+        },
+    };
+}
 
 fn isNormalName(name: [*c]const u8) bool {
     const n = name orelse return false;
@@ -281,10 +397,19 @@ const PendingView = struct { img: *c.cgltf_image, view_idx: usize, normal: bool 
 /// (4 outer x 8 inner basisu threads) only adds context switching.
 const max_parallel_encodes = 4;
 
-/// One image to encode, in `cdata.images` order.
+/// One image to encode, in `cdata.images` order, with its resolved params.
 const ImageJob = struct {
     bytes: []const u8,
+    mode: encode_ktx.Mode,
+    quality: u8,
+    max_size: u32,
+    generate_mips: bool,
+    /// Value for the encode call's `normal_map` (override or auto path).
+    normal_map: bool,
+    srgb: bool,
+    /// Effective normal flag, for the buffer-view bookkeeping.
     normal: bool,
+    rdo_lambda: f32,
 };
 
 const EncOutcome = struct {
@@ -296,8 +421,6 @@ const EncOutcome = struct {
 
 const ParCtx = struct {
     jobs: []const ImageJob,
-    mode: encode_ktx.Mode,
-    p: preset.TextureParams,
     /// Work-stealing cursor: workers claim the next image index, so uneven
     /// image sizes balance out without chunking.
     next: std.atomic.Value(usize) = .init(0),
@@ -315,27 +438,27 @@ const Worker = struct {
 
 /// decode -> (downscale) -> basisu encode for one image, all scratch from
 /// `scratch`. The returned KTX2 is a c_allocator copy so it outlives the arena.
-fn encodeOneJob(scratch: std.mem.Allocator, job: ImageJob, mode: encode_ktx.Mode, p: preset.TextureParams) EncOutcome {
+fn encodeOneJob(scratch: std.mem.Allocator, job: ImageJob) EncOutcome {
     const dec = decode.decodeRgba(scratch, job.bytes) orelse return .{ .err = error.ImageDecode };
 
     var px = dec.pixels;
     var w = dec.width;
     var h = dec.height;
-    if (p.max_size > 0 and (w > p.max_size or h > p.max_size)) {
-        const fit = mips.fitMaxSize(scratch, px, w, h, p.max_size) catch |err| return .{ .err = err };
+    if (job.max_size > 0 and (w > job.max_size or h > job.max_size)) {
+        const fit = mips.fitMaxSize(scratch, px, w, h, job.max_size) catch |err| return .{ .err = err };
         px = fit.pixels;
         w = fit.w;
         h = fit.h;
     }
 
     const out = encode_ktx.encode(scratch, px, w, h, .{
-        .mode = mode,
-        .quality = p.quality,
-        .rdo_lambda = p.rdo_lambda,
-        .normal_map = job.normal and p.normal_maps_renormalize,
-        .generate_mips = p.generate_mips,
+        .mode = job.mode,
+        .quality = job.quality,
+        .rdo_lambda = job.rdo_lambda,
+        .normal_map = job.normal_map,
+        .generate_mips = job.generate_mips,
         .max_size = 0, // already downscaled
-        .srgb = !job.normal,
+        .srgb = job.srgb,
     }) catch |err| return .{ .err = err };
 
     const owned = std.heap.c_allocator.dupe(u8, out.ktx2) catch return .{ .err = error.OutOfMemory };
@@ -348,7 +471,7 @@ fn workerMain(w: *Worker) void {
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.jobs.len) return;
-        ctx.outs[i] = encodeOneJob(scratch, ctx.jobs[i], ctx.mode, ctx.p);
+        ctx.outs[i] = encodeOneJob(scratch, ctx.jobs[i]);
         _ = w.arena.reset(.retain_capacity);
     }
 }
@@ -374,23 +497,13 @@ fn encodeTexturesWith(
     thread_cap: usize,
 ) !TexEncResult {
     var res: TexEncResult = .{};
-    const mode: encode_ktx.Mode = switch (p.format) {
-        // ETC1S transcodes to ASTC/ETC2/BC1-5 at load — the compact choice
-        .etc1s => .etc1s,
-        .astc => .etc1s,
-        // UASTC transcodes to BC7 (quality path)
-        .uastc, .bc7 => .uastc,
-        .auto => switch (target) {
-            .desktop => .uastc,
-            .mobile, .web => .etc1s,
-        },
-    };
+    const base_mode = modeForFormat(p.format, target);
     res.mode_note = switch (p.format) {
         .astc => "etc1s (transcode to astc at load)",
         .bc7 => "uastc (transcode to bc7 at load)",
         .etc1s => "etc1s",
         .uastc => "uastc",
-        .auto => switch (mode) {
+        .auto => switch (base_mode) {
             .etc1s => "etc1s",
             .uastc => "uastc",
         },
@@ -401,13 +514,19 @@ fn encodeTexturesWith(
 
     var pending: std.ArrayList(PendingView) = .empty;
 
+    // Per-image report rows, only when overrides exist (the default path stays
+    // allocation-free and the report shape unchanged).
+    var details: std.ArrayList(TextureImageOutcome) = .empty;
+    const details_ptr: ?*std.ArrayList(TextureImageOutcome) = if (p.overrides.len > 0) &details else null;
+
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
     const n_threads = @min(thread_cap, encodeThreadCount(images.len));
     if (n_threads <= 1) {
-        try encodeImagesSequential(a, loaded.cdata, p, mode, images, &gb, &pending, &res);
+        try encodeImagesSequential(a, loaded.cdata, p, target, images, &gb, &pending, &res, details_ptr);
     } else {
-        try encodeImagesParallel(a, loaded.cdata, p, mode, images, &gb, &pending, &res, n_threads);
+        try encodeImagesParallel(a, loaded.cdata, p, target, images, &gb, &pending, &res, n_threads, details_ptr);
     }
+    if (details_ptr != null) res.details = try details.toOwnedSlice(a);
 
     if (pending.items.len == 0) return res;
     try gb.finish();
@@ -421,57 +540,92 @@ fn encodeTexturesWith(
     return res;
 }
 
+/// One detail row for the textures report. `format` is the effective format
+/// tag, or `"as-is"` for skipped images.
+fn appendDetail(
+    a: std.mem.Allocator,
+    details: ?*std.ArrayList(TextureImageOutcome),
+    index: u32,
+    name: [*c]const u8,
+    skipped: bool,
+    format: []const u8,
+) !void {
+    const d = details orelse return;
+    try d.append(a, .{
+        .index = index,
+        .name = try dupCStr(a, name),
+        .skipped = skipped,
+        .format = format,
+    });
+}
+
 /// Original one-image-at-a-time loop, kept for the single-image fast path and
 /// as the reference behaviour (same allocations in `a`, same view order).
 fn encodeImagesSequential(
     a: std.mem.Allocator,
     cd: *c.cgltf_data,
     p: preset.TextureParams,
-    mode: encode_ktx.Mode,
+    target: preset.Target,
     images: []c.cgltf_image,
     gb: *geom.Builder,
     pending: *std.ArrayList(PendingView),
     res: *TexEncResult,
+    details: ?*std.ArrayList(TextureImageOutcome),
 ) !void {
-    for (images) |*im| {
+    for (images, 0..) |*im, idx| {
+        const index: u32 = @intCast(idx);
+        const eff = resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri));
+        if (eff.skip) {
+            res.skipped += 1;
+            res.mixed = true;
+            // Untouched: buffer_view still points at the source bytes.
+            try appendDetail(a, details, index, im.name, true, "as-is");
+            continue;
+        }
+        if (eff.format != p.format) res.mixed = true;
         const bytes = embeddedImageBytes(cd, im) orelse {
             res.skipped += 1;
+            try appendDetail(a, details, index, im.name, true, "as-is");
             continue;
         };
         var dec = decode.decodeRgba(a, bytes) orelse {
             res.skipped += 1;
+            try appendDetail(a, details, index, im.name, true, "as-is");
             continue;
         };
         defer dec.deinit(a);
 
-        const normal = isNormalName(im.name);
+        const auto_normal = isNormalName(im.name);
+        const eff_normal: bool = eff.normal_map orelse auto_normal;
         var px = dec.pixels;
         var w = dec.width;
         var h = dec.height;
-        if (p.max_size > 0 and (w > p.max_size or h > p.max_size)) {
-            const fit = try mips.fitMaxSize(a, px, w, h, p.max_size);
+        if (eff.max_size > 0 and (w > eff.max_size or h > eff.max_size)) {
+            const fit = try mips.fitMaxSize(a, px, w, h, eff.max_size);
             px = fit.pixels;
             w = fit.w;
             h = fit.h;
         }
 
         const out = encode_ktx.encode(a, px, w, h, .{
-            .mode = mode,
-            .quality = p.quality,
+            .mode = modeForFormat(eff.format, target),
+            .quality = eff.quality,
             .rdo_lambda = p.rdo_lambda,
-            .normal_map = normal and p.normal_maps_renormalize,
-            .generate_mips = p.generate_mips,
+            .normal_map = if (eff.normal_map) |o| o else (auto_normal and p.normal_maps_renormalize),
+            .generate_mips = eff.generate_mips,
             .max_size = 0, // already downscaled
-            .srgb = !normal,
+            .srgb = !eff_normal,
         }) catch {
             res.skipped += 1;
+            try appendDetail(a, details, index, im.name, true, "as-is");
             continue;
         };
 
         res.src_bytes += bytes.len;
         res.ktx_bytes += out.ktx2.len;
         const vi = try gb.addView(out.ktx2, 0);
-        try pending.append(a, .{ .img = im, .view_idx = vi, .normal = normal });
+        try pending.append(a, .{ .img = im, .view_idx = vi, .normal = eff_normal });
+        try appendDetail(a, details, index, im.name, false, @tagName(eff.format));
         res.encoded += 1;
     }
 }
@@ -483,12 +637,13 @@ fn encodeImagesParallel(
     a: std.mem.Allocator,
     cd: *c.cgltf_data,
     p: preset.TextureParams,
-    mode: encode_ktx.Mode,
+    target: preset.Target,
     images: []c.cgltf_image,
     gb: *geom.Builder,
     pending: *std.ArrayList(PendingView),
     res: *TexEncResult,
     n_threads: usize,
+    details: ?*std.ArrayList(TextureImageOutcome),
 ) !void {
     const Slot = union(enum) { skip, job: usize };
     var slots = try a.alloc(Slot, images.len);
@@ -496,19 +651,39 @@ fn encodeImagesParallel(
 
     var jobs: std.ArrayList(ImageJob) = .empty;
     for (images, 0..) |*im, i| {
+        const eff = resolveTextureOverride(p, @intCast(i), cStr(im.name), cStr(im.uri));
+        if (eff.skip) {
+            res.mixed = true;
+            continue; // slot stays .skip; counted in the join loop below
+        }
         const bytes = embeddedImageBytes(cd, im) orelse continue;
+        if (eff.format != p.format) res.mixed = true;
+        const auto_normal = isNormalName(im.name);
+        const eff_normal: bool = eff.normal_map orelse auto_normal;
         slots[i] = .{ .job = jobs.items.len };
-        try jobs.append(a, .{ .bytes = bytes, .normal = isNormalName(im.name) });
+        try jobs.append(a, .{
+            .bytes = bytes,
+            .mode = modeForFormat(eff.format, target),
+            .quality = eff.quality,
+            .max_size = eff.max_size,
+            .generate_mips = eff.generate_mips,
+            .normal_map = if (eff.normal_map) |o| o else (auto_normal and p.normal_maps_renormalize),
+            .srgb = !eff_normal,
+            .normal = eff_normal,
+            .rdo_lambda = p.rdo_lambda,
+        });
     }
     if (jobs.items.len == 0) {
         res.skipped += @intCast(images.len);
+        if (details) |d| {
+            for (images, 0..) |*im, i|
+                try appendDetail(a, d, @intCast(i), im.name, true, "as-is");
+        }
         return;
     }
 
     var ctx: ParCtx = .{
         .jobs = jobs.items,
-        .mode = mode,
-        .p = p,
         .outs = try a.alloc(EncOutcome, jobs.items.len),
     };
     @memset(ctx.outs, .{});
@@ -540,9 +715,11 @@ fn encodeImagesParallel(
     };
 
     for (images, 0..) |*im, i| {
+        const index: u32 = @intCast(i);
         const j = switch (slots[i]) {
             .skip => {
                 res.skipped += 1;
+                try appendDetail(a, details, index, im.name, true, "as-is");
                 continue;
             },
             .job => |idx| idx,
@@ -553,6 +730,7 @@ fn encodeImagesParallel(
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     res.skipped += 1;
+                    try appendDetail(a, details, index, im.name, true, "as-is");
                     continue;
                 },
             }
@@ -561,6 +739,7 @@ fn encodeImagesParallel(
         res.ktx_bytes += out.ktx2.len;
         const vi = try gb.addView(out.ktx2, 0);
         try pending.append(a, .{ .img = im, .view_idx = vi, .normal = jobs.items[j].normal });
+        try appendDetail(a, details, index, im.name, false, @tagName(resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri)).format));
         res.encoded += 1;
     }
 }
@@ -712,6 +891,12 @@ fn testNowMs() i64 {
 
 /// Minimal GLB with `pngs.len` embedded PNG images and no geometry.
 fn testGlbWithImages(a: std.mem.Allocator, pngs: []const []const u8) ![]u8 {
+    const names = try a.alloc([]const u8, pngs.len);
+    for (names, 0..) |*n, i| n.* = try std.fmt.allocPrint(a, "tex{d}", .{i});
+    return testGlbWithNamedImages(a, pngs, names);
+}
+
+fn testGlbWithNamedImages(a: std.mem.Allocator, pngs: []const []const u8, names: []const []const u8) ![]u8 {
     var offs = try a.alloc(usize, pngs.len);
     var bin_len: usize = 0;
     for (pngs, 0..) |png, i| {
@@ -727,8 +912,8 @@ fn testGlbWithImages(a: std.mem.Allocator, pngs: []const []const u8) ![]u8 {
         if (i != 0) try js.append(a, ',');
         try js.appendSlice(a, try std.fmt.allocPrint(
             a,
-            "{{\"name\":\"tex{d}\",\"bufferView\":{d},\"mimeType\":\"image/png\"}}",
-            .{ i, i },
+            "{{\"name\":\"{s}\",\"bufferView\":{d},\"mimeType\":\"image/png\"}}",
+            .{ names[i], i },
         ));
     }
     try js.appendSlice(a, "],\"bufferViews\":[");
@@ -783,6 +968,128 @@ fn testGradient(a: std.mem.Allocator, w: u32, h: u32, seed: u8) ![]u8 {
 // Every encoded image must carry a KTX2 view, in image order, with strictly
 // increasing BIN offsets, and (since basisu's per-encode thread count is the
 // same either way) bytes identical to the sequential result.
+test "textures overrides: resolve order and matching" {
+    const ovs = [_]preset.TextureOverride{
+        .{ .image = 1, .format = .uastc, .quality = 200 },
+        .{ .name = "BASE", .max_size = 512 },
+        .{ .image = 1, .quality = 64 }, // last match wins for image 1
+    };
+    const p: preset.TextureParams = .{ .format = .etc1s, .quality = 128, .overrides = &ovs };
+
+    // Image 1: #0 sets uastc/200, #2 overwrites quality → uastc/64.
+    const e1 = resolveTextureOverride(p, 1, "tex1", null);
+    try testing.expect(!e1.skip);
+    try testing.expectEqual(preset.TextureFormat.uastc, e1.format);
+    try testing.expectEqual(@as(u8, 64), e1.quality);
+    try testing.expectEqual(@as(u32, 0), e1.max_size);
+
+    // Name match is case-insensitive; image 7 is only hit by #1.
+    const e2 = resolveTextureOverride(p, 7, "BaseColor_map", null);
+    try testing.expectEqual(preset.TextureFormat.etc1s, e2.format);
+    try testing.expectEqual(@as(u32, 512), e2.max_size);
+
+    // Unmatched image keeps the base params.
+    const e3 = resolveTextureOverride(p, 3, "other", "other.png");
+    try testing.expectEqual(preset.TextureFormat.etc1s, e3.format);
+    try testing.expectEqual(@as(u8, 128), e3.quality);
+
+    // An item with neither selector matches nothing.
+    const no_sel = [_]preset.TextureOverride{.{ .quality = 10 }};
+    const pn: preset.TextureParams = .{ .quality = 128, .overrides = &no_sel };
+    try testing.expectEqual(@as(u8, 128), resolveTextureOverride(pn, 0, "tex0", null).quality);
+
+    // image+name in one item: both must match.
+    const both = [_]preset.TextureOverride{.{ .image = 1, .name = "tex", .quality = 10 }};
+    const pb: preset.TextureParams = .{ .quality = 128, .overrides = &both };
+    try testing.expectEqual(@as(u8, 128), resolveTextureOverride(pb, 1, "other", null).quality);
+    try testing.expectEqual(@as(u8, 128), resolveTextureOverride(pb, 2, "tex2", null).quality);
+    try testing.expectEqual(@as(u8, 10), resolveTextureOverride(pb, 1, "tex1", null).quality);
+
+    // skip follows the same last-wins rule as every other field.
+    const skips = [_]preset.TextureOverride{ .{ .image = 0, .skip = true }, .{ .image = 0, .max_size = 64 } };
+    const ps: preset.TextureParams = .{ .overrides = &skips };
+    const es = resolveTextureOverride(ps, 0, null, null);
+    try testing.expect(!es.skip);
+    try testing.expectEqual(@as(u32, 64), es.max_size);
+}
+
+test "textures overrides: skip keeps source bytes, name override changes format" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dim: u32 = 512;
+    const pngs = try a.alloc([]const u8, 2);
+    for (pngs, 0..) |*png, i| {
+        const px = try testGradient(a, dim, dim, @intCast(31 * (i + 1)));
+        png.* = try decode.encodePngRgba(a, px, dim, dim);
+    }
+    const names = [_][]const u8{ "albedo", "BaseColor_map" };
+
+    const in_path = ".zig-cache/pipeline_runner_tex_ov.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = in_path, .data = try testGlbWithNamedImages(a, pngs, &names) });
+    defer std.Io.Dir.cwd().deleteFile(io, in_path) catch {};
+
+    // Baseline: no overrides, sequential.
+    const base_params: preset.TextureParams = .{ .quality = 64, .generate_mips = false };
+    var base_loaded = try parse.loadFile(io, a, in_path);
+    defer base_loaded.deinit();
+    const base = try encodeTexturesWith(a, base_loaded, base_params, .mobile, 1);
+    try testing.expectEqual(@as(u32, 2), base.encoded);
+    try testing.expectEqual(@as(u32, 0), base.skipped);
+    try testing.expect(!base.mixed);
+    try testing.expectEqual(@as(usize, 0), base.details.len);
+
+    // Overrides: skip image 0, uastc + downscale for the basecolor image.
+    const ovs = [_]preset.TextureOverride{
+        .{ .image = 0, .skip = true },
+        .{ .name = "basecolor", .format = .uastc, .max_size = 128 },
+    };
+    const ov_params: preset.TextureParams = .{ .quality = 64, .generate_mips = false, .overrides = &ovs };
+    var ov_loaded = try parse.loadFile(io, a, in_path);
+    defer ov_loaded.deinit();
+    const ov = try encodeTexturesWith(a, ov_loaded, ov_params, .mobile, 1);
+    try testing.expectEqual(@as(u32, 1), ov.encoded);
+    try testing.expectEqual(@as(u32, 1), ov.skipped);
+    try testing.expect(ov.mixed);
+    try testing.expectEqual(@as(usize, 2), ov.details.len);
+    try testing.expect(ov.details[0].skipped);
+    try testing.expectEqualStrings("as-is", ov.details[0].format);
+    try testing.expect(!ov.details[1].skipped);
+    try testing.expectEqualStrings("uastc", ov.details[1].format);
+    try testing.expectEqualStrings("BaseColor_map", ov.details[1].name.?);
+
+    // Skipped image 0 is untouched: still PNG, bytes identical to the source.
+    const ov_images = geom.sl(c.cgltf_image, ov_loaded.cdata.images, ov_loaded.cdata.images_count);
+    try testing.expectEqualStrings("image/png", std.mem.span(ov_images[0].mime_type.?));
+    const kept: *const c.cgltf_buffer_view = @ptrCast(ov_images[0].buffer_view.?);
+    try testing.expectEqualSlices(u8, pngs[0], geom.viewData(kept).?);
+
+    // Image 1 encoded as uastc, downscaled to max_size.
+    try testing.expectEqualStrings("image/ktx2", std.mem.span(ov_images[1].mime_type.?));
+    const enc_view: *const c.cgltf_buffer_view = @ptrCast(ov_images[1].buffer_view.?);
+    const hdr = formats.parseHeader(geom.viewData(enc_view).?) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 128), hdr.width);
+    try testing.expectEqual(@as(u32, 128), hdr.height);
+
+    // Parallel path agrees with the sequential reference.
+    var par_loaded = try parse.loadFile(io, a, in_path);
+    defer par_loaded.deinit();
+    const par = try encodeTexturesWith(a, par_loaded, ov_params, .mobile, 4);
+    try testing.expectEqual(ov.encoded, par.encoded);
+    try testing.expectEqual(ov.skipped, par.skipped);
+    try testing.expectEqual(ov.details.len, par.details.len);
+    for (ov.details, par.details) |x, y| {
+        try testing.expectEqual(x.index, y.index);
+        try testing.expectEqual(x.skipped, y.skipped);
+        try testing.expectEqualStrings(x.format, y.format);
+    }
+    const par_images = geom.sl(c.cgltf_image, par_loaded.cdata.images, par_loaded.cdata.images_count);
+    const par_view: *const c.cgltf_buffer_view = @ptrCast(par_images[1].buffer_view.?);
+    try testing.expectEqualSlices(u8, geom.viewData(enc_view).?, geom.viewData(par_view).?);
+}
+
 test "textures: 4 images encode in parallel, image order preserved" {
     const io = testing.io;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

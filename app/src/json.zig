@@ -238,6 +238,20 @@ pub fn writeOptimize(
         try w.print(", \"applied\": {s}, \"note\": ", .{if (st.applied) "true" else "false"});
         try jsonStr(w, st.note);
         try w.print(", \"secs\": {d:.4}", .{st.secs});
+        // The textures step also carries the per-image rows (same data as the
+        // root `texture_images`, placed on the step where the page looks).
+        if (std.mem.eql(u8, st.kind, "textures") and rep.texture_images.len > 0) {
+            try w.writeAll(", \"images\": [");
+            for (rep.texture_images, 0..) |im, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.print("{{\"index\":{d},\"name\":", .{im.index});
+                try jsonStrOpt(w, im.name);
+                try w.writeAll(",\"format\":");
+                try jsonStr(w, im.format);
+                try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
+            }
+            try w.writeByte(']');
+        }
         try w.writeByte('}');
     }
     try w.writeAll("\n  ],\n  \"deltas\": {");
@@ -268,6 +282,19 @@ pub fn writeOptimize(
         rep.after.vram_total,
         rep.after.disk_total,
     });
+    // Per-image textures outcomes (only present when the preset used overrides).
+    if (rep.texture_images.len > 0) {
+        try w.writeAll(",\n  \"texture_images\": [");
+        for (rep.texture_images, 0..) |im, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
+            try jsonStrOpt(w, im.name);
+            try w.writeAll(",\"format\":");
+            try jsonStr(w, im.format);
+            try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
+        }
+        try w.writeAll("\n  ]");
+    }
     try w.print("}},\n  \"total_secs\": {d:.3}\n}}\n", .{rep.total_secs});
 }
 

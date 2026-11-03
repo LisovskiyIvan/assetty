@@ -1,14 +1,21 @@
 import { app } from "../app";
 import { isBusyError } from "../bridge";
 import { buildOptimizeForm } from "../optimizeForm";
-import { getSettings, onSettingsChange, updateSettings } from "../settings";
-import type { OptimizeSteps } from "../settings";
+import {
+  getSettings,
+  getTextureOverrides,
+  onSettingsChange,
+  textureOverridesCount,
+  updateSettings,
+} from "../settings";
+import type { OptimizeSteps, TextureFormat } from "../settings";
 import {
   el,
   fmtBytes,
   fmtNum,
   fmtPct,
   deltaClass,
+  clear,
   section,
   copyText,
   emptyState,
@@ -115,15 +122,16 @@ function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
   if (steps.weld.enabled) out.push({ weld: { tolerance: steps.weld.tolerance } });
   if (steps.join.enabled) out.push({ join: {} });
   if (steps.textures.enabled) {
-    out.push({
-      textures: {
-        format: steps.textures.format,
-        quality: steps.textures.quality,
-        rdo_lambda: 1,
-        generate_mips: steps.textures.generate_mips,
-        max_size: steps.textures.max_size,
-      },
-    });
+    const textures: Record<string, unknown> = {
+      format: steps.textures.format,
+      quality: steps.textures.quality,
+      rdo_lambda: 1,
+      generate_mips: steps.textures.generate_mips,
+      max_size: steps.textures.max_size,
+    };
+    const overrides = getTextureOverrides(app.sourcePath);
+    if (overrides.length > 0) textures.overrides = overrides.map((o) => ({ ...o }));
+    out.push({ textures });
   }
   if (steps.quantize.enabled) {
     out.push({
@@ -264,8 +272,109 @@ export function mountOptimize(): TabHandle {
 
   const form = buildOptimizeForm(stepsBody, { get: steps, edit });
 
+  /* --------------------------------------- textures: auto presets + overrides */
+
+  /** Seeds for the textures BASE params (per-texture overrides stay untouched). */
+  const TEXTURE_AUTO: Array<{
+    name: string;
+    format: TextureFormat;
+    quality: number;
+    max_size: number;
+    mips: boolean;
+    tip: string;
+  }> = [
+    {
+      name: "mobile",
+      format: "etc1s",
+      quality: 128,
+      max_size: 1024,
+      mips: true,
+      tip: "mobile: ETC1S q128, max 1024px, mips on — small downloads",
+    },
+    {
+      name: "desktop",
+      format: "etc1s",
+      quality: 160,
+      max_size: 0,
+      mips: true,
+      tip: "desktop: ETC1S q160, original size, mips on — max fidelity",
+    },
+    {
+      name: "web",
+      format: "etc1s",
+      quality: 96,
+      max_size: 2048,
+      mips: true,
+      tip: "web: ETC1S q96, max 2048px, mips on — fast streaming",
+    },
+  ];
+
+  const texExtra = el("div", { class: "tex-extra" });
+
+  function syncTexExtra(): void {
+    clear(texExtra);
+    texExtra.append(
+      el(
+        "div",
+        { class: "chip-row" },
+        el("span", { class: "muted", text: "auto:" }),
+        ...TEXTURE_AUTO.map((p) =>
+          el("button", {
+            class: "small",
+            text: p.name,
+            title: p.tip,
+            onclick: () => {
+              edit((s) => {
+                s.textures.format = p.format;
+                s.textures.quality = p.quality;
+                s.textures.max_size = p.max_size;
+                s.textures.generate_mips = p.mips;
+              });
+              syncTexExtra();
+            },
+          }),
+        ),
+      ),
+      el(
+        "div",
+        { class: "hint" },
+        el("span", {
+          text: (() => {
+            const n = textureOverridesCount(app.sourcePath);
+            return n > 0
+              ? `${n} per-texture override${n === 1 ? "" : "s"} (apply to source)`
+              : "no per-texture overrides";
+          })(),
+          title:
+            "overrides are model-scoped (per_model[sourcePath]) and merge into the textures step",
+        }),
+        " ",
+        el("button", {
+          class: "small",
+          text: "Edit in Textures tab",
+          title: "open the Textures tab to edit per-image overrides",
+          onclick: () => {
+            window.dispatchEvent(new CustomEvent("assetty:select-tab", { detail: "textures" }));
+          },
+        }),
+      ),
+    );
+  }
+
+  // Inside the textures step block so the chips read as part of the step;
+  // falls back to a standalone block if the form layout ever changes.
+  for (const block of Array.from(stepsBody.querySelectorAll(".step-block"))) {
+    if (block.querySelector(".step-name")?.textContent === "textures") {
+      block.append(texExtra);
+      break;
+    }
+  }
+  if (!texExtra.parentElement) stepsPanel.append(texExtra);
+  syncTexExtra();
+
   function syncAll(): void {
     form.sync();
+    syncTexExtra();
     runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
     syncSourceHead();
     syncEmptyHint();
@@ -444,6 +553,26 @@ export function mountOptimize(): TabHandle {
             s.note && s.note !== "ok" ? el("span", { class: "note", text: s.note }) : null,
           ),
         );
+        // Per-image rows (newer hosts): skipped state + effective format.
+        if (s.kind === "textures" && s.images && s.images.length > 0) {
+          for (const im of s.images) {
+            const idx = im.image ?? im.index ?? -1;
+            const label = [`#${idx}`, im.name ?? null].filter((p) => p).join(" ");
+            list.append(
+              el(
+                "div",
+                { class: `step-image ${im.skipped ? "skipped" : ""}` },
+                el("span", { class: "mark", text: im.skipped ? "–" : "·" }),
+                el("span", {
+                  text: im.skipped
+                    ? `${label} — skipped`
+                    : `${label} → ${im.effective_format ?? im.format ?? "?"}`,
+                  title: im.skipped ? "left as-is (not encoded)" : "effective format",
+                }),
+              ),
+            );
+          }
+        }
       }
       body.append(list);
     }
@@ -596,6 +725,7 @@ export function mountOptimize(): TabHandle {
     sourceLabel.title = path;
     syncSourceHead();
     syncEmptyHint();
+    syncTexExtra();
     if (!left) return;
     try {
       if (app.bridge.live) await left.loadBase64(await app.bridge.loadBytes(path));

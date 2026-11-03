@@ -51,6 +51,13 @@ const SCHEMA_SAMPLE = `{
                     "error_tolerance": 0.001, "aggressive": false,
                     "lock_borders": true, "use_attributes": false,
                     "weight_normal": 1, "weight_uv": 1 }
+    },
+    "per_model": {
+      "<sourcePath>": { "textures": { "overrides": [
+        { "image": 2, "format": "uastc", "quality": 200,
+          "max_size": 512, "generate_mips": true },
+        { "image": 5, "skip": true }
+      ] } }
     }
   }
 }
@@ -90,7 +97,7 @@ export function mountSettings(): TabHandle {
     }),
     el("span", {
       class: "mono",
-      text: "{ theme, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify } } }",
+      text: "{ theme, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
     }),
   );
 

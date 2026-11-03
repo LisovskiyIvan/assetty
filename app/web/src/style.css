@@ -1596,3 +1596,109 @@ textarea {
     display: none;
   }
 }
+
+/* --- per-texture overrides (Textures tab row editor) --- */
+.badge.accent {
+  color: var(--accent-fg);
+  border-color: var(--accent-border);
+  background: var(--accent-dim);
+}
+
+button.chev {
+  padding: 1px 7px;
+  font-size: 11px;
+  flex: none;
+}
+
+tr.skipped td {
+  color: var(--text-dim);
+}
+
+.texture-table {
+  table-layout: fixed;
+}
+
+.texture-table th:last-child,
+.texture-table td:last-child {
+  width: 132px;
+}
+
+.ov-cell {
+  padding: 0 8px 10px 30px;
+  background: var(--bg-alt);
+}
+
+.ov-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.ov-editor {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px 10px;
+  min-width: 0;
+}
+
+.ov-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.ov-field select,
+.ov-field input {
+  width: 100%;
+  min-width: 0;
+}
+
+/* --- optimize tab: texture auto presets + overrides note --- */
+.tex-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  min-width: 0;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* --- optimize report: per-image rows of the textures step --- */
+.step-image {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  padding-left: 16px;
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.step-image.skipped {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.step-image .mark {
+  color: var(--text-dim);
+}

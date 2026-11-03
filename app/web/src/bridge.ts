@@ -52,6 +52,7 @@ import type {
   OptimizeReport,
   OptimizeResult,
   Stats,
+  TextureImageReport,
   TexturePreview,
   TexturesResult,
 } from "./types";
@@ -262,6 +263,9 @@ function normalizeOptimize(raw: unknown): OptimizeResult {
       applied: Boolean(st.applied),
       note: st.note == null ? undefined : String(st.note),
       secs: optNumber(st.secs ?? st.seconds ?? st.duration),
+      images: (Array.isArray(st.images) && st.images.length > 0
+        ? st.images
+        : undefined) as unknown as TextureImageReport[] | undefined,
     };
   });
   const before = normalizeStats(rep.before ?? r.before);
@@ -378,8 +382,21 @@ function normalizeSettings(raw: unknown): EncodeSettings | undefined {
         : typeof s.mips === "boolean"
           ? s.mips
           : undefined,
+    normal_map: typeof s.normal_map === "boolean" ? s.normal_map : undefined,
   };
   return out;
+}
+
+/** Drops undefined keys so the host sees only the params being overridden. */
+function cleanEncodeArgs(settings?: EncodeSettings): Record<string, unknown> | undefined {
+  if (!settings) return undefined;
+  const out: Record<string, unknown> = {};
+  if (settings.format != null) out.format = settings.format;
+  if (settings.quality != null) out.quality = settings.quality;
+  if (settings.max_size != null) out.max_size = settings.max_size;
+  if (settings.generate_mips != null) out.generate_mips = settings.generate_mips;
+  if (settings.normal_map != null) out.normal_map = settings.normal_map;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Normalizes both the event payload and the legacy synchronous reply. */
@@ -694,17 +711,22 @@ export class Bridge {
    * Renders one image of the asset to a PNG. New hosts answer
    * `{ started: true }` and report through `texturePreviewDone`; older hosts
    * may reply with the payload directly (the tab handles both).
+   * `settings` carries the row's effective params (base + its override).
    */
-  async texturePreview(path: string, index: number): Promise<PreviewInvocation> {
+  async texturePreview(
+    path: string,
+    index: number,
+    settings?: EncodeSettings,
+  ): Promise<PreviewInvocation> {
     if (!this.live) {
       return { started: false, result: await this.demo.texturePreview(path, index) };
     }
     if (!this.native?.methods.includes("texturePreview")) {
       throw new Error("backend has no texturePreview()");
     }
-    const res = parseMaybeJson<Record<string, unknown>>(
-      await this.raw("texturePreview", [path, index]),
-    );
+    const extra = cleanEncodeArgs(settings);
+    const args = extra ? [path, index, JSON.stringify(extra)] : [path, index];
+    const res = parseMaybeJson<Record<string, unknown>>(await this.raw("texturePreview", args));
     if (isStartedAck(res)) return { started: true };
     const event = normalizePreviewDone({ ...res, ok: true });
     if (!event.ok) throw new Error(event.error);
@@ -724,13 +746,21 @@ export class Bridge {
     }
   }
 
-  async textureEncode(path: string, index: number): Promise<EncodeInvocation> {
+  /**
+   * Dry-run encode of one image. `settings` carries the row's effective
+   * params (base + its override); omitted keys fall back to host defaults.
+   */
+  async textureEncode(
+    path: string,
+    index: number,
+    settings?: EncodeSettings,
+  ): Promise<EncodeInvocation> {
     if (!this.live) {
       return { started: false, result: await this.demo.textureEncode(path, index) };
     }
-    const res = parseMaybeJson<Record<string, unknown>>(
-      await this.raw("textureEncode", [path, index]),
-    );
+    const extra = cleanEncodeArgs(settings);
+    const args = extra ? [path, index, JSON.stringify(extra)] : [path, index];
+    const res = parseMaybeJson<Record<string, unknown>>(await this.raw("textureEncode", args));
     if (isStartedAck(res)) return { started: true };
     const payload =
       res.result && typeof res.result === "object" ? (res.result as Record<string, unknown>) : res;

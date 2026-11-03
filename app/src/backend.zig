@@ -74,8 +74,8 @@ pub const Backend = struct {
         .optimize = .{ "path", "preset" },
         .optimizeCustom = .{ "path", "spec" },
         .textures = .{"path"},
-        .textureEncode = .{ "path", "index" },
-        .texturePreview = .{ "path", "index" },
+        .textureEncode = .{ "path", "index", "settings" },
+        .texturePreview = .{ "path", "index", "settings" },
         .diff = .{ "a", "b" },
         .lint = .{ "path", "budgetJson" },
         .presetLoad = .{"name"},
@@ -168,9 +168,19 @@ pub const Backend = struct {
     /// Encodes image `index` to KTX2 in the background: answers
     /// `{"started":true}` at once, then `textureEncodeDone` with the size, the
     /// PSNR, the VRAM it now needs and paths to the before/after PNGs.
-    pub fn textureEncode(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
+    /// `settings` is a JSON object string with per-call overrides for this one
+    /// image — `{"format":"etc1s"|"uastc","quality":N,"max_size":N,
+    /// "generate_mips":bool,"normal_map":bool}`; omitted keys keep the host
+    /// defaults (the Textures tab sends the row's effective params).
+    pub fn textureEncode(
+        self: *Backend,
+        call: *nanoui.Call,
+        path: []const u8,
+        index: u32,
+        settings: ?[]const u8,
+    ) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
-        return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index, null);
+        return self.launch(call.arena, Target.of(call.window), .texture_encode, path, null, index, settings);
     }
 
     /// Renders image `index` as a PNG the page can show: answers
@@ -180,7 +190,17 @@ pub const Backend = struct {
     /// Async like `textureEncode`: decode (stb/basisu) plus PNG encode of a
     /// 2K texture is seconds, not milliseconds, so it must not run on the main
     /// thread.
-    pub fn texturePreview(self: *Backend, call: *nanoui.Call, path: []const u8, index: u32) !json.Raw {
+    /// `settings` is accepted for call-shape symmetry with `textureEncode`
+    /// (the page sends the row's params to both) but ignored: a preview
+    /// renders the decoded image, which no encode setting changes.
+    pub fn texturePreview(
+        self: *Backend,
+        call: *nanoui.Call,
+        path: []const u8,
+        index: u32,
+        settings: ?[]const u8,
+    ) !json.Raw {
+        _ = settings;
         if (self.previewBusy()) return json.errorRaw(call.arena, "busy", .{});
         return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index, null);
     }
@@ -809,7 +829,8 @@ const Job = struct {
     path: []u8,
     /// Deep copy of the resolved preset; null for `texture_encode`.
     preset: ?core.preset.Preset = null,
-    /// Second path argument; the `export_file` destination, else null.
+    /// Extra argument: the `export_file` destination, or the `texture_encode`
+    /// settings JSON text; null for every other kind.
     arg: ?[]u8 = null,
     /// Set by the worker before it posts: null means it failed, see `err`.
     result: ?Result = null,
@@ -862,7 +883,7 @@ const Job = struct {
     fn runTextureEncode(self: *Job) void {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index) catch
+        const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index, self.arg) catch
             return self.fail("out of memory", .{});
         switch (outcome) {
             // The two paths point into the arena, which dies here: the job's
@@ -1147,10 +1168,32 @@ fn windowAlive(app: *nanoui.App, window: *nanoui.Window) bool {
 fn clonePreset(gpa: std.mem.Allocator, p: core.preset.Preset) !core.preset.Preset {
     const name = try gpa.dupe(u8, p.name);
     errdefer gpa.free(name);
-    return .{ .name = name, .target = p.target, .steps = try gpa.dupe(core.preset.Step, p.steps) };
+    const steps = try gpa.dupe(core.preset.Step, p.steps);
+    errdefer gpa.free(steps);
+    // Override slices (and their name strings) point into the call's arena,
+    // which dies with the call; the job outlives it, so deep-copy them.
+    for (steps) |*s| {
+        if (s.* == .textures and s.textures.overrides.len > 0) {
+            const ov = try gpa.dupe(core.preset.TextureOverride, s.textures.overrides);
+            errdefer gpa.free(ov);
+            for (ov) |*o| {
+                if (o.name.len > 0) o.name = try gpa.dupe(u8, o.name);
+            }
+            s.textures.overrides = ov;
+        }
+    }
+    return .{ .name = name, .target = p.target, .steps = steps };
 }
 
 fn freePreset(gpa: std.mem.Allocator, p: core.preset.Preset) void {
+    for (p.steps) |s| {
+        if (s == .textures) {
+            for (s.textures.overrides) |o| {
+                if (o.name.len > 0) gpa.free(o.name);
+            }
+            if (s.textures.overrides.len > 0) gpa.free(s.textures.overrides);
+        }
+    }
     gpa.free(p.name);
     gpa.free(p.steps);
 }
@@ -1191,15 +1234,23 @@ const Encoded = struct {
 };
 
 /// Load `path`, encode image `index` to KTX2, measure it and write the
-/// before/after PNGs.
-fn encodeTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32) error{OutOfMemory}!EncodeOutcome {
+/// before/after PNGs. `settings_text` carries optional per-call overrides
+/// (see `parseEncodeOverride`).
+fn encodeTexture(
+    io: std.Io,
+    a: std.mem.Allocator,
+    path: []const u8,
+    index: u32,
+    settings_text: ?[]const u8,
+) error{OutOfMemory}!EncodeOutcome {
     var loaded = core.parse.loadFile(io, a, path) catch |err|
         return .{ .failed = try std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) };
     defer loaded.deinit();
     if (index >= loaded.asset.images.len)
         return .{ .failed = try std.fmt.allocPrint(a, "image {d} out of range ({d} images)", .{ index, loaded.asset.images.len }) };
 
-    const enc = encodeImage(a, loaded.asset.images[index], index) catch |err| switch (err) {
+    const ov = parseEncodeOverride(a, settings_text);
+    const enc = encodeImage(a, loaded.asset.images[index], index, ov) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failed = try std.fmt.allocPrint(a, "encode {d}: {s}", .{ index, @errorName(err) }) },
     };
@@ -1227,6 +1278,68 @@ fn encodeTexture(io: std.Io, a: std.mem.Allocator, path: []const u8, index: u32)
         .max_size = e.max_size,
         .generate_mips = e.generate_mips,
     } };
+}
+
+/// Per-call override for a single-image encode: present fields replace the
+/// host defaults; absent keys keep them (including the name-based normal-map
+/// detection).
+const EncodeOverride = struct {
+    mode: ?core.encode_ktx.Mode = null,
+    quality: ?u8 = null,
+    max_size: ?u32 = null,
+    generate_mips: ?bool = null,
+    normal_map: ?bool = null,
+};
+
+/// Parses the `settings` argument of `textureEncode`: a JSON object string
+/// with `format` ("etc1s"/"uastc"; "auto" and unknown strings keep the
+/// default), `quality`, `max_size`, `generate_mips`, `normal_map`. Lenient
+/// like the step specs: invalid JSON, wrong types or unknown keys leave the
+/// default in place instead of failing the encode.
+fn parseEncodeOverride(a: std.mem.Allocator, text: ?[]const u8) EncodeOverride {
+    var ov: EncodeOverride = .{};
+    const t = std.mem.trim(u8, text orelse return ov, " \t\r\n");
+    if (t.len == 0) return ov;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, t, .{}) catch return ov;
+    defer parsed.deinit();
+    const fields = switch (parsed.value) {
+        .object => |o| o,
+        else => return ov,
+    };
+    if (fields.get("format")) |f| {
+        switch (f) {
+            .string => |s| {
+                if (std.mem.eql(u8, s, "uastc")) ov.mode = .uastc;
+                if (std.mem.eql(u8, s, "etc1s")) ov.mode = .etc1s;
+            },
+            else => {},
+        }
+    }
+    if (fields.get("quality")) |q| {
+        switch (q) {
+            .integer => |i| ov.quality = std.math.cast(u8, i),
+            else => {},
+        }
+    }
+    if (fields.get("max_size")) |m| {
+        switch (m) {
+            .integer => |i| ov.max_size = std.math.cast(u32, i),
+            else => {},
+        }
+    }
+    if (fields.get("generate_mips")) |g| {
+        switch (g) {
+            .bool => |b| ov.generate_mips = b,
+            else => {},
+        }
+    }
+    if (fields.get("normal_map")) |nm| {
+        switch (nm) {
+            .bool => |b| ov.normal_map = b,
+            else => {},
+        }
+    }
+    return ov;
 }
 
 /// Writes `<out_dir>/tex_<ts>_<tag>.png` and returns the absolute path (the
@@ -1444,7 +1557,7 @@ fn presetFromSpecValue(
     for (step_order) |kind| {
         for (items) |item| {
             const params = item.object.get(@tagName(kind)) orelse continue;
-            steps[n] = try stepFromSpec(kind, params, detail);
+            steps[n] = try stepFromSpec(a, kind, params, detail);
             n += 1;
         }
     }
@@ -1501,7 +1614,58 @@ const SpecParams = struct {
     }
 };
 
+/// Parse the textures step's `overrides` array (see the pipeline contract).
+/// Lenient on purpose: a missing/non-array value means no overrides, a
+/// non-object item is skipped, and a mistyped field keeps its default.
+/// Unknown keys are ignored, like the step params themselves. An unknown
+/// format string leaves the override's format unset (it must not silently
+/// become `.auto`, which is a real value here).
+fn parseTextureOverrides(a: std.mem.Allocator, v: ?std.json.Value) SpecError![]core.preset.TextureOverride {
+    const items = switch (v orelse return &.{}) {
+        .array => |arr| arr.items,
+        else => return &.{},
+    };
+    var out: std.ArrayList(core.preset.TextureOverride) = .empty;
+    for (items) |item| {
+        const fields = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        var o: core.preset.TextureOverride = .{};
+        if (fields.get("image")) |iv| {
+            if (iv == .integer) o.image = std.math.cast(u32, iv.integer);
+        }
+        if (fields.get("name")) |nv| {
+            if (nv == .string) o.name = try a.dupe(u8, nv.string);
+        }
+        if (fields.get("skip")) |sv| {
+            if (sv == .bool) o.skip = sv.bool;
+        }
+        if (fields.get("format")) |fv| {
+            if (fv == .string) {
+                if (std.meta.stringToEnum(core.preset.TextureFormat, fv.string)) |f| o.format = f;
+            }
+        }
+        if (fields.get("quality")) |qv| {
+            if (qv == .integer) o.quality = std.math.cast(u8, qv.integer);
+        }
+        if (fields.get("max_size")) |mv| {
+            if (mv == .integer) o.max_size = std.math.cast(u32, mv.integer);
+        }
+        if (fields.get("generate_mips")) |gv| {
+            if (gv == .bool) o.generate_mips = gv.bool;
+        }
+        if (fields.get("normal_map")) |nmv| {
+            if (nmv == .bool) o.normal_map = nmv.bool;
+        }
+        try out.append(a, o);
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(a);
+}
+
 fn stepFromSpec(
+    a: std.mem.Allocator,
     kind: core.preset.StepKind,
     v: std.json.Value,
     detail: *[]const u8,
@@ -1549,6 +1713,7 @@ fn stepFromSpec(
                 .normal_maps_renormalize = (try r.boolField("normal_maps_renormalize")) orelse d.normal_maps_renormalize,
                 .generate_mips = (try r.boolField("generate_mips")) orelse d.generate_mips,
                 .max_size = (try r.intField(u32, "max_size")) orelse d.max_size,
+                .overrides = try parseTextureOverrides(a, r.get("overrides")),
             } };
         },
         .quantize => blk: {
@@ -1611,25 +1776,45 @@ const EncodedPixels = struct {
 
 /// Decode image `idx` to RGBA, encode to KTX2, decode back, measure PSNR.
 /// Null when the image is not decodable (external/unsupported).
-fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?EncodedPixels {
+fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32, ov: EncodeOverride) !?EncodedPixels {
     const bytes = img.data orelse return null;
     const dec = core.decode.decodeRgba(a, bytes) orelse return null;
 
-    const is_normal = if (img.name) |n| containsIgnoreCase(n, "normal") else false;
-    const opts: core.encode_ktx.Options = .{ .normal_map = is_normal };
+    const is_normal = ov.normal_map orelse
+        (if (img.name) |n| containsIgnoreCase(n, "normal") else false);
+    var opts: core.encode_ktx.Options = .{ .normal_map = is_normal };
+    if (ov.mode) |m| opts.mode = m;
+    if (ov.quality) |q| opts.quality = q;
+    if (ov.max_size) |ms| opts.max_size = ms;
+    if (ov.generate_mips) |g| opts.generate_mips = g;
 
-    const out = try core.encode_ktx.encode(a, dec.pixels, dec.width, dec.height, opts);
+    // `max_size` is a downscale: fit here so the round-trip check below can
+    // compare against the *encoded* dimensions (core encode() would resize
+    // internally and the mismatch would read as "not encodable").
+    var px = dec.pixels;
+    var w = dec.width;
+    var h = dec.height;
+    const req_max = opts.max_size;
+    if (opts.max_size > 0 and (w > opts.max_size or h > opts.max_size)) {
+        const fitted = core.mips.fitMaxSize(a, px, w, h, opts.max_size) catch return null;
+        px = fitted.pixels;
+        w = fitted.w;
+        h = fitted.h;
+        opts.max_size = 0;
+    }
+
+    const out = try core.encode_ktx.encode(a, px, w, h, opts);
     const rt = try core.encode_ktx.decodeToRgba(a, out.ktx2);
-    if (rt.width != dec.width or rt.height != dec.height) return null;
+    if (rt.width != w or rt.height != h) return null;
 
-    const levels = mipLevelsFor(dec.width, dec.height);
-    const vram_before = core.formats.mipChainBytes(dec.width, dec.height, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
+    const levels = mipLevelsFor(w, h);
+    const vram_before = core.formats.mipChainBytes(w, h, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
     return .{
         .result = .{
             .index = idx,
             .name = img.name,
-            .width = dec.width,
-            .height = dec.height,
+            .width = w,
+            .height = h,
             .mode = opts.mode,
             .quality = opts.quality,
             .srgb = opts.srgb,
@@ -1640,13 +1825,13 @@ fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?EncodedP
             .mip_levels = out.mip_levels,
             .vram_before = vram_before,
             .vram_after = out.ktx2.len,
-            .psnr_db = core.encode_ktx.psnr(dec.pixels, rt.pixels),
+            .psnr_db = core.encode_ktx.psnr(px, rt.pixels),
         },
-        .before = .{ .rgba = dec.pixels, .width = dec.width, .height = dec.height },
+        .before = .{ .rgba = px, .width = w, .height = h },
         .after = .{ .rgba = rt.pixels, .width = rt.width, .height = rt.height },
         .mode = opts.mode,
         .quality = opts.quality,
-        .max_size = opts.max_size,
+        .max_size = req_max,
         .generate_mips = opts.generate_mips,
     };
 }
@@ -1982,6 +2167,99 @@ test "custom spec accepts a json string value" {
     try testing.expectEqual(core.preset.StepKind.join, std.meta.activeTag(p.steps[1]));
 }
 
+test "custom spec maps textures overrides" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const spec =
+        \\{"steps":[{
+        \\  "textures":{
+        \\    "format":"auto","quality":128,"max_size":0,"generate_mips":true,
+        \\    "overrides":[
+        \\      {"image":2,"format":"uastc","quality":200,"max_size":512,"generate_mips":true,"skip":false,"normal_map":true},
+        \\      {"name":"basecolor","max_size":1024},
+        \\      {"image":5,"skip":true}
+        \\    ]
+        \\  }
+        \\}]}
+    ;
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(a, spec, &detail);
+    try testing.expectEqual(@as(usize, 1), p.steps.len);
+    const tex = p.steps[0].textures;
+    try testing.expectEqual(@as(usize, 3), tex.overrides.len);
+
+    try testing.expectEqual(@as(?u32, 2), tex.overrides[0].image);
+    try testing.expectEqual(core.preset.TextureFormat.uastc, tex.overrides[0].format.?);
+    try testing.expectEqual(@as(?u8, 200), tex.overrides[0].quality);
+    try testing.expectEqual(@as(?u32, 512), tex.overrides[0].max_size);
+    try testing.expectEqual(@as(?bool, true), tex.overrides[0].generate_mips);
+    try testing.expectEqual(@as(?bool, true), tex.overrides[0].normal_map);
+    try testing.expect(!tex.overrides[0].skip);
+
+    try testing.expectEqualStrings("basecolor", tex.overrides[1].name);
+    try testing.expectEqual(@as(?u32, 1024), tex.overrides[1].max_size);
+    try testing.expectEqual(@as(?u32, null), tex.overrides[1].image);
+
+    try testing.expect(tex.overrides[2].skip);
+
+    // The effective resolution matches the pipeline's (last wins).
+    const eff = core.runner.resolveTextureOverride(tex, 2, "helmet_base", null);
+    try testing.expectEqual(core.preset.TextureFormat.uastc, eff.format);
+    try testing.expectEqual(@as(u8, 200), eff.quality);
+
+    // overrides on non-textures steps are ignored (unknown keys pass through).
+    var detail2: []const u8 = "";
+    const p2 = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{\"overrides\":[{\"image\":0}]}}]}", &detail2);
+    try testing.expect(p2.steps[0].prune.unused_nodes);
+}
+
+test "custom spec ignores malformed override items gracefully" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Non-object items dropped; mistyped fields keep defaults; unknown keys
+    // and unknown format strings ignored; out-of-range ints ignored.
+    const spec =
+        \\{"steps":[{
+        \\  "textures":{"overrides":[
+        \\    42,
+        \\    {"image":"two","quality":"high","bogus_key":1,"format":"bogus"},
+        \\    {"image":9999999999,"quality":300},
+        \\    {"name":"ok","skip":true}
+        \\  ]}
+        \\}]}
+    ;
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(a, spec, &detail);
+    const tex = p.steps[0].textures;
+    try testing.expectEqual(@as(usize, 3), tex.overrides.len);
+    // First kept item: everything malformed → all defaults.
+    try testing.expectEqual(@as(?u32, null), tex.overrides[0].image);
+    try testing.expectEqual(@as(?u8, null), tex.overrides[0].quality);
+    try testing.expectEqual(@as(?core.preset.TextureFormat, null), tex.overrides[0].format);
+    try testing.expect(!tex.overrides[0].skip);
+    // Second kept item: out-of-range ints ignored, not errors.
+    try testing.expectEqual(@as(?u32, null), tex.overrides[1].image);
+    try testing.expectEqual(@as(?u8, null), tex.overrides[1].quality);
+    // Third kept item is intact.
+    try testing.expectEqualStrings("ok", tex.overrides[2].name);
+    try testing.expect(tex.overrides[2].skip);
+
+    // Non-array overrides and null both mean "none", not an error.
+    for ([_][]const u8{
+        "{\"steps\":[{\"textures\":{\"overrides\":\"nope\"}}]}",
+        "{\"steps\":[{\"textures\":{\"overrides\":null}}]}",
+        "{\"steps\":[{\"textures\":{}}]}",
+    }) |s| {
+        var d: []const u8 = "";
+        const q = try customPresetFromSpec(a, s, &d);
+        try testing.expectEqual(@as(usize, 0), q.steps[0].textures.overrides.len);
+    }
+}
+
 test "custom spec rejects unknown step kinds by name" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2115,6 +2393,11 @@ const Collector = struct {
     called: std.atomic.Value(bool) = .init(false),
     ok: bool = false,
     report: ?[]u8 = null,
+    // Scalar snapshot of a `.texture` result (its strings die with the job).
+    mode: ?core.encode_ktx.Mode = null,
+    quality: u8 = 0,
+    max_size: u32 = 0,
+    mips: bool = true,
 
     fn collect(ctx: ?*anyopaque, job: *Job) void {
         const self: *Collector = @ptrCast(@alignCast(ctx orelse return));
@@ -2122,7 +2405,13 @@ const Collector = struct {
         self.ok = job.result != null;
         if (job.result) |res| switch (res) {
             .optimize => |o| self.report = testing.allocator.dupe(u8, o.report) catch null,
-            .texture, .preview, .exported => {},
+            .texture => |t| {
+                self.mode = t.mode;
+                self.quality = t.quality;
+                self.max_size = t.max_size;
+                self.mips = t.generate_mips;
+            },
+            .preview, .exported => {},
         };
         self.mutex.unlock();
         job.backend.releaseJob(job);
@@ -2187,6 +2476,54 @@ test "texturePreview runs on a worker and delivers a result" {
     try testing.expect(!b.busy());
 }
 
+test "textureEncode honors the settings payload" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    var got: Collector = .{};
+    b.on_job_done = &Collector.collect;
+    b.on_job_done_ctx = &got;
+    defer b.on_job_done = null;
+
+    const reply = try b.launch(a, .{}, .texture_encode, "test/fixtures/box.glb", null, 0, "{\"format\":\"uastc\",\"quality\":200,\"max_size\":64,\"generate_mips\":false,\"nope\":1}");
+    try testing.expectEqualStrings("{\"started\":true}", reply.text);
+
+    got.wait();
+    try testing.expect(got.ok);
+    try testing.expect(!b.busy());
+    try testing.expectEqual(core.encode_ktx.Mode.uastc, got.mode.?);
+    try testing.expectEqual(@as(u8, 200), got.quality);
+    try testing.expectEqual(@as(u32, 64), got.max_size);
+    try testing.expect(!got.mips);
+}
+
+test "textureEncode without settings keeps the defaults" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var b = testBackend();
+    var got: Collector = .{};
+    b.on_job_done = &Collector.collect;
+    b.on_job_done_ctx = &got;
+    defer b.on_job_done = null;
+
+    // Empty string, garbage, and null must all resolve to the defaults.
+    for ([_]?[]const u8{ null, "", "not json", "[1,2]" }) |s| {
+        got = .{};
+        const reply = try b.launch(a, .{}, .texture_encode, "test/fixtures/box.glb", null, 0, s);
+        try testing.expectEqualStrings("{\"started\":true}", reply.text);
+        got.wait();
+        try testing.expect(got.ok);
+        try testing.expectEqual(core.encode_ktx.Mode.etc1s, got.mode.?);
+        try testing.expectEqual(@as(u8, 128), got.quality);
+        try testing.expectEqual(@as(u32, 0), got.max_size);
+        try testing.expect(got.mips);
+    }
+}
+
 test "exportTo shares the pipeline gate and delivers on a worker" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2230,7 +2567,7 @@ test "texture encode reports an out-of-range index" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 999)) {
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 999, null)) {
         .failed => |msg| try testing.expect(std.mem.indexOf(u8, msg, "out of range") != null),
         else => return error.TestUnexpectedResult,
     }
@@ -2241,7 +2578,7 @@ test "texture encode writes before/after pngs and reports the settings" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0)) {
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0, null)) {
         .done => |e| {
             // Absolute paths that actually exist and are real PNGs.
             try testing.expect(std.fs.path.isAbsolute(e.before_png));

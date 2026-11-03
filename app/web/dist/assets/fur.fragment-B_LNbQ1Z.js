@@ -1,0 +1,76 @@
+import{b6 as e}from"./index-Crtbj3yS.js";import{helperFunctionsWGSL as a}from"./helperFunctions-D5r70MFH.js";import{l as o,s as n}from"./shadowsFragmentFunctions-DXmO8kic.js";import{logDepthDeclarationWGSL as t}from"./logDepthDeclaration-BMqOz1nS.js";import{l as s}from"./lightsFragmentFunctions-Cj8T4gqJ.js";import{fogFragmentDeclarationWGSL as l}from"./fogFragmentDeclaration-Ci9FXFb8.js";import{c as u,a as m}from"./clipPlaneFragment-DyBYmI8v.js";import{d as c}from"./depthPrePass-Cwd2ZMOE.js";import{lightFragmentWGSL as v}from"./lightFragment-B-johT03.js";import{l as d}from"./logDepthFragment-DJRjn3Uj.js";import{f as g}from"./fogFragment-CwzsOB7W.js";import{i as S}from"./imageProcessingCompatibility-fb0Eml2j.js";import"./clusteredLightingFunctions-RslSq0Zq.js";const f="furPixelShader",i=`uniform vEyePosition: vec4f;uniform vDiffuseColor: vec4f;uniform furColor: vec4f;uniform furLength: f32;varying vPositionW: vec3f;varying vfur_length: f32;
+#ifdef NORMAL
+varying vNormalW: vec3f;
+#endif
+#ifdef VERTEXCOLOR
+varying vColor: vec4f;
+#endif
+#include<helperFunctions>
+#include<lightUboDeclaration>[0..maxSimultaneousLights]
+#ifdef DIFFUSE
+varying vDiffuseUV: vec2f;var diffuseSamplerSampler: sampler;var diffuseSampler: texture_2d<f32>;uniform vDiffuseInfos: vec2f;
+#endif
+#ifdef HIGHLEVEL
+uniform furOffset: f32;uniform furOcclusion: f32;var furTextureSampler: sampler;var furTexture: texture_2d<f32>;varying vFurUV: vec2f;
+#endif
+#include<logDepthDeclaration>
+#include<lightsFragmentFunctions>
+#include<shadowsFragmentFunctions>
+#include<fogFragmentDeclaration>
+#include<clipPlaneFragmentDeclaration>
+fn Rand(rv: vec3f)->f32 {var x: f32=dot(rv, vec3f(12.9898,78.233,24.65487));return fract(sin(x)*43758.5453);}
+#if defined(CLUSTLIGHT_BATCH) && CLUSTLIGHT_BATCH>0
+varying vViewDepth: f32;
+#endif
+#define CUSTOM_FRAGMENT_DEFINITIONS
+@fragment
+fn main(input: FragmentInputs)->FragmentOutputs {
+#define CUSTOM_FRAGMENT_MAIN_BEGIN
+#include<clipPlaneFragment>
+var viewDirectionW: vec3f=normalize(uniforms.vEyePosition.xyz-fragmentInputs.vPositionW);var baseColor: vec4f=uniforms.furColor;var diffuseColor: vec3f=uniforms.vDiffuseColor.rgb;var alpha: f32=uniforms.vDiffuseColor.a;
+#ifdef DIFFUSE
+baseColor=baseColor*textureSample(diffuseSampler,diffuseSamplerSampler,fragmentInputs.vDiffuseUV);
+#ifdef ALPHATEST
+if (baseColor.a<0.4) {discard;}
+#endif
+#define DEPTHPREPASS_SKIP_EARLY_RETURN
+#include<depthPrePass>
+#ifndef DEPTHPREPASS
+baseColor=vec4f(baseColor.rgb*uniforms.vDiffuseInfos.y,baseColor.a);
+#endif
+#endif
+#ifndef DEPTHPREPASS
+#ifdef VERTEXCOLOR
+baseColor=vec4f(baseColor.rgb*fragmentInputs.vColor.rgb,baseColor.a);
+#endif
+#ifdef NORMAL
+var normalW: vec3f=normalize(fragmentInputs.vNormalW);
+#else
+var normalW: vec3f= vec3f(1.0,1.0,1.0);
+#endif
+#ifdef HIGHLEVEL
+var furTextureColor: vec4f=textureSample(furTexture,furTextureSampler, vec2f(fragmentInputs.vFurUV.x,fragmentInputs.vFurUV.y));if (furTextureColor.a<=0.0 || furTextureColor.g<uniforms.furOffset) {discard;}
+var occlusion: f32=mix(0.0,furTextureColor.b*1.2,uniforms.furOffset);baseColor= vec4f(baseColor.xyz*max(occlusion,uniforms.furOcclusion),1.1-uniforms.furOffset);
+#endif
+var diffuseBase: vec3f= vec3f(0.,0.,0.);var info: lightingInfo;var shadow: f32=1.;var glossiness: f32=0.;var aggShadow: f32=0.;var numLights: f32=0.;
+#ifdef SPECULARTERM
+var specularBase: vec3f= vec3f(0.,0.,0.);
+#endif
+#include<lightFragment>[0..maxSimultaneousLights]
+#if defined(VERTEXALPHA) || defined(INSTANCESCOLOR) && defined(INSTANCES)
+alpha*=fragmentInputs.vColor.a;
+#endif
+var finalDiffuse: vec3f=clamp(diffuseBase.rgb*baseColor.rgb,vec3f(0.0),vec3f(1.0));
+#ifdef HIGHLEVEL
+var color: vec4f= vec4f(finalDiffuse,alpha);
+#else
+var rr: f32=fragmentInputs.vfur_length/uniforms.furLength*0.5;var color: vec4f= vec4f(finalDiffuse*(0.5+rr),alpha);
+#endif
+#include<logDepthFragment>
+#include<fogFragment>
+fragmentOutputs.color=color;
+#include<imageProcessingCompatibility>
+#define CUSTOM_FRAGMENT_MAIN_END
+#endif
+}
+`;e.ShadersStoreWGSL[f]||(e.ShadersStoreWGSL[f]=i);const p=[a,o,t,s,n,l,u,m,c,v,d,g,S];for(const r of p)e.IncludesShadersStoreWGSL[r.name]||(e.IncludesShadersStoreWGSL[r.name]=r.shader);const A={name:f,shader:i};export{A as furPixelShaderWGSL};

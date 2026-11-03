@@ -135,6 +135,25 @@ pub const TextureParams = struct {
     generate_mips: bool = true,
     /// Downscale textures larger than this. 0 = no limit.
     max_size: u32 = 0,
+    /// Per-image overrides, applied in array order (last match wins).
+    overrides: []const TextureOverride = &.{},
+};
+
+/// One entry of `TextureParams.overrides`. Every field is optional: only the
+/// present ones replace the step's base params for the matched image. An entry
+/// matching no image is ignored.
+pub const TextureOverride = struct {
+    /// 0-based index into model.images (the indices `info` reports).
+    image: ?u32 = null,
+    /// Substring matched (case-insensitive) against image name/uri.
+    name: []const u8 = "",
+    /// Leave the image as-is: original bytes preserved, not encoded.
+    skip: bool = false,
+    format: ?TextureFormat = null,
+    quality: ?u8 = null,
+    max_size: ?u32 = null,
+    generate_mips: ?bool = null,
+    normal_map: ?bool = null,
 };
 
 /// One pipeline step. The active field selects the operation.
@@ -306,16 +325,20 @@ pub fn describe(p: Preset, w: anytype) !void {
                 "simplify  target_ratio={d} error_tolerance={d} aggressive={} lock_borders={} use_attributes={} weight_normal={d} weight_uv={d}\n",
                 .{ v.target_ratio, v.error_tolerance, v.aggressive, v.lock_borders, v.use_attributes, v.weight_normal, v.weight_uv },
             ),
-            .textures => |v| try w.print(
-                "textures  format={s} quality={d} rdo_lambda={d} mips={} max_size={d}\n",
-                .{
-                    @tagName(v.format),
-                    v.quality,
-                    v.rdo_lambda,
-                    v.generate_mips,
-                    v.max_size,
-                },
-            ),
+            .textures => |v| {
+                try w.print(
+                    "textures  format={s} quality={d} rdo_lambda={d} mips={} max_size={d}",
+                    .{
+                        @tagName(v.format),
+                        v.quality,
+                        v.rdo_lambda,
+                        v.generate_mips,
+                        v.max_size,
+                    },
+                );
+                if (v.overrides.len > 0) try w.print(" overrides={d}", .{v.overrides.len});
+                try w.writeByte('\n');
+            },
         }
     }
 }
@@ -506,4 +529,64 @@ test "describe smoke test" {
     try testing.expect(std.mem.indexOf(u8, out, "textures  format=astc") != null);
     try testing.expect(std.mem.indexOf(u8, out, "quantize  position_bits=14") != null);
     try testing.expectEqual(@as(usize, 7), std.mem.count(u8, out, "\n"));
+}
+
+test "parse textures overrides round-trip" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const src =
+        \\.{
+        \\    .name = "ov",
+        \\    .target = .desktop,
+        \\    .steps = .{
+        \\        .{ .textures = .{
+        \\            .format = .auto,
+        \\            .quality = 128,
+        \\            .overrides = .{
+        \\                .{ .image = 2, .format = .uastc, .quality = 200, .max_size = 512, .generate_mips = true, .normal_map = true },
+        \\                .{ .name = "basecolor", .max_size = 1024 },
+        \\                .{ .image = 5, .skip = true },
+        \\            },
+        \\        } },
+        \\    },
+        \\}
+    ;
+
+    const p = try parse(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 1), p.steps.len);
+    const tex = p.steps[0].textures;
+    try testing.expectEqual(@as(usize, 3), tex.overrides.len);
+
+    const o0 = tex.overrides[0];
+    try testing.expectEqual(@as(?u32, 2), o0.image);
+    try testing.expectEqual(TextureFormat.uastc, o0.format.?);
+    try testing.expectEqual(@as(?u8, 200), o0.quality);
+    try testing.expectEqual(@as(?u32, 512), o0.max_size);
+    try testing.expectEqual(@as(?bool, true), o0.generate_mips);
+    try testing.expectEqual(@as(?bool, true), o0.normal_map);
+    try testing.expect(!o0.skip);
+
+    const o1 = tex.overrides[1];
+    try testing.expectEqual(@as(?u32, null), o1.image);
+    try testing.expectEqualStrings("basecolor", o1.name);
+    try testing.expectEqual(@as(?u32, 1024), o1.max_size);
+    try testing.expectEqual(@as(?TextureFormat, null), o1.format);
+
+    const o2 = tex.overrides[2];
+    try testing.expectEqual(@as(?u32, 5), o2.image);
+    try testing.expect(o2.skip);
+
+    // describe reports the override count on the textures line.
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(p, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "overrides=3") != null);
+}
+
+test "parse textures without overrides defaults to empty" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const p = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .textures = .{} } } }");
+    try testing.expectEqual(@as(usize, 0), p.steps[0].textures.overrides.len);
 }

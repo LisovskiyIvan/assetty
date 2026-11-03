@@ -908,7 +908,20 @@ fn printOptimizeJson(
     try deltaJson(w, rep.before.vram_total, rep.after.vram_total);
     try w.writeAll(",\n    \"disk_bytes\": ");
     try deltaJson(w, rep.before.disk_total, rep.after.disk_total);
-    try w.writeAll("\n  }\n}\n");
+    try w.writeAll("\n  }");
+    if (rep.texture_images.len > 0) {
+        try w.writeAll(",\n  \"texture_images\": [");
+        for (rep.texture_images, 0..) |im, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
+            try jsonStrOpt(w, im.name);
+            try w.writeAll(",\"format\":");
+            try jsonStr(w, im.format);
+            try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
+        }
+        try w.writeAll("\n  ]");
+    }
+    try w.writeAll("\n}\n");
 }
 
 fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {

@@ -36,6 +36,10 @@ export interface ImageInfo {
   vram: number;
   disk: number;
   has_mips: boolean;
+  /** Report rows: the backend left this image unencoded (`skip: true`). */
+  skipped?: boolean;
+  /** Report rows: effective codec after per-texture overrides. */
+  effective_format?: string;
 }
 
 export interface Garbage {
@@ -64,6 +68,18 @@ export interface OptimizeStep {
   note?: string;
   /** Wall-clock seconds this step took (newer hosts). */
   secs?: number;
+  /** Per-image rows for the textures step (newer hosts): skipped + effective format. */
+  images?: TextureImageReport[];
+}
+
+/** One per-image row inside a textures-step report. */
+export interface TextureImageReport {
+  image?: number;
+  index?: number;
+  name?: string | null;
+  skipped?: boolean;
+  format?: string;
+  effective_format?: string;
 }
 
 export interface Stats {
@@ -109,6 +125,7 @@ export interface EncodeSettings {
   quality?: number;
   max_size?: number;
   generate_mips?: boolean;
+  normal_map?: boolean;
 }
 
 export interface EncodeResult {

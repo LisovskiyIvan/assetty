@@ -20,6 +20,14 @@
  *       "simplify": { "enabled": false, "target_ratio": 0.5, "error_tolerance": 0.001,
  *                     "aggressive": false, "lock_borders": true,
  *                     "use_attributes": false, "weight_normal": 1, "weight_uv": 1 }
+ *     },
+ *     "per_model": {
+ *       "<sourcePath>": { "textures": { "overrides": [
+ *         { "image": 2, "format": "uastc", "quality": 200, "max_size": 512,
+ *           "generate_mips": true, "skip": false, "normal_map": true },
+ *         { "name": "basecolor", "max_size": 1024 },
+ *         { "image": 5, "skip": true }
+ *       ] } }
  *     }
  *   }
  * }
@@ -28,6 +36,13 @@
  * sent in the `optimizeCustom` spec. Missing keys fall back to the defaults
  * above, unknown keys are dropped, numbers are clamped to their UI ranges.
  * Writes are debounced (500 ms) and go through `settingsSave(text)`.
+ *
+ * `per_model` holds MODEL-SCOPED per-texture overrides keyed by sourcePath
+ * (the app's optimize source; indices are that model's `info()` image indices
+ * and must never leak to another model). `image` matches one image index,
+ * `name` matches case-insensitively against image name/uri/filename, entries
+ * apply in array order and only present fields replace the base params;
+ * `skip: true` leaves the image unencoded. Missing `per_model` merges to {}.
  */
 import { bridge } from "./bridge";
 
@@ -67,6 +82,31 @@ export interface TextureSettings {
   generate_mips: boolean;
 }
 
+/**
+ * One per-texture override (backend `textures` step spec, `overrides` array).
+ * `image` is the 0-based `info()` image index; `name` is a case-insensitive
+ * substring match on image name/uri/filename. Only present fields replace the
+ * base params; `skip: true` leaves the image unencoded.
+ */
+export interface TextureOverride {
+  image?: number;
+  name?: string;
+  format?: TextureFormat;
+  quality?: number;
+  max_size?: number;
+  generate_mips?: boolean;
+  skip?: boolean;
+  normal_map?: boolean;
+}
+
+export interface PerModelTextures {
+  overrides: TextureOverride[];
+}
+
+export interface PerModelEntry {
+  textures?: PerModelTextures;
+}
+
 export interface QuantizeSettings {
   enabled: boolean;
   position_bits: number;
@@ -98,7 +138,7 @@ export interface OptimizeSteps {
 
 export interface Settings {
   theme: ThemeMode;
-  optimize: { steps: OptimizeSteps };
+  optimize: { steps: OptimizeSteps; per_model: Record<string, PerModelEntry> };
 }
 
 export interface SettingsStatus {
@@ -146,6 +186,7 @@ export function defaultSettings(): Settings {
           weight_uv: 1,
         },
       },
+      per_model: {},
     },
   };
 }
@@ -571,7 +612,234 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
     ),
   };
 
+  out.optimize.per_model = readPerModel(optimize, strict);
+
   return out;
+}
+
+/** Normalizes one `overrides` entry; null = empty/inapplicable, dropped. */
+function sanitizeTextureOverride(
+  raw: unknown,
+  strict: boolean,
+  label: string,
+): TextureOverride | null {
+  if (!isObject(raw)) return reject(strict, label, "must be an object", null);
+  const out: TextureOverride = {};
+  if (raw["image"] !== undefined) {
+    const v = raw["image"];
+    if (typeof v !== "number" || !Number.isFinite(v) || Math.round(v) < 0) {
+      return reject(strict, `${label}.image`, "must be a non-negative integer", null);
+    }
+    out.image = Math.round(v);
+  }
+  if (raw["name"] !== undefined) {
+    const v = raw["name"];
+    if (typeof v !== "string") {
+      return reject(strict, `${label}.name`, "must be a string", null);
+    }
+    if (v.trim()) out.name = v;
+  }
+  if (raw["format"] !== undefined) {
+    const v = raw["format"];
+    if (typeof v !== "string" || !(TEXTURE_FORMATS as readonly string[]).includes(v)) {
+      return reject(
+        strict,
+        `${label}.format`,
+        `must be one of ${TEXTURE_FORMATS.join(", ")}`,
+        null,
+      );
+    }
+    out.format = v as TextureFormat;
+  }
+  const num = (key: string, min: number, max: number): number | undefined => {
+    if (raw[key] === undefined) return undefined;
+    const v = raw[key];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      return reject(strict, `${label}.${key}`, "must be a number", undefined);
+    }
+    return Math.round(Math.min(max, Math.max(min, v)));
+  };
+  const quality = num("quality", 1, 255);
+  if (quality !== undefined) out.quality = quality;
+  const maxSize = num("max_size", 0, 8192);
+  if (maxSize !== undefined) out.max_size = maxSize;
+  for (const key of ["generate_mips", "skip", "normal_map"] as const) {
+    if (raw[key] === undefined) continue;
+    const v = raw[key];
+    if (typeof v !== "boolean") {
+      reject(strict, `${label}.${key}`, "must be true or false", undefined);
+      continue;
+    }
+    out[key] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function readPerModel(
+  optimize: Record<string, unknown>,
+  strict: boolean,
+): Record<string, PerModelEntry> {
+  const out: Record<string, PerModelEntry> = {};
+  const raw = readObject(optimize, "per_model", "optimize.per_model", strict);
+  for (const [key, value] of Object.entries(raw)) {
+    if (!key || !isObject(value)) {
+      if (strict) throw new SettingsError("optimize.per_model entries must be objects");
+      continue;
+    }
+    const label = `optimize.per_model.${key}.textures.overrides`;
+    const texRaw = readObject(value, "textures", label, strict);
+    const list = texRaw["overrides"];
+    if (list === undefined) {
+      out[key] = {};
+      continue;
+    }
+    if (!Array.isArray(list)) {
+      if (strict) throw new SettingsError(`${label} must be an array`);
+      out[key] = {};
+      continue;
+    }
+    const overrides: TextureOverride[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const clean = sanitizeTextureOverride(list[i], strict, `${label}[${i}]`);
+      if (clean) overrides.push(clean);
+    }
+    out[key] = { textures: { overrides } };
+  }
+  return out;
+}
+
+/* ------------------------------------------------- per-model texture overrides */
+
+/** Overrides stored for one source model (never shared across models). */
+export function getTextureOverrides(sourcePath: string | null | undefined): TextureOverride[] {
+  if (!sourcePath) return [];
+  return current.optimize.per_model[sourcePath]?.textures?.overrides ?? [];
+}
+
+export function textureOverridesCount(sourcePath: string | null | undefined): number {
+  return getTextureOverrides(sourcePath).length;
+}
+
+/** Image-index override for one row (the Textures tab editor owns these). */
+export function textureOverrideForImage(
+  sourcePath: string | null | undefined,
+  image: number,
+): TextureOverride | undefined {
+  return getTextureOverrides(sourcePath).find((o) => o.image === image);
+}
+
+function cleanOverride(patch: TextureOverride): TextureOverride {
+  const out: TextureOverride = {};
+  if (patch.image !== undefined) out.image = patch.image;
+  if (patch.name !== undefined && patch.name.trim()) out.name = patch.name;
+  if (patch.format !== undefined) out.format = patch.format;
+  if (patch.quality !== undefined) out.quality = patch.quality;
+  if (patch.max_size !== undefined) out.max_size = patch.max_size;
+  if (patch.generate_mips !== undefined) out.generate_mips = patch.generate_mips;
+  if (patch.skip !== undefined) out.skip = patch.skip;
+  if (patch.normal_map !== undefined) out.normal_map = patch.normal_map;
+  return out;
+}
+
+/**
+ * Inserts/replaces the image-indexed override for `sourcePath`. A patch with
+ * no fields besides `image` removes the entry instead.
+ */
+export function replaceTextureOverride(sourcePath: string, patch: TextureOverride): void {
+  if (patch.image === undefined) return;
+  updateSettings((settings) => {
+    const perModel = (settings.optimize.per_model[sourcePath] ??= {});
+    const tex = (perModel.textures ??= { overrides: [] });
+    const clean = cleanOverride(patch);
+    const idx = tex.overrides.findIndex((o) => o.image === patch.image);
+    if (Object.keys(clean).length <= 1) {
+      if (idx >= 0) tex.overrides.splice(idx, 1);
+      return;
+    }
+    if (idx >= 0) tex.overrides[idx] = clean;
+    else tex.overrides.push(clean);
+  });
+}
+
+/** Clears the image-indexed override ("Reset" in the row editor). */
+export function clearTextureOverride(sourcePath: string, image: number): void {
+  updateSettings((settings) => {
+    const list = settings.optimize.per_model[sourcePath]?.textures?.overrides;
+    if (!list) return;
+    const idx = list.findIndex((o) => o.image === image);
+    if (idx >= 0) list.splice(idx, 1);
+  });
+}
+
+function overrideMatches(
+  o: TextureOverride,
+  image: number,
+  name: string | null | undefined,
+): boolean {
+  if (o.image !== undefined && o.image === image) return true;
+  if (o.name && name && name.toLowerCase().includes(o.name.toLowerCase())) return true;
+  // No target at all: applies to every image (same as the backend).
+  return o.image === undefined && !o.name;
+}
+
+export interface EffectiveTextureParams {
+  format: TextureFormat;
+  quality: number;
+  max_size: number;
+  generate_mips: boolean;
+  normal_map?: boolean;
+  skip: boolean;
+}
+
+/** Base params with this model's overrides applied in array order. */
+export function effectiveTextureParams(
+  sourcePath: string | null | undefined,
+  image: number,
+  name: string | null | undefined,
+): EffectiveTextureParams {
+  const base = current.optimize.steps.textures;
+  const eff: EffectiveTextureParams = {
+    format: base.format,
+    quality: base.quality,
+    max_size: base.max_size,
+    generate_mips: base.generate_mips,
+    skip: false,
+  };
+  for (const o of getTextureOverrides(sourcePath)) {
+    if (!overrideMatches(o, image, name)) continue;
+    if (o.format !== undefined) eff.format = o.format;
+    if (o.quality !== undefined) eff.quality = o.quality;
+    if (o.max_size !== undefined) eff.max_size = o.max_size;
+    if (o.generate_mips !== undefined) eff.generate_mips = o.generate_mips;
+    if (o.normal_map !== undefined) eff.normal_map = o.normal_map;
+    if (o.skip !== undefined) eff.skip = o.skip;
+  }
+  return eff;
+}
+
+/**
+ * Short deviation label for the row badge (`uastc · 512 · q200`, `skipped`).
+ * Null when the effective params equal the base params.
+ */
+export function describeTextureDeviation(
+  sourcePath: string | null | undefined,
+  image: number,
+  name: string | null | undefined,
+): string | null {
+  const base = current.optimize.steps.textures;
+  const eff = effectiveTextureParams(sourcePath, image, name);
+  if (eff.skip) return "skipped";
+  const parts: string[] = [];
+  if (eff.format !== base.format) parts.push(eff.format);
+  if (eff.quality !== base.quality) parts.push(`q${eff.quality}`);
+  if (eff.max_size !== base.max_size) {
+    parts.push(eff.max_size === 0 ? "orig" : String(eff.max_size));
+  }
+  if (eff.generate_mips !== base.generate_mips) {
+    parts.push(eff.generate_mips ? "mips" : "no-mips");
+  }
+  if (eff.normal_map) parts.push("normal");
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 /** Strict parse for the Settings tab's "edit as JSON" surface. */
