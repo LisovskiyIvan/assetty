@@ -17,6 +17,164 @@ export interface OptimizeForm {
   sync(): void;
 }
 
+/**
+ * One-liner help for every property in the step forms (single source: the
+ * Optimize step blocks and the Settings defaults both render from here; the
+ * compare-mode toggle and the texture override editors reuse it too).
+ * Pattern: what it does + what it affects (quality / disk / VRAM / draws).
+ */
+export const FIELD_HELP: Record<string, string> = {
+  "prune.unused_nodes":
+    "Drops nodes unreachable from any scene at serialize time. Smaller file and a shorter node hierarchy; rendering is unchanged.",
+  "prune.unused_materials":
+    "Drops materials no mesh references. Smaller file and a shorter material list; rendering is unchanged.",
+  "prune.unused_textures":
+    "Drops images and samplers no material references. Smaller file and less texture memory reserved; rendering is unchanged.",
+  "dedup.accessors":
+    "Merges byte-identical GPU buffers so they are stored once. Smaller disk size and less VRAM; rendering is unchanged.",
+  "dedup.meshes":
+    "Merges meshes with identical primitives into a single definition. Smaller file; rendering is unchanged.",
+  "dedup.materials":
+    "Merges materials with identical parameters into one. Smaller file and fewer state changes, which can reduce draw calls; rendering is unchanged.",
+  "weld.tolerance":
+    "Merges vertices closer than this distance (0 = exact matches only). Higher values close tiny cracks and shrink the vertex buffer, but may weld UV seams and shift positions slightly.",
+  join: "Merges mesh primitives that share a material into fewer draw calls. Fewer draws, but coarser per-mesh culling — distant parts of a joined mesh stay resident.",
+  "simplify.target_ratio":
+    "Fraction of triangles to keep (0.5 = half). Fewer triangles render faster and use less memory, at some loss of silhouette detail.",
+  "simplify.error_tolerance":
+    "Maximum allowed visual error for the decimation. Higher values let the simplifier remove more at the same ratio, trading fidelity for size.",
+  "simplify.aggressive":
+    "Allows topology changes during decimation. Simplifies more aggressively (smaller file, fewer triangles) but accepts larger local error.",
+  "simplify.lock_borders":
+    "Keeps UV-shell and mesh borders fixed during decimation. Prevents seams cracking open; the mesh compresses slightly less.",
+  "simplify.use_attributes":
+    "Weighs normal and UV error during decimation (seam-aware). Preserves shading and UV islands better, at the cost of keeping more triangles.",
+  "simplify.weight_normal":
+    "How strongly normal distortion is penalized when seam-aware mode is on. Higher values protect shading smoothness but keep more triangles.",
+  "simplify.weight_uv":
+    "How strongly UV distortion is penalized when seam-aware mode is on. Higher values protect texture mapping but keep more triangles.",
+  "textures.format":
+    "GPU texture codec: auto picks per target, ETC1S is smallest with fast transcode (lossy), UASTC is higher quality but a bigger file. Affects disk size and GPU decode cost.",
+  "textures.quality":
+    "ETC1S encoder quality, 1–255. Higher values preserve detail but compress worse (bigger KTX2); lower values trade visible artifacts for disk savings.",
+  "textures.max_size":
+    "Downscales the longest side to this many pixels (0 = original). Halving each side quarters VRAM and disk use, at a loss of texture sharpness.",
+  "textures.generate_mips":
+    "Generates the mip chain for minified sampling. Sharper, shimmer-free minification at ~33% more VRAM; almost always keep on.",
+  "textures.normal_map":
+    "Encodes with normal-map settings (renormalization, no sRGB). Required for correct lighting on normal maps; using it on color textures washes them out.",
+  "quantize.position_bits":
+    "Quantizes vertex positions to this many bits (14 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
+  "quantize.uv_bits":
+    "Quantizes texture coordinates to this many bits (12 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
+  "quantize.normal_oct":
+    "Packs normals with octahedral encoding (2×8/16-bit instead of 3 floats). Much smaller vertex buffers; needs extension support — very old viewers may render it wrong.",
+  "compare.mode":
+    "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
+  "textures.overrides_note":
+    "Per-texture overrides replace the base params for single images of this model only, and merge into the textures step on Run. Edit them per image in the Textures tab.",
+};
+
+/* ------------------------------------------------- help popover (singleton) */
+
+let helpPop: HTMLElement | null = null;
+let helpAnchor: HTMLElement | null = null;
+let helpWired = false;
+
+/** Closes the open "?" popover, if any. Tabs call this on deactivate. */
+export function closeFieldHelp(): void {
+  helpPop?.remove();
+  helpPop = null;
+  helpAnchor = null;
+}
+
+function wireHelpOnce(): void {
+  if (helpWired) return;
+  helpWired = true;
+  document.addEventListener(
+    "click",
+    (ev) => {
+      if (!helpPop) return;
+      const target = ev.target as Node | null;
+      if (target && (helpPop.contains(target) || (helpAnchor && helpAnchor.contains(target)))) {
+        return;
+      }
+      closeFieldHelp();
+    },
+    true,
+  );
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeFieldHelp();
+  });
+  document.addEventListener(
+    "scroll",
+    (ev) => {
+      if (!helpPop) return;
+      const target = ev.target as Node | null;
+      if (target instanceof Node && helpPop.contains(target)) return;
+      closeFieldHelp();
+    },
+    true,
+  );
+  window.addEventListener("resize", () => closeFieldHelp());
+}
+
+function toggleFieldHelp(anchor: HTMLElement, id: string): void {
+  if (helpPop && helpAnchor === anchor) {
+    closeFieldHelp();
+    return;
+  }
+  closeFieldHelp();
+  const text = FIELD_HELP[id];
+  if (!text) return;
+  wireHelpOnce();
+  const pop = el("div", { class: "field-help-pop", text });
+  pop.setAttribute("role", "note");
+  document.body.append(pop);
+  // Measure, then place near the icon: below it, flipping above near the
+  // viewport bottom and clamping horizontally to the viewport (which, on
+  // narrow windows, is the panel width).
+  pop.style.visibility = "hidden";
+  const popW = pop.offsetWidth;
+  const popH = pop.offsetHeight;
+  const rect = anchor.getBoundingClientRect();
+  const left = Math.min(
+    Math.max(8, rect.left + rect.width / 2 - popW / 2),
+    Math.max(8, window.innerWidth - popW - 8),
+  );
+  const below = rect.bottom + 6;
+  const above = rect.top - 6 - popH;
+  const top =
+    below + popH <= window.innerHeight - 8 || above < 8
+      ? Math.min(below, Math.max(8, window.innerHeight - popH - 8))
+      : above;
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+  pop.style.visibility = "";
+  helpPop = pop;
+  helpAnchor = anchor;
+}
+
+/** Small "?" icon-button; opens the FIELD_HELP popover for `id` on click. */
+export function fieldHelpButton(id: string): HTMLElement {
+  wireHelpOnce();
+  const btn = el("button", {
+    class: "help-btn",
+    type: "button",
+    text: "?",
+    title: "what does this do?",
+    dataset: { help: id },
+  });
+  btn.setAttribute("aria-label", `help: ${id}`);
+  btn.addEventListener("click", (ev) => {
+    // The button may sit inside a <label>: never toggle the control.
+    ev.preventDefault();
+    ev.stopPropagation();
+    toggleFieldHelp(btn, id);
+  });
+  return btn;
+}
+
 const TEXTURE_MAX_SIZES: Array<[string, number]> = [
   ["no resize", 0],
   ["512", 512],
@@ -73,23 +231,31 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     refresh();
   }
 
-  function field(label: string, control: HTMLElement, wide = false): HTMLElement {
+  function field(label: string, control: HTMLElement, wide = false, helpId?: string): HTMLElement {
     return el(
       "div",
       { class: wide ? "field wide" : "field" },
       el("span", { text: label }),
+      helpId ? fieldHelpButton(helpId) : null,
       control,
     );
   }
 
-  function check(label: string, get: () => boolean, set: (value: boolean) => void): HTMLElement {
+  function check(
+    label: string,
+    get: () => boolean,
+    set: (value: boolean) => void,
+    helpId?: string,
+  ): HTMLElement {
     const box = el("input", { type: "checkbox" });
     box.checked = get();
     box.addEventListener("change", () => set(box.checked));
     valueSyncers.push(() => {
       box.checked = get();
     });
-    return el("label", { class: "inline-check" }, box, el("span", { text: label }));
+    const lab = el("label", { class: "inline-check" }, box, el("span", { text: label }));
+    if (helpId) lab.append(fieldHelpButton(helpId));
+    return lab;
   }
 
   function select(
@@ -166,6 +332,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     label: string,
     hint: string,
     buildParams: () => HTMLElement[],
+    helpId?: string,
   ): void {
     const box = el("input", { type: "checkbox" });
     box.checked = opts.get()[id].enabled;
@@ -187,6 +354,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           { class: "step-toggle" },
           box,
           el("span", { class: "step-name", text: label }),
+          helpId ? fieldHelpButton(helpId) : null,
           el("span", { class: "step-hint", text: hint }),
         ),
         params,
@@ -206,6 +374,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.prune.unused_nodes = value;
           }),
+        "prune.unused_nodes",
       ),
       check(
         "materials",
@@ -214,6 +383,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.prune.unused_materials = value;
           }),
+        "prune.unused_materials",
       ),
       check(
         "textures",
@@ -222,6 +392,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.prune.unused_textures = value;
           }),
+        "prune.unused_textures",
       ),
     ),
   ]);
@@ -238,6 +409,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.dedup.accessors = value;
           }),
+        "dedup.accessors",
       ),
       check(
         "meshes",
@@ -246,6 +418,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.dedup.meshes = value;
           }),
+        "dedup.meshes",
       ),
       check(
         "materials",
@@ -254,6 +427,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.dedup.materials = value;
           }),
+        "dedup.materials",
       ),
     ),
   ]);
@@ -273,11 +447,12 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           }),
       ),
       true,
+      "weld.tolerance",
     ),
   ]);
 
   /* ------------------------------------------------------------------ join */
-  stepBlock("join", "join", "merge primitives sharing a material", () => []);
+  stepBlock("join", "join", "merge primitives sharing a material", () => [], "join");
 
   /* -------------------------------------------------------------- textures */
   stepBlock("textures", "textures", "KTX2 / basis encode", () => [
@@ -291,6 +466,8 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.textures.format = value as TextureFormat;
           }),
       ),
+      false,
+      "textures.format",
     ),
     field(
       "quality",
@@ -305,6 +482,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           }),
       ),
       true,
+      "textures.quality",
     ),
     field(
       "max size",
@@ -316,6 +494,8 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.textures.max_size = Number(value);
           }),
       ),
+      false,
+      "textures.max_size",
     ),
     field(
       "mips",
@@ -326,6 +506,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.textures.generate_mips = value;
           }),
+        "textures.generate_mips",
       ),
     ),
   ]);
@@ -342,6 +523,8 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.quantize.position_bits = Number(value);
           }),
       ),
+      false,
+      "quantize.position_bits",
     ),
     field(
       "uv bits",
@@ -353,6 +536,8 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.quantize.uv_bits = Number(value);
           }),
       ),
+      false,
+      "quantize.uv_bits",
     ),
     field(
       "normals",
@@ -363,6 +548,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.quantize.normal_oct = value;
           }),
+        "quantize.normal_oct",
       ),
     ),
   ]);
@@ -409,6 +595,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
         "%",
       ),
       true,
+      "simplify.target_ratio",
     ),
     field(
       "max error",
@@ -420,6 +607,8 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.simplify.error_tolerance = Number(value);
           }),
       ),
+      false,
+      "simplify.error_tolerance",
     ),
     field(
       "mode",
@@ -430,6 +619,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.simplify.aggressive = value;
           }),
+        "simplify.aggressive",
       ),
     ),
     field(
@@ -441,6 +631,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.simplify.lock_borders = value;
           }),
+        "simplify.lock_borders",
       ),
     ),
     field(
@@ -452,11 +643,12 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           edit((steps) => {
             steps.simplify.use_attributes = value;
           }),
+        "simplify.use_attributes",
       ),
       true,
     ),
-    field("weight normal", weightNormal),
-    field("weight uv", weightUv),
+    field("weight normal", weightNormal, false, "simplify.weight_normal"),
+    field("weight uv", weightUv, false, "simplify.weight_uv"),
   ]);
 
   sync();

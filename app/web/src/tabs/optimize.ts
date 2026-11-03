@@ -1,6 +1,6 @@
 import { app } from "../app";
 import { isBusyError } from "../bridge";
-import { buildOptimizeForm } from "../optimizeForm";
+import { buildOptimizeForm, closeFieldHelp, fieldHelpButton } from "../optimizeForm";
 import {
   getSettings,
   getTextureOverrides,
@@ -201,7 +201,13 @@ export function mountOptimize(): TabHandle {
     text: "before/after canvases stay in sync while you orbit",
   });
   const modeSeg = el("div", { class: "segmented compare-seg" }, sideBtn, splitBtn);
-  const toolbar = el("div", { class: "compare-toolbar" }, modeSeg, splitHint);
+  const toolbar = el(
+    "div",
+    { class: "compare-toolbar" },
+    modeSeg,
+    fieldHelpButton("compare.mode"),
+    splitHint,
+  );
 
   // Split overlay: divider line + full-height 28px drag strip with a ⟷ knob
   // + SOURCE/OPTIMIZED chips. pointer-events:none except the grip, so drags
@@ -519,6 +525,7 @@ export function mountOptimize(): TabHandle {
             window.dispatchEvent(new CustomEvent("assetty:select-tab", { detail: "textures" }));
           },
         }),
+        fieldHelpButton("textures.overrides_note"),
       ),
     );
   }
@@ -1091,6 +1098,7 @@ export function mountOptimize(): TabHandle {
       syncCompareUI();
     },
     deactivate: () => {
+      closeFieldHelp();
       left?.pause();
       right?.pause();
     },

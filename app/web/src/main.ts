@@ -71,19 +71,11 @@ const openBtn = el("button", {
   onclick: () => void app.pickAndOpen(),
 });
 
-/** Viewer-tab activations; the inspector auto-opens once per activation unless
- * dismissed. `inspectorDismissedAt` records the activation during which the
- * user explicitly closed the inspector ("don't fight the user"). */
-let viewerActivation = 0;
-let inspectorDismissedAt = -1;
-
-function onInspectorOpenChange(open: boolean): void {
-  if (open) inspectorDismissedAt = -1;
-  else inspectorDismissedAt = viewerActivation;
-  syncInspectorChrome();
-}
-
-const inspectorDock = createInspectorDock(onInspectorOpenChange);
+/** The inspector belongs to the Viewer scene: closed by default, it opens
+ * only on a successful viewer model load (see the `assetty:viewer-loaded`
+ * hook below) and hides whenever the user leaves the Viewer tab. Returning
+ * to the Viewer tab never reopens it — only a fresh load does. */
+const inspectorDock = createInspectorDock(() => syncInspectorChrome());
 
 const inspectorBtn = el("button", {
   class: "small",
@@ -116,30 +108,13 @@ function syncInspectorChrome(): void {
 }
 
 async function toggleInspector(): Promise<void> {
-  let scene = app.viewer?.scene ?? null;
-  if (!scene) {
-    // Nothing rendered yet: the Viewer tab owns the primary scene.
-    selectTab("viewer");
-    scene = app.viewer?.scene ?? null;
-    // Selecting the Viewer tab auto-opens the inspector; don't toggle it shut.
-    if (inspectorDock.isOpen) {
-      syncInspectorChrome();
-      return;
-    }
-  }
-  await inspectorDock.toggle(scene);
-  syncInspectorChrome();
-}
-
-/** Auto-opens the inspector on Viewer-tab activation (open by default, even
- * with an empty scene). Skipped when the user dismissed it during this same
- * activation — it re-opens on the next activation. */
-async function autoOpenInspector(): Promise<void> {
-  if (inspectorDock.isOpen) return;
-  if (inspectorDismissedAt === viewerActivation) return;
   const scene = app.viewer?.scene ?? null;
-  if (!scene) return;
-  await inspectorDock.show(scene);
+  if (!scene) {
+    // Nothing rendered yet: point at the Viewer tab; the toggle below then
+    // reports that a model is needed.
+    selectTab("viewer");
+  }
+  await inspectorDock.toggle(app.viewer?.scene ?? null);
   syncInspectorChrome();
 }
 
@@ -361,9 +336,10 @@ function selectTab(id: TabId): void {
   }
   handle.el.style.display = "";
   handle.activate();
-  if (id === "viewer") {
-    viewerActivation++;
-    void autoOpenInspector();
+  if (id !== "viewer" && inspectorDock.isOpen) {
+    // The inspector belongs to the Viewer scene: leaving the tab hides it,
+    // and coming back does not reopen it (only a fresh model load does).
+    void inspectorDock.hide().then(() => syncInspectorChrome());
   }
 }
 
@@ -382,6 +358,15 @@ for (const def of TAB_DEFS) {
 window.addEventListener("assetty:select-tab", (ev) => {
   const id = (ev as CustomEvent).detail as TabId;
   if (TAB_DEFS.some((t) => t.id === id)) selectTab(id);
+});
+
+// The Viewer tab dispatches this after a model loads successfully (failed
+// and demo loads don't). Only a fresh load opens the inspector.
+window.addEventListener("assetty:viewer-loaded", () => {
+  if (activeTab !== "viewer" || inspectorDock.isOpen) return;
+  const scene = app.viewer?.scene ?? null;
+  if (!scene) return;
+  void inspectorDock.show(scene).then(() => syncInspectorChrome());
 });
 
 /* ---------------------------------------------------------------- status bar */

@@ -1,5 +1,5 @@
 import { app } from "../app";
-import { buildOptimizeForm } from "../optimizeForm";
+import { buildOptimizeForm, closeFieldHelp } from "../optimizeForm";
 import {
   applySettingsText,
   getSettings,
@@ -355,6 +355,9 @@ export function mountSettings(): TabHandle {
       defaultsForm.sync();
       if (!dirty) json.value = settingsToJson();
       if (names.length === 0) void loadNames();
+    },
+    deactivate: () => {
+      closeFieldHelp();
     },
     dispose: () => {
       offChange();

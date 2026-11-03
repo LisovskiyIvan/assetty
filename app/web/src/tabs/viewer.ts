@@ -43,6 +43,9 @@ export function mountViewer(): TabHandle {
       if (app.bridge.live) {
         const b64 = await app.bridge.loadBytes(path);
         await v.loadBase64(b64);
+        // Successful viewer model load: the shell opens the inspector.
+        // (Demo and failed loads stay quiet.)
+        window.dispatchEvent(new CustomEvent("assetty:viewer-loaded"));
       } else {
         v.loadDemo();
       }

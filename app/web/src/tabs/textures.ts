@@ -1,6 +1,7 @@
 import { app } from "../app";
 import { isBusyError } from "../bridge";
 import { isMissingMethodError, notify } from "../notify";
+import { closeFieldHelp, fieldHelpButton } from "../optimizeForm";
 import {
   el,
   fmtBytes,
@@ -561,6 +562,7 @@ export function mountTextures(): TabHandle {
       get: () => string,
       set: (value: string) => void,
       title?: string,
+      helpId?: string,
     ): HTMLElement => {
       const node = el("select", { class: "compact", title });
       for (const [text, value] of options) node.append(el("option", { value, text }));
@@ -569,7 +571,9 @@ export function mountTextures(): TabHandle {
         set(node.value);
         commit();
       });
-      return el("label", { class: "ov-field" }, el("span", { text: label }), node);
+      const lab = el("span", { text: label });
+      if (helpId) lab.append(" ", fieldHelpButton(helpId));
+      return el("label", { class: "ov-field" }, lab, node);
     };
 
     form.append(
@@ -635,6 +639,7 @@ export function mountTextures(): TabHandle {
           else draft.normal_map = v === "yes";
         },
         "normal_map: hint for the encoder",
+        "textures.normal_map",
       ),
     );
 
@@ -1373,6 +1378,9 @@ export function mountTextures(): TabHandle {
     el: root,
     activate: () => {
       void reload();
+    },
+    deactivate: () => {
+      closeFieldHelp();
     },
     dispose: () => {
       document.removeEventListener("keydown", onKey);

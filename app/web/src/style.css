@@ -1352,6 +1352,46 @@ tr.selected {
   height: 100%;
 }
 
+/* --- per-property help ("?" popover, shared by optimize + settings forms) --- */
+.help-btn {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.help-btn:hover:not(:disabled) {
+  color: var(--accent-fg);
+  border-color: var(--accent-border);
+}
+
+.ov-field .help-btn {
+  margin-left: 4px;
+  vertical-align: baseline;
+}
+
+.field-help-pop {
+  position: fixed;
+  z-index: 200;
+  max-width: 280px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--accent-border);
+  box-shadow: 0 12px 32px var(--shadow-strong);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 /* --- optimize step form --- */
 .form {
   gap: 6px;
