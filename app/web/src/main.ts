@@ -71,7 +71,19 @@ const openBtn = el("button", {
   onclick: () => void app.pickAndOpen(),
 });
 
-const inspectorDock = createInspectorDock(() => syncInspectorChrome());
+/** Viewer-tab activations; the inspector auto-opens once per activation unless
+ * dismissed. `inspectorDismissedAt` records the activation during which the
+ * user explicitly closed the inspector ("don't fight the user"). */
+let viewerActivation = 0;
+let inspectorDismissedAt = -1;
+
+function onInspectorOpenChange(open: boolean): void {
+  if (open) inspectorDismissedAt = -1;
+  else inspectorDismissedAt = viewerActivation;
+  syncInspectorChrome();
+}
+
+const inspectorDock = createInspectorDock(onInspectorOpenChange);
 
 const inspectorBtn = el("button", {
   class: "small",
@@ -109,8 +121,25 @@ async function toggleInspector(): Promise<void> {
     // Nothing rendered yet: the Viewer tab owns the primary scene.
     selectTab("viewer");
     scene = app.viewer?.scene ?? null;
+    // Selecting the Viewer tab auto-opens the inspector; don't toggle it shut.
+    if (inspectorDock.isOpen) {
+      syncInspectorChrome();
+      return;
+    }
   }
   await inspectorDock.toggle(scene);
+  syncInspectorChrome();
+}
+
+/** Auto-opens the inspector on Viewer-tab activation (open by default, even
+ * with an empty scene). Skipped when the user dismissed it during this same
+ * activation — it re-opens on the next activation. */
+async function autoOpenInspector(): Promise<void> {
+  if (inspectorDock.isOpen) return;
+  if (inspectorDismissedAt === viewerActivation) return;
+  const scene = app.viewer?.scene ?? null;
+  if (!scene) return;
+  await inspectorDock.show(scene);
   syncInspectorChrome();
 }
 
@@ -332,6 +361,10 @@ function selectTab(id: TabId): void {
   }
   handle.el.style.display = "";
   handle.activate();
+  if (id === "viewer") {
+    viewerActivation++;
+    void autoOpenInspector();
+  }
 }
 
 for (const def of TAB_DEFS) {

@@ -1677,6 +1677,125 @@ tr.skipped td {
   min-width: 0;
 }
 
+/* --- optimize tab: before/after view modes --- */
+.compare-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  min-width: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+.compare-toolbar .hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Split slider: both panes stack in one viewport. The result pane stays on
+   top but is clipped to the right of the divider; it ignores input so every
+   orbit/zoom gesture drives the source (master) camera underneath. */
+.dual.split {
+  display: block;
+  position: relative;
+}
+
+.dual.split .canvas-wrap {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+}
+
+.dual.split .pane-top {
+  z-index: 1;
+  pointer-events: none;
+}
+
+.dual.split .canvas-label {
+  display: none;
+}
+
+.split-ui {
+  display: none;
+}
+
+.dual.split .split-ui {
+  display: block;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.split-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--shadow-strong);
+}
+
+.split-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  cursor: ew-resize;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.split-grip:hover:not(:disabled) {
+  border: 0;
+}
+
+.split-knob {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 34px;
+  border-radius: 11px;
+  background: var(--bg-raised);
+  border: 1px solid var(--accent-border);
+  color: var(--accent-fg);
+  font-size: 12px;
+  box-shadow: 0 2px 8px var(--shadow);
+}
+
+.split-chip {
+  position: absolute;
+  top: 8px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--canvas-label-bg);
+  border: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.split-chip.left {
+  left: 10px;
+}
+
+.split-chip.right {
+  right: 10px;
+}
+
 /* --- optimize report: per-image rows of the textures step --- */
 .step-image {
   display: grid;

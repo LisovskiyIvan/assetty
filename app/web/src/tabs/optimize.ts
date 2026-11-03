@@ -166,17 +166,63 @@ export function mountOptimize(): TabHandle {
   const main = el("div", { class: "tab-main" });
 
   const dual = el("div", { class: "dual" });
-  const mkPane = (title: string) => {
-    const wrap = el("div", { class: "canvas-wrap" });
+  const mkPane = (title: string, paneClass: string) => {
+    const wrap = el("div", { class: `canvas-wrap ${paneClass}` });
     const canvas = el("canvas");
     wrap.append(canvas, el("div", { class: "canvas-label", text: title }));
     dual.append(wrap);
     return { wrap, canvas };
   };
-  const leftPane = mkPane("original");
-  const rightPane = mkPane("optimized");
+  const leftPane = mkPane("original", "pane-left");
+  const rightPane = mkPane("optimized", "pane-top");
+
+  /** Before/after view mode. "side" is the classic two canvases; "split"
+   * stacks both scenes in one viewport with a draggable wipe divider (the
+   * TOP canvas shows the result, clipped to the right of the divider). */
+  type CompareMode = "side" | "split";
+  let compareMode: CompareMode = "side";
+  /** Divider position in % (left = SOURCE, right = OPTIMIZED). Persists across
+   * renders of the same result; reset to 50% on every new result. */
+  let splitPos = 50;
+
+  const sideBtn = el("button", {
+    class: "small active",
+    text: "Side by side",
+    title: "show the source and the result next to each other",
+  });
+  const splitBtn = el("button", {
+    class: "small",
+    text: "Split slider",
+    title: "Run optimize to compare",
+    disabled: true,
+  });
+  const splitHint = el("span", {
+    class: "hint",
+    text: "before/after canvases stay in sync while you orbit",
+  });
+  const modeSeg = el("div", { class: "segmented compare-seg" }, sideBtn, splitBtn);
+  const toolbar = el("div", { class: "compare-toolbar" }, modeSeg, splitHint);
+
+  // Split overlay: divider line + full-height 28px drag strip with a ⟷ knob
+  // + SOURCE/OPTIMIZED chips. pointer-events:none except the grip, so drags
+  // anywhere else fall through to the MASTER (source) canvas below.
+  const splitLine = el("div", { class: "split-line" });
+  const splitGrip = el(
+    "button",
+    { class: "split-grip", title: "drag to wipe between source and result" },
+    el("span", { class: "split-knob", text: "⟷" }),
+  );
+  const splitUi = el(
+    "div",
+    { class: "split-ui" },
+    splitLine,
+    el("div", { class: "split-chip left", text: "SOURCE" }),
+    el("div", { class: "split-chip right", text: "OPTIMIZED" }),
+    splitGrip,
+  );
+  dual.append(splitUi);
   // No bottom panel here: progress + report live in the right panel.
-  main.append(dual);
+  main.append(toolbar, dual);
 
   const openHint = emptyState(OPEN_HINT, { label: "Open…", onClick: () => void app.pickAndOpen() });
   openHint.classList.add("overlay");
@@ -210,6 +256,122 @@ export function mountOptimize(): TabHandle {
   let pendingDst: string | null = null;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
+  /** Removes the split-mode master→slave camera sync (null when inactive). */
+  let stopSplitSync: (() => void) | null = null;
+
+  /** Applies the divider position: the TOP canvas (result) is clipped so only
+   * its right part shows; the BOTTOM canvas (source) shows through on the left. */
+  function applySplit(): void {
+    const x = Math.max(0, Math.min(100, splitPos));
+    rightPane.wrap.style.clipPath = `inset(0 0 0 ${x}%)`;
+    splitLine.style.left = `${x}%`;
+    splitGrip.style.left = `${x}%`;
+  }
+
+  /**
+   * Split mode makes the source camera the MASTER and the result camera a
+   * SLAVE: every frame (just before each scene renders, on both scenes so the
+   * copy lands even when the two engines tick in different order) the slave
+   * copies angle/radius/target plus the zoom/clip limits, so both viewports
+   * share identical projections — pixel-level comparison at shared angles.
+   * The slave canvas never receives input (the top pane is pointer-events:none
+   * and the grip strip sits above it), so the bidirectional orbit link used by
+   * side-by-side mode cannot fight this copy: it is idempotent anyway.
+   */
+  function setSplitSync(on: boolean): void {
+    if (on && stopSplitSync) return;
+    if (!on) {
+      stopSplitSync?.();
+      stopSplitSync = null;
+      return;
+    }
+    const master = left;
+    const slave = right;
+    if (!master || !slave) return;
+    const copy = (): void => {
+      const s = master.camera;
+      const d = slave.camera;
+      d.lowerRadiusLimit = s.lowerRadiusLimit;
+      d.upperRadiusLimit = s.upperRadiusLimit;
+      d.minZ = s.minZ;
+      d.maxZ = s.maxZ;
+      slave.applyCameraFrom(s);
+    };
+    copy();
+    const o1 = master.scene.onBeforeRenderObservable.add(copy);
+    const o2 = slave.scene.onBeforeRenderObservable.add(copy);
+    stopSplitSync = () => {
+      master.scene.onBeforeRenderObservable.remove(o1);
+      slave.scene.onBeforeRenderObservable.remove(o2);
+    };
+  }
+
+  /** Refreshes the toolbar + layout for the current mode/result state. Falls
+   * back to side-by-side while there is no result to compare against. */
+  function syncCompareUI(): void {
+    const split = compareMode === "split" && lastResult !== null;
+    dual.classList.toggle("split", split);
+    sideBtn.classList.toggle("active", !split);
+    splitBtn.classList.toggle("active", split);
+    splitBtn.disabled = lastResult === null;
+    splitBtn.title = lastResult
+      ? "wipe between source (left) and result (right)"
+      : "Run optimize to compare";
+    splitHint.textContent = split
+      ? "drag ⟷ to compare — left SOURCE, right OPTIMIZED"
+      : "before/after canvases stay in sync while you orbit";
+    setSplitSync(split && left !== null && right !== null);
+    if (split) applySplit();
+    else rightPane.wrap.style.clipPath = "";
+    left?.forceResize();
+    right?.forceResize();
+  }
+
+  function setCompareMode(mode: CompareMode): void {
+    if (mode === "split" && lastResult === null) return;
+    compareMode = mode;
+    syncCompareUI();
+  }
+
+  sideBtn.addEventListener("click", () => setCompareMode("side"));
+  splitBtn.addEventListener("click", () => setCompareMode("split"));
+
+  /** Dragging the 28px grip strip moves the divider. Moves are handled on the
+   * container (not the grip): with pointer capture they retarget to the grip
+   * and bubble up here; without capture (or when the cursor outruns the
+   * strip) the container still sees them. The strip sits above both canvases,
+   * so these pointerdowns never reach the master camera. */
+  let splitDragging = false;
+  splitGrip.addEventListener("pointerdown", (ev) => {
+    if (compareMode !== "split" || lastResult === null) return;
+    splitDragging = true;
+    try {
+      splitGrip.setPointerCapture(ev.pointerId);
+    } catch {
+      // Synthetic pointers (headless checks) may refuse capture; the
+      // container-level move handler below covers that case.
+    }
+    ev.preventDefault();
+  });
+  dual.addEventListener("pointermove", (ev) => {
+    if (!splitDragging) return;
+    const rect = dual.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    splitPos = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
+    applySplit();
+  });
+  const endSplitDrag = (): void => {
+    splitDragging = false;
+  };
+  dual.addEventListener("pointerup", endSplitDrag);
+  dual.addEventListener("pointercancel", endSplitDrag);
+
+  /** A fresh result enables the Split option and re-centers the divider. */
+  function noteResult(res: OptimizeResult): void {
+    lastResult = res;
+    splitPos = 50;
+    syncCompareUI();
+  }
 
   // Step parameters live in the shared settings state (Settings tab edits the
   // same object); every change is applied in-app immediately and debounce-saved.
@@ -662,6 +824,7 @@ export function mountOptimize(): TabHandle {
     stopJob();
     setProgress("done", 100);
     renderReport(event.result);
+    noteResult(event.result);
     void loadOptimized(event.result.out_path);
     notify("optimization finished", "ok");
   });
@@ -844,6 +1007,7 @@ export function mountOptimize(): TabHandle {
       stopJob();
       setProgress("done", 100);
       renderReport(call.result);
+      noteResult(call.result);
       void loadOptimized(call.result.out_path);
       notify("optimization finished", "ok");
     } catch (err) {
@@ -889,11 +1053,20 @@ export function mountOptimize(): TabHandle {
             linkCameras(left, right);
           }
           // Headless checks need both panes (the shared hook only exposes the
-          // Viewer tab's scene).
+          // Viewer tab's scene) plus the compare-mode state.
           const dbg = (window as unknown as Record<string, unknown>)["__assetty"] as
             | Record<string, unknown>
             | undefined;
-          if (dbg) dbg["panes"] = () => ({ left, right });
+          if (dbg) {
+            dbg["panes"] = () => ({ left, right });
+            dbg["compare"] = () => ({
+              mode: compareMode,
+              split: splitPos,
+              hasResult: lastResult !== null,
+            });
+            dbg["setCompareMode"] = (mode: string) =>
+              setCompareMode(mode === "split" ? "split" : "side");
+          }
           if (app.sourcePath) void loadSource(app.sourcePath);
           else if (!app.bridge.live) {
             left.loadDemo();
@@ -915,6 +1088,7 @@ export function mountOptimize(): TabHandle {
       right?.forceResize();
       void loadPresets();
       syncAll();
+      syncCompareUI();
     },
     deactivate: () => {
       left?.pause();
@@ -928,6 +1102,7 @@ export function mountOptimize(): TabHandle {
       offDone();
       offExport();
       stopJob();
+      setSplitSync(false);
       left?.dispose();
       right?.dispose();
       left = null;
