@@ -878,7 +878,7 @@ export class Bridge {
     }
     if (this.native && this.native.methods.includes("openDialogAt")) {
       const seed = dir?.trim() ? dir.trim() : null;
-      const res = parseMaybeJson<unknown>(await this.raw("openDialogAt", seed ? [seed] : []));
+      const res = parseMaybeJson<unknown>(await this.raw("openDialogAt", [seed ?? ""]));
       if (res == null) return { path: null };
       if (typeof res === "string") return { path: res.trim() || null };
       const obj = res as Record<string, unknown>;
