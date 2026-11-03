@@ -53,7 +53,7 @@ interface CompareImages {
 }
 
 export function mountTextures(): TabHandle {
-  const root = el("div", { class: "tab-body" });
+  const root = el("div", { class: "tab-body textures-tab" });
   const main = el("div", { class: "tab-main" });
   const head = el(
     "div",
@@ -62,8 +62,6 @@ export function mountTextures(): TabHandle {
     el("span", { class: "muted mono", text: "images: view · apply: source" }),
   );
   const listHost = el("div", { class: "texture-list" });
-  const detailHost = el("div", { class: "texture-detail" });
-  detailHost.hidden = true;
 
   /* Apply-to-model toolbar: sits above the list, next to the preview hint. */
   const applyBtn = el("button", { class: "primary", text: "Apply to model…" });
@@ -106,15 +104,13 @@ export function mountTextures(): TabHandle {
     applyActs.title = app.sourcePath ?? "no source model";
   }
   syncActsOn();
-  main.append(head, applyBar, listHost, detailHost);
+  main.append(head, applyBar, listHost);
 
   const side = el("div", { class: "tab-side" });
   root.append(main, side);
 
   let images: ImageInfo[] = [];
   let selected = -1;
-  /** Expanded per-texture override editor (one row at a time; index-based). */
-  let expanded: number | null = null;
   /** True while the row editor commits (skip the full list rebuild). */
   let selfEdit = false;
 
@@ -347,37 +343,6 @@ export function mountTextures(): TabHandle {
     return block;
   }
 
-  function renderDetail(): void {
-    clear(detailHost);
-    const img = images[selected];
-    if (!img) {
-      detailHost.hidden = true;
-      return;
-    }
-    const result = results.get(img.index);
-    if (result) {
-      detailHost.hidden = false;
-      detailHost.append(renderCompare(img, result));
-      return;
-    }
-    if (previewing === img.index) {
-      detailHost.hidden = false;
-      detailHost.append(previewLoading(img));
-      return;
-    }
-    if (previewError && previewErrorIndex === img.index) {
-      detailHost.hidden = false;
-      detailHost.append(previewMessage(img, `preview failed: ${previewError}`));
-      return;
-    }
-    if (preview && preview.index === img.index) {
-      detailHost.hidden = false;
-      detailHost.append(renderPreview(img, preview));
-      return;
-    }
-    detailHost.hidden = true;
-  }
-
   /* ------------------------------------------------------------------- list */
 
   function rowBadge(img: ImageInfo): HTMLElement {
@@ -407,12 +372,23 @@ export function mountTextures(): TabHandle {
     return badge;
   }
 
-  /** Updates row badges in place (no rebuild, so the open editor keeps focus). */
+  /** Updates row + side-panel badges in place (no rebuild, so editors keep focus). */
   function refreshOverrideBadges(): void {
     const src = app.sourcePath;
     for (const node of Array.from(listHost.querySelectorAll("[data-ovbadge]"))) {
       const badge = node as HTMLElement;
       const img = images.find((i) => i.index === Number(badge.dataset.ovbadge));
+      const dev = img && src ? describeTextureDeviation(src, img.index, img.name) : null;
+      badge.hidden = !dev;
+      if (dev) {
+        badge.textContent = dev;
+        badge.classList.toggle("dim", dev === "skipped");
+        badge.classList.toggle("accent", dev !== "skipped");
+      }
+    }
+    for (const node of Array.from(side.querySelectorAll("[data-sidebadge]"))) {
+      const badge = node as HTMLElement;
+      const img = images.find((i) => i.index === Number(badge.dataset.sidebadge));
       const dev = img && src ? describeTextureDeviation(src, img.index, img.name) : null;
       badge.hidden = !dev;
       if (dev) {
@@ -442,22 +418,8 @@ export function mountTextures(): TabHandle {
       }
       return;
     }
-    const src = app.sourcePath;
     const body: HTMLElement[] = [];
     for (const img of images) {
-      const open = expanded === img.index;
-      const expandBtn = el("button", {
-        class: "small chev",
-        text: open ? "▾" : "▸",
-        title: src
-          ? "per-texture overrides for this image (stored per source model)"
-          : "open a source model to edit per-texture overrides",
-        onclick: (ev: Event) => {
-          ev.stopPropagation();
-          expanded = open ? null : img.index;
-          renderList();
-        },
-      });
       const formatText = img.effective_format ?? img.format;
       const formatCell = el("td", { class: "mono", text: formatText });
       if (img.effective_format && img.effective_format !== img.format) {
@@ -480,18 +442,9 @@ export function mountTextures(): TabHandle {
           el("td", { class: "num", text: `${img.width}×${img.height}` }),
           el("td", { class: "num", text: fmtBytes(img.disk) }),
           el("td", { class: "num", text: fmtBytes(img.vram) }),
-          el("td", null, el("div", { class: "row" }, expandBtn, rowBadge(img))),
+          el("td", null, rowBadge(img)),
         ),
       );
-      if (open) {
-        body.push(
-          el(
-            "tr",
-            { class: "ov-row" },
-            el("td", { class: "ov-cell", colspan: 7 }, overrideEditor(img)),
-          ),
-        );
-      }
     }
     const rows = body;
     listHost.append(
@@ -716,6 +669,7 @@ export function mountTextures(): TabHandle {
         onclick: () => {
           clearTextureOverride(src, img.index);
           renderList();
+          renderSide();
           syncApplyBar();
         },
       }),
@@ -745,32 +699,74 @@ export function mountTextures(): TabHandle {
 
   function renderSide(): void {
     clear(side);
-    const img = images[selected];
+    const img = images.find((i) => i.index === selected);
     if (!img) {
-      side.append(section("Image", el("div", { class: "empty", text: "select an image" })));
-      side.append(
-        section(
-          "Preview",
-          el("div", { class: "muted", text: "pick an image, then preview basisu" }),
-        ),
-      );
+      side.append(section("Texture", el("div", { class: "empty", text: "select a texture" })));
       encodeBtn.disabled = true;
       return;
     }
+    const src = app.sourcePath;
+    const dev = src ? describeTextureDeviation(src, img.index, img.name) : null;
+    const devBadge = el("span", {
+      class: `badge ${dev === "skipped" ? "dim" : "accent"}`,
+      text: dev ?? "",
+      dataset: { sidebadge: String(img.index) },
+      title: "per-texture override (deviation from base params)",
+    });
+    devBadge.hidden = !dev;
     side.append(
-      section(
-        "Image",
-        kv([
-          ["index", String(img.index)],
-          ["name", img.name ?? "—"],
-          ["format", img.format],
-          ["size", `${img.width}×${img.height}`],
-          ["disk", fmtBytes(img.disk)],
-          ["vram est", fmtBytes(img.vram)],
-          ["mips", img.has_mips ? "yes" : "no"],
-        ]),
+      el(
+        "div",
+        { class: "panel" },
+        el(
+          "div",
+          { class: "panel-head" },
+          el("span", {
+            text: img.name ?? `image ${img.index}`,
+            title: img.name ?? `image ${img.index}`,
+          }),
+          el(
+            "span",
+            { class: "row" },
+            devBadge,
+            el("button", {
+              class: "small",
+              text: "✕",
+              title: "deselect (Esc)",
+              onclick: () => deselect(),
+            }),
+          ),
+        ),
+        el(
+          "div",
+          { class: "panel-body" },
+          el("div", {
+            class: "hint mono",
+            text: `image ${img.index}`,
+          }),
+          kv([
+            ["format", img.effective_format ?? img.format],
+            ["stored", img.format],
+            ["size", `${img.width}×${img.height}`],
+            ["disk", fmtBytes(img.disk)],
+            ["vram est", fmtBytes(img.vram)],
+            ["mips", img.has_mips ? "yes" : "no"],
+          ]),
+        ),
       ),
     );
+
+    /* Preview thumbnail (existing flow: loading / error / decoded image). */
+    if (previewing === img.index) {
+      side.append(previewLoading(img));
+    } else if (previewError && previewErrorIndex === img.index) {
+      side.append(previewMessage(img, `preview failed: ${previewError}`));
+    } else if (preview && preview.index === img.index) {
+      side.append(renderPreview(img, preview));
+    }
+
+    /* Per-texture editor, moved here verbatim from the old inline row. */
+    side.append(section("Texture settings", overrideEditor(img)));
 
     const body: Array<Node | string> = [
       el("div", { class: "row" }, encodeBtn),
@@ -797,7 +793,6 @@ export function mountTextures(): TabHandle {
           ["disk delta", signedBytes(result.ktx2_size - img.disk)],
           ["vram delta", signedBytes(result.vram_after - img.vram)],
         ]),
-        el("div", { class: "hint", text: "compare + applied settings are under the list" }),
       );
     } else {
       body.push(el("div", { class: "muted", text: "not encoded yet" }));
@@ -805,6 +800,7 @@ export function mountTextures(): TabHandle {
     encodeBtn.textContent = activeEncode === null ? "Preview KTX2" : "previewing…";
     encodeBtn.disabled = !app.bridge.live || activeEncode !== null;
     side.append(section("Preview (dry run)", ...body));
+    if (result) side.append(renderCompare(img, result));
   }
 
   /* --------------------------------------------------------------- preview run */
@@ -825,7 +821,7 @@ export function mountTextures(): TabHandle {
       previewError = "no completion event (timed out)";
       previewErrorIndex = index;
       renderList();
-      renderDetail();
+      renderSide();
       notify("texture preview timed out — no completion event", "error");
     }, PREVIEW_TIMEOUT_MS);
   }
@@ -837,7 +833,7 @@ export function mountTextures(): TabHandle {
     previewError = result.b64 ? null : "empty image returned";
     previewErrorIndex = result.b64 ? null : index;
     renderList();
-    renderDetail();
+    renderSide();
   }
 
   async function requestPreview(index: number): Promise<void> {
@@ -850,7 +846,7 @@ export function mountTextures(): TabHandle {
     previewErrorIndex = null;
     clearPreviewTimer();
     renderList();
-    renderDetail();
+    renderSide();
     try {
       const img = images.find((i) => i.index === index);
       const call = await app.bridge.texturePreview(
@@ -882,7 +878,7 @@ export function mountTextures(): TabHandle {
         "error",
       );
       renderList();
-      renderDetail();
+      renderSide();
     }
   }
 
@@ -896,10 +892,22 @@ export function mountTextures(): TabHandle {
     clearPreviewTimer();
     renderList();
     renderSide();
-    renderDetail();
     const cached = results.get(index);
     if (cached) void loadCompare(index, cached);
     void requestPreview(index);
+  }
+
+  /** Close the detail panel (✕ button or Escape). */
+  function deselect(): void {
+    selected = -1;
+    previewSeq++; // cancel any in-flight preview
+    preview = null;
+    previewing = null;
+    previewError = null;
+    previewErrorIndex = null;
+    clearPreviewTimer();
+    renderList();
+    renderSide();
   }
 
   /* ---------------------------------------------------------------- encodes */
@@ -920,10 +928,7 @@ export function mountTextures(): TabHandle {
     compares.delete(index);
     renderList();
     renderSide();
-    if (selected === index) {
-      renderDetail();
-      void loadCompare(index, result);
-    }
+    if (selected === index) void loadCompare(index, result);
     notify(`image ${index}: ${fmtBytes(result.ktx2_size)} @ ${result.psnr.toFixed(1)} dB`, "ok");
   }
 
@@ -932,7 +937,7 @@ export function mountTextures(): TabHandle {
     if (!result.before_png && !result.after_png) {
       // Legacy payload: no rendered previews, keep the decoded original if we have it.
       compares.set(index, { before: previewUrl(index), after: null });
-      renderDetail();
+      renderSide();
       return;
     }
     const gen = compareGen;
@@ -942,12 +947,12 @@ export function mountTextures(): TabHandle {
     ]);
     if (gen !== compareGen) return;
     compares.set(index, { before: before ?? previewUrl(index), after });
-    if (selected === index) renderDetail();
+    if (selected === index) renderSide();
   }
 
   async function startEncode(): Promise<void> {
     const path = app.viewPath;
-    const img = images[selected];
+    const img = images.find((i) => i.index === selected);
     if (!path || !img || activeEncode) return;
     const token = ++encodeSeq;
     activeEncode = { token, index: img.index, path };
@@ -992,7 +997,7 @@ export function mountTextures(): TabHandle {
       previewError = event.error;
       previewErrorIndex = current;
       renderList();
-      renderDetail();
+      renderSide();
       notify(`preview failed: ${event.error}`, "error");
       return;
     }
@@ -1294,7 +1299,10 @@ export function mountTextures(): TabHandle {
   });
 
   const offApplySettings = onSettingsChange(() => {
-    if (!selfEdit) renderList();
+    if (!selfEdit) {
+      renderList();
+      renderSide();
+    }
     syncApplyBar();
   });
 
@@ -1302,9 +1310,9 @@ export function mountTextures(): TabHandle {
 
   async function reload(): Promise<void> {
     const path = app.viewPath;
+    const keep = selected;
     images = [];
     selected = -1;
-    expanded = null;
     preview = null;
     previewing = null;
     previewError = null;
@@ -1330,7 +1338,6 @@ export function mountTextures(): TabHandle {
     compares.clear();
     renderList();
     renderSide();
-    renderDetail();
     if (path || !app.bridge.live) {
       try {
         const res = await app.bridge.textures(path ?? "/demo/DamagedHelmet.glb");
@@ -1339,10 +1346,10 @@ export function mountTextures(): TabHandle {
         notify(`textures failed: ${(err as Error).message}`, "error");
       }
     }
-    if (images.length > 0) selected = images[0].index;
+    /* Keep the selection when the same image survives the reload, else deselect. */
+    selected = images.some((i) => i.index === keep) ? keep : -1;
     renderList();
     renderSide();
-    renderDetail();
     if (selected >= 0) void requestPreview(selected);
   }
 
@@ -1350,12 +1357,17 @@ export function mountTextures(): TabHandle {
     void reload();
   });
   const offSource = app.on("source", () => {
-    expanded = null;
     syncApplyBar();
     syncActsOn();
+    refreshOverrideBadges();
     renderList();
     renderSide();
   });
+
+  const onKey = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape" && selected >= 0) deselect();
+  };
+  document.addEventListener("keydown", onKey);
 
   return {
     el: root,
@@ -1363,6 +1375,7 @@ export function mountTextures(): TabHandle {
       void reload();
     },
     dispose: () => {
+      document.removeEventListener("keydown", onKey);
       offView();
       offSource();
       offDone();

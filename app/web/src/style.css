@@ -897,24 +897,11 @@ tr.selected {
   color: var(--ok-fg);
 }
 
-/* --- textures tab: preview + compare under the list --- */
+/* --- textures tab: detail lives in the right side panel --- */
 .texture-list {
   flex: 1 1 auto;
   min-height: 96px;
   overflow: auto;
-}
-
-.texture-detail {
-  flex: 0 1 auto;
-  max-height: 54%;
-  overflow: auto;
-  padding: 8px 12px 10px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-alt);
-}
-
-.texture-detail[hidden] {
-  display: none;
 }
 
 .detail-block {
@@ -1604,12 +1591,6 @@ textarea {
   background: var(--accent-dim);
 }
 
-button.chev {
-  padding: 1px 7px;
-  font-size: 11px;
-  flex: none;
-}
-
 tr.skipped td {
   color: var(--text-dim);
 }
@@ -1620,12 +1601,7 @@ tr.skipped td {
 
 .texture-table th:last-child,
 .texture-table td:last-child {
-  width: 132px;
-}
-
-.ov-cell {
-  padding: 0 8px 10px 30px;
-  background: var(--bg-alt);
+  width: 96px;
 }
 
 .ov-wrap {
@@ -1661,6 +1637,25 @@ tr.skipped td {
 .ov-field input {
   width: 100%;
   min-width: 0;
+}
+
+/* Narrow windows: the texture detail panel stacks below the table. */
+@media (max-width: 860px) {
+  .tab-body.textures-tab {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(240px, 1fr) auto;
+    overflow-y: auto;
+  }
+
+  .tab-body.textures-tab .tab-main {
+    min-height: 0;
+  }
+
+  .tab-body.textures-tab .tab-side {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+    overflow: visible;
+  }
 }
 
 /* --- optimize tab: texture auto presets + overrides note --- */
