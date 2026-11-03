@@ -159,66 +159,35 @@ export function mountTextures(): TabHandle {
 
   /* ---------------------------------------------------------------- detail pane */
 
-  function detailHead(title: string, img: ImageInfo): HTMLElement {
-    return el(
-      "div",
-      { class: "detail-head" },
-      el("span", { class: "detail-title", text: title }),
-      el("span", {
-        class: "muted mono",
-        text: `image ${img.index}${img.name ? ` — ${img.name}` : ""}`,
-      }),
-    );
+  function previewLoadingInner(): HTMLElement {
+    return el("div", { class: "detail-loading" }, el("span", { class: "spin" }), "decoding image…");
   }
 
-  function previewLoading(img: ImageInfo): HTMLElement {
-    return el(
-      "div",
-      { class: "detail-block" },
-      detailHead("Preview", img),
-      el("div", { class: "detail-loading" }, el("span", { class: "spin" }), "decoding image…"),
-    );
-  }
-
-  function previewMessage(img: ImageInfo, message: string): HTMLElement {
-    return el(
-      "div",
-      { class: "detail-block" },
-      detailHead("Preview", img),
-      el("div", { class: "empty", text: message }),
-    );
-  }
-
-  function renderPreview(img: ImageInfo, shot: TexturePreview): HTMLElement {
+  function renderPreviewInner(img: ImageInfo, shot: TexturePreview): HTMLElement {
     const dims =
       shot.width > 0 && shot.height > 0
         ? `${shot.width}×${shot.height}`
         : `${img.width}×${img.height}`;
     return el(
       "div",
-      { class: "detail-block" },
-      detailHead("Preview", img),
+      { class: "preview-figure" },
+      el("img", {
+        class: "preview-img",
+        src: b64DataUrl(shot.b64),
+        alt: img.name ?? `image ${img.index}`,
+        title: `${dims} · ${img.format}`,
+      }),
       el(
         "div",
-        { class: "preview-figure" },
-        el("img", {
-          class: "preview-img",
-          src: b64DataUrl(shot.b64),
-          alt: img.name ?? `image ${img.index}`,
-          title: `${dims} · ${img.format}`,
-        }),
-        el(
-          "div",
-          { class: "preview-meta" },
-          el("div", { class: "hint", text: "as stored in the asset" }),
-          kv([
-            ["format", img.format],
-            ["size", dims],
-            ["disk", fmtBytes(img.disk)],
-            ["vram est", fmtBytes(img.vram)],
-            ["mips", img.has_mips ? "yes" : "no"],
-          ]),
-        ),
+        { class: "preview-meta" },
+        el("div", { class: "hint", text: "as stored in the asset" }),
+        kv([
+          ["format", img.format],
+          ["size", dims],
+          ["disk", fmtBytes(img.disk)],
+          ["vram", fmtBytes(img.vram)],
+          ["mips", img.has_mips ? "yes" : "no"],
+        ]),
       ),
     );
   }
@@ -289,22 +258,13 @@ export function mountTextures(): TabHandle {
     );
   }
 
-  function renderCompare(img: ImageInfo, res: EncodeResult): HTMLElement {
+  /** Compare content (no outer wrapper — lives inside the single side panel). */
+  function compareNodes(img: ImageInfo, res: EncodeResult): HTMLElement[] {
     const loaded = compares.get(img.index);
     const beforeUrl = loaded?.before ?? previewUrl(img.index);
     const afterUrl = loaded?.after ?? null;
-    const block = el(
-      "div",
-      { class: "detail-block" },
-      el(
-        "div",
-        { class: "detail-head" },
-        el("span", { class: "detail-title", text: "Preview (dry run) — not written anywhere" }),
-        el("span", {
-          class: "muted mono",
-          text: `image ${img.index}${img.name ? ` — ${img.name}` : ""}`,
-        }),
-      ),
+    const out: HTMLElement[] = [
+      el("div", { class: "section-title", text: `Compare — ${compareTitle(res)}` }),
       el(
         "div",
         { class: "row" },
@@ -316,9 +276,9 @@ export function mountTextures(): TabHandle {
         }),
         el("div", { class: "hint", text: "writes KTX2 with these settings" }),
       ),
-    );
+    ];
     if (beforeUrl || afterUrl) {
-      block.append(
+      out.push(
         el(
           "div",
           { class: "compare-grid" },
@@ -331,7 +291,7 @@ export function mountTextures(): TabHandle {
         ),
       );
     } else {
-      block.append(
+      out.push(
         el("div", {
           class: "hint",
           text: loaded
@@ -340,8 +300,8 @@ export function mountTextures(): TabHandle {
         }),
       );
     }
-    block.append(metricsRow(img, res), appliedLine(res));
-    return block;
+    out.push(metricsRow(img, res), appliedLine(res));
+    return out;
   }
 
   /* ------------------------------------------------------------------- list */
@@ -719,61 +679,46 @@ export function mountTextures(): TabHandle {
       title: "per-texture override (deviation from base params)",
     });
     devBadge.hidden = !dev;
-    side.append(
-      el(
-        "div",
-        { class: "panel" },
-        el(
-          "div",
-          { class: "panel-head" },
-          el("span", {
-            text: img.name ?? `image ${img.index}`,
-            title: img.name ?? `image ${img.index}`,
-          }),
-          el(
-            "span",
-            { class: "row" },
-            devBadge,
-            el("button", {
-              class: "small",
-              text: "✕",
-              title: "deselect (Esc)",
-              onclick: () => deselect(),
-            }),
-          ),
-        ),
-        el(
-          "div",
-          { class: "panel-body" },
-          el("div", {
-            class: "hint mono",
-            text: `image ${img.index}`,
-          }),
-          kv([
-            ["format", img.effective_format ?? img.format],
-            ["stored", img.format],
-            ["size", `${img.width}×${img.height}`],
-            ["disk", fmtBytes(img.disk)],
-            ["vram est", fmtBytes(img.vram)],
-            ["mips", img.has_mips ? "yes" : "no"],
-          ]),
-        ),
-      ),
+    /* One coherent panel: header (ellipsized name) + a single padded body
+     * holding facts, preview, settings, dry-run and compare — no detached
+     * floating blocks. The side column itself scrolls. */
+    const name = img.name ?? `image ${img.index}`;
+    const body = el(
+      "div",
+      { class: "panel-body" },
+      el("div", { class: "hint mono", text: `image ${img.index}` }),
+      kv([
+        ["format", img.effective_format ?? img.format],
+        ["stored", img.format],
+        ["size", `${img.width}×${img.height}`],
+        ["disk", fmtBytes(img.disk)],
+        ["vram est", fmtBytes(img.vram)],
+        ["mips", img.has_mips ? "yes" : "no"],
+      ]),
     );
 
     /* Preview thumbnail (existing flow: loading / error / decoded image). */
     if (previewing === img.index) {
-      side.append(previewLoading(img));
+      body.append(el("div", { class: "section-title", text: "Preview" }), previewLoadingInner());
     } else if (previewError && previewErrorIndex === img.index) {
-      side.append(previewMessage(img, `preview failed: ${previewError}`));
+      body.append(
+        el("div", { class: "section-title", text: "Preview" }),
+        el("div", { class: "empty", text: `preview failed: ${previewError}` }),
+      );
     } else if (preview && preview.index === img.index) {
-      side.append(renderPreview(img, preview));
+      body.append(
+        el("div", { class: "section-title", text: "Preview" }),
+        renderPreviewInner(img, preview),
+      );
     }
 
     /* Per-texture editor, moved here verbatim from the old inline row. */
-    side.append(section("Texture settings", overrideEditor(img)));
+    body.append(
+      el("div", { class: "section-title", text: "Texture settings" }),
+      overrideEditor(img),
+    );
 
-    const body: Array<Node | string> = [
+    const dryRun: Array<Node | string> = [
       el("div", { class: "row" }, encodeBtn),
       previewActs,
       el("div", {
@@ -783,9 +728,9 @@ export function mountTextures(): TabHandle {
     ];
     const result = results.get(img.index);
     if (activeEncode?.index === img.index) {
-      body.push(el("span", { class: "badge yellow", text: "previewing…" }));
+      dryRun.push(el("span", { class: "badge yellow", text: "previewing…" }));
     } else if (result) {
-      body.push(
+      dryRun.push(
         el(
           "div",
           { class: "row spread" },
@@ -800,12 +745,35 @@ export function mountTextures(): TabHandle {
         ]),
       );
     } else {
-      body.push(el("div", { class: "muted", text: "not encoded yet" }));
+      dryRun.push(el("div", { class: "muted", text: "not encoded yet" }));
     }
     encodeBtn.textContent = activeEncode === null ? "Preview KTX2" : "previewing…";
     encodeBtn.disabled = !app.bridge.live || activeEncode !== null;
-    side.append(section("Preview (dry run)", ...body));
-    if (result) side.append(renderCompare(img, result));
+    body.append(el("div", { class: "section-title", text: "Preview (dry run)" }), ...dryRun);
+    if (result) body.append(...compareNodes(img, result));
+    side.append(
+      el(
+        "div",
+        { class: "panel" },
+        el(
+          "div",
+          { class: "panel-head" },
+          el("span", { class: "tex-name", text: name, title: name }),
+          el(
+            "span",
+            { class: "row" },
+            devBadge,
+            el("button", {
+              class: "small",
+              text: "✕",
+              title: "deselect (Esc)",
+              onclick: () => deselect(),
+            }),
+          ),
+        ),
+        body,
+      ),
+    );
   }
 
   /* --------------------------------------------------------------- preview run */

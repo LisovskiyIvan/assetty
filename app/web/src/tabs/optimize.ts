@@ -407,6 +407,11 @@ export function mountOptimize(): TabHandle {
   const presetRow = el("div", { class: "preset-row" });
   const runBtn = el("button", { class: "primary", text: "Run optimize", disabled: true });
   const exportBtn = el("button", { text: "Export", disabled: true });
+  /** Compact progress strip: lives with the Run button so it stays visible. */
+  const progressFill = el("div");
+  const progressMeta = el("span", { class: "run-progress-meta", text: "idle · 0%" });
+  const progressBar = el("div", { class: "progress grow" }, progressFill);
+  const logLine = el("div", { class: "logline mono", text: "—" });
   /** Pre-run guard: shown when the source has no encodable images left. */
   const guardBox = el("div", { class: "guard-box" });
   guardBox.hidden = true;
@@ -428,6 +433,8 @@ export function mountOptimize(): TabHandle {
       guardBox,
       presetRow,
       el("div", { class: "row" }, runBtn, exportBtn),
+      el("div", { class: "row run-progress" }, progressBar, progressMeta),
+      logLine,
     ),
   );
 
@@ -550,21 +557,6 @@ export function mountOptimize(): TabHandle {
   }
   syncAll();
 
-  /* ---------------------------------------------------------------- progress */
-
-  const progressStep = el("span", { text: "idle" });
-  const progressPct = el("span", { text: "0%" });
-  const progressFill = el("div");
-  const progressBar = el("div", { class: "progress" }, progressFill);
-  const logLine = el("div", { class: "logline mono", text: "—" });
-  const progressPanel = section(
-    "Progress",
-    el("div", { class: "progress-meta" }, progressStep, progressPct),
-    progressBar,
-    logLine,
-  );
-  side.append(progressPanel);
-
   /* ------------------------------------------------------------------ report */
 
   const reportPanel = section(
@@ -572,6 +564,18 @@ export function mountOptimize(): TabHandle {
     el("div", { class: "empty", text: "run an optimization to see before/after" }),
   );
   side.append(reportPanel);
+
+  /** Back to the empty state: a new run supersedes the previous report. */
+  function resetReport(): void {
+    reportPanel.replaceChildren(
+      el("div", { class: "panel-head" }, el("span", { text: "Report" })),
+      el(
+        "div",
+        { class: "panel-body" },
+        el("div", { class: "empty", text: "run an optimization to see before/after" }),
+      ),
+    );
+  }
   side.append(
     el("div", {
       class: "hint",
@@ -580,9 +584,8 @@ export function mountOptimize(): TabHandle {
   );
 
   function setProgress(step: string, pct: number): void {
-    progressStep.textContent = step || "working…";
     const clamped = Math.max(0, Math.min(100, pct));
-    progressPct.textContent = `${Math.round(clamped)}%`;
+    progressMeta.textContent = `${step || "working…"} · ${Math.round(clamped)}%`;
     progressFill.style.width = `${clamped}%`;
   }
 
@@ -981,6 +984,9 @@ export function mountOptimize(): TabHandle {
     stopProgress?.();
     stopProgress = null;
     setRunning(true);
+    /* The run supersedes the previous result: drop it before doing any work. */
+    lastResult = null;
+    resetReport();
     setProgress("starting…", 0);
     try {
       const call = await app.bridge.optimizeCustom(

@@ -1,0 +1,26 @@
+import{b6 as e}from"./index-B8E16sa6.js";import{b as n,a as i}from"./bakedVertexAnimationDeclaration-C4jBwsNZ.js";import{m as o,a as s}from"./morphTargetsVertexDeclaration-CqA_B0A9.js";import{i as c}from"./instancesDeclaration-DAS9jrol.js";import{m as d,a as m}from"./morphTargetsVertex-r8dEmTsj.js";import{i as l}from"./instancesVertex-DjyfO-OX.js";import{b as S,a as p}from"./bakedVertexAnimation-D0qOHjTF.js";const r="pickingVertexShader",a=`attribute position: vec3f;
+#if defined(INSTANCES)
+attribute instanceMeshID: f32;
+#endif
+#include<bonesDeclaration>
+#include<bakedVertexAnimationDeclaration>
+#include<morphTargetsVertexGlobalDeclaration>
+#include<morphTargetsVertexDeclaration>[0..maxSimultaneousMorphTargets]
+#include<instancesDeclaration>
+uniform viewProjection: mat4x4f;
+#if defined(INSTANCES)
+flat varying vMeshID: f32;
+#endif
+@vertex
+fn main(input : VertexInputs)->FragmentInputs {var positionUpdated: vec3f=vertexInputs.position;
+#include<morphTargetsVertexGlobal>
+#include<morphTargetsVertex>[0..maxSimultaneousMorphTargets]
+#include<instancesVertex>
+#include<bonesVertex>
+#include<bakedVertexAnimation>
+var worldPos: vec4f=finalWorld*vec4f(positionUpdated,1.0);vertexOutputs.position=uniforms.viewProjection*worldPos;
+#if defined(INSTANCES)
+vertexOutputs.vMeshID=vertexInputs.instanceMeshID;
+#endif
+}
+`;e.ShadersStoreWGSL[r]||(e.ShadersStoreWGSL[r]=a);const f=[n,i,o,s,c,d,m,l,S,p];for(const t of f)e.IncludesShadersStoreWGSL[t.name]||(e.IncludesShadersStoreWGSL[t.name]=t.shader);const W={name:r,shader:a};export{W as pickingVertexShaderWGSL};

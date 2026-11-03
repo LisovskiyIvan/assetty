@@ -332,6 +332,7 @@ button.active {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   padding: 8px 12px;
   font-size: 11px;
   text-transform: uppercase;
@@ -486,12 +487,11 @@ textarea {
   }
 }
 
-.progress-meta {
-  display: flex;
-  justify-content: space-between;
+.run-progress-meta {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text-dim);
+  white-space: nowrap;
 }
 
 /* --- table --- */
@@ -771,43 +771,6 @@ tr.selected {
   color: var(--divider);
 }
 
-.status-path {
-  display: inline-flex;
-  align-items: center;
-  min-width: 0;
-  max-width: min(46ch, 46vw);
-  padding: 1px 9px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--bg-raised);
-  color: var(--text);
-  font: inherit;
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.status-path:hover:not(:disabled) {
-  border-color: var(--accent);
-}
-
-.status-path[data-empty="true"] {
-  color: var(--text-dim);
-}
-
-.status-path .k {
-  color: var(--text-dim);
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  flex: none;
-}
-
-.status-path .v {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .status-spacer {
   flex: 1 1 auto;
 }
@@ -904,35 +867,13 @@ tr.selected {
   overflow: auto;
 }
 
-.detail-block {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-
-.detail-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 0;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-dim);
-}
-
-.detail-head > * {
+/* Single-panel header name: never clips to the left, ellipsizes instead. */
+.panel-head .tex-name {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.detail-title {
-  flex: none;
-  color: var(--text);
 }
 
 .detail-loading {
@@ -1580,13 +1521,6 @@ textarea {
   max-width: 100%;
 }
 
-@media (max-width: 1200px) {
-  /* full path stays in the tooltip; the bar shows the file name only */
-  .status-path {
-    max-width: 22ch;
-  }
-}
-
 @media (max-width: 1000px) {
   .statusbar [data-chip="disk"] {
     display: none;
@@ -1611,10 +1545,6 @@ textarea {
   .statusbar {
     gap: 3px 8px;
     padding: 3px 8px;
-  }
-
-  .status-path {
-    max-width: 16ch;
   }
 }
 
