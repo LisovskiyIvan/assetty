@@ -250,6 +250,9 @@ export function mountOptimize(): TabHandle {
   let right: ViewerScene | null = null;
   let linked = false;
   let lastResult: OptimizeResult | null = null;
+  /** Last rendered report numbers. Survives a discard (only the artifact
+   * goes) so the before/after table stays put; cleared by the next run. */
+  let lastReport: OptimizeResult | null = null;
   /** True while a background job owns the backend (Run stays disabled). */
   let running = false;
   /** True while an exportTo copy is in flight (Save as… stays disabled). */
@@ -381,6 +384,7 @@ export function mountOptimize(): TabHandle {
   /** A fresh result enables the Split option and re-centers the divider. */
   function noteResult(res: OptimizeResult): void {
     lastResult = res;
+    lastReport = res;
     splitPos = 50;
     syncCompareUI();
   }
@@ -703,6 +707,31 @@ export function mountOptimize(): TabHandle {
     }
   }
 
+  /**
+   * "This optimization didn't please me": deletes the result file on the host
+   * and forgets the artifact. The report numbers stay — only the file (and
+   * everything pointing at it) goes: the banner hides, Export disables,
+   * Split falls back to side-by-side, and a view of the deleted file returns
+   * to the source.
+   */
+  async function discardResult(outPath: string): Promise<void> {
+    try {
+      await app.bridge.discardFile(outPath);
+    } catch (err) {
+      notify(t("opt.discardFail", { message: (err as Error).message }), "error");
+      return;
+    }
+    // A new run may have superseded this result while the unlink was in flight.
+    if (lastResult?.out_path !== outPath) return;
+    lastResult = null;
+    compareMode = "side";
+    syncCompareUI();
+    if (lastReport) renderReport(lastReport);
+    syncAll();
+    if (app.viewPath === outPath && app.sourcePath) app.setView(app.sourcePath);
+    notify(t("opt.discarded"), "ok");
+  }
+
   function stopJob(): void {
     if (doneTimer) {
       clearTimeout(doneTimer);
@@ -799,48 +828,50 @@ export function mountOptimize(): TabHandle {
       body.append(list);
     }
 
-    body.append(
-      el("button", {
-        class: "path-button mono",
-        text: res.out_path,
-        title: `${res.out_path}\nclick to copy`,
-        onclick: async () => {
-          const ok = await copyText(res.out_path);
-          notify(
-            ok ? t("common.copied", { path: res.out_path }) : res.out_path,
-            ok ? "ok" : "info",
-          );
-        },
-      }),
-      el(
-        "div",
-        { class: "row" },
-        el("button", {
-          class: "small primary",
-          text: t("common.view"),
-          title: t("opt.viewTitle"),
-          onclick: () => {
-            app.setView(res.out_path);
-            notify(t("opt.viewing", { path: res.out_path }), "ok");
-          },
-        }),
-        el("button", {
-          class: "small",
-          text: t("common.useAsSource"),
-          title: t("opt.useTitle"),
-          onclick: () => {
-            app.useAsSource(res.out_path);
-            notify(t("opt.sourceSet", { path: res.out_path }), "ok");
-          },
-        }),
-        el("button", {
-          class: "small",
-          text: t("common.saveAs"),
-          title: t("opt.saveTitle"),
-          onclick: () => void saveAs(res.out_path),
-        }),
-      ),
-    );
+    // The action banner lives only while the artifact does: after a discard
+    // the numbers stay but there is no file left to save or copy a path of.
+    if (lastResult?.out_path === res.out_path) {
+      body.append(
+        el(
+          "div",
+          { class: "result-banner", dataset: { path: res.out_path } },
+          el("button", {
+            class: "path-button mono",
+            text: res.out_path,
+            title: `${res.out_path}\nclick to copy`,
+            onclick: async () => {
+              const ok = await copyText(res.out_path);
+              notify(
+                ok ? t("common.copied", { path: res.out_path }) : res.out_path,
+                ok ? "ok" : "info",
+              );
+            },
+          }),
+          el(
+            "div",
+            { class: "row" },
+            el("button", {
+              class: "small primary",
+              text: t("common.saveAs"),
+              title: t("opt.saveTitle"),
+              onclick: () => void saveAs(res.out_path),
+            }),
+            el("button", {
+              class: "small danger",
+              text: t("opt.discard"),
+              title: t("opt.discardTitle"),
+              onclick: (ev: Event) => {
+                const btn = ev.currentTarget as HTMLButtonElement | null;
+                if (btn) btn.disabled = true;
+                void discardResult(res.out_path).finally(() => {
+                  if (btn?.isConnected) btn.disabled = false;
+                });
+              },
+            }),
+          ),
+        ),
+      );
+    }
 
     reportHead.textContent = t("opt.report");
     const secs = fmtSecs(res.report.total_secs);
@@ -1032,6 +1063,7 @@ export function mountOptimize(): TabHandle {
     setRunning(true);
     /* The run supersedes the previous result: drop it before doing any work. */
     lastResult = null;
+    lastReport = null;
     resetReport();
     resetSub();
     setProgress(t("opt.starting"), 0);
@@ -1115,7 +1147,7 @@ export function mountOptimize(): TabHandle {
       anchor.setAttribute("aria-label", t("help.aria", { id: anchor.dataset.help ?? "" }));
     }
     buildForm();
-    if (lastResult) renderReport(lastResult);
+    if (lastReport) renderReport(lastReport);
     else resetReport();
     syncAll();
   });

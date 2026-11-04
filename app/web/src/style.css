@@ -413,6 +413,17 @@ button.small {
   font-size: 11px;
 }
 
+/* Subtle destructive: tinted text/border only, no filled background. */
+button.danger {
+  border-color: var(--bad-border);
+  color: var(--bad-fg-strong);
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--bad);
+  background: var(--bad-bg);
+}
+
 select,
 input {
   padding: 6px 8px;

@@ -182,6 +182,10 @@ const en: Dict = {
   "opt.exportNoHost": "export unavailable — rebuild the assetty binary",
   "opt.exportFail": "export failed: {message}",
   "opt.savedTo": "saved to {path}",
+  "opt.discard": "Discard",
+  "opt.discardTitle": "Delete this result file and forget it",
+  "opt.discarded": "result discarded",
+  "opt.discardFail": "discard failed: {message}",
   "opt.loadOptFail": "load optimized failed: {message}",
   "opt.loadFail": "load failed: {message}",
 
@@ -577,6 +581,10 @@ const ru: Dict = {
   "opt.exportNoHost": "экспорт недоступен — пересоберите бинарник assetty",
   "opt.exportFail": "ошибка экспорта: {message}",
   "opt.savedTo": "сохранено в {path}",
+  "opt.discard": "Сбросить",
+  "opt.discardTitle": "Удалить файл результата и забыть его",
+  "opt.discarded": "результат сброшен",
+  "opt.discardFail": "не удалось сбросить: {message}",
   "opt.loadOptFail": "не загрузить результат: {message}",
   "opt.loadFail": "ошибка загрузки: {message}",
 

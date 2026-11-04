@@ -22,6 +22,7 @@
  *                              (older hosts: { ktx2_size, psnr, vram_after } synchronously)
  *   diff(a, b)              -> DiffReport
  *   lint(path, budgetJson)  -> { violations, total }
+ *   discardFile(path)       -> {"ok":true} (only under .zig-cache/assetty-app; missing counts as discarded)
  *   presets()               -> ["desktop", ...] | { presets: [...] }
  *   presetLoad(name)        -> zon text | { zon }
  *   presetSave(name, zon)   -> anything
@@ -110,6 +111,7 @@ const METHOD_NAMES = [
   "textureEncode",
   "diff",
   "lint",
+  "discardFile",
   "presets",
   "presetLoad",
   "presetSave",
@@ -201,7 +203,7 @@ function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|discardFile|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
         key,
       );
     if (!m) continue;
@@ -550,6 +552,15 @@ class DemoBackend {
     return demo.demoLint;
   }
 
+  /**
+   * Demo mode never touches disk — the real host only deletes inside
+   * `.zig-cache/assetty-app/` anyway. Waits a beat so the UI path (banner
+   * teardown, toasts) stays identical to the live one.
+   */
+  async discardFile(_path: string): Promise<void> {
+    await sleep(120);
+  }
+
   async presets(): Promise<string[]> {
     await sleep(40);
     return [...demo.demoPresets];
@@ -789,6 +800,16 @@ export class Bridge {
   async lint(path: string, budgetJson: string): Promise<LintResult> {
     if (!this.live) return this.demo.lint();
     return normalizeViolations(parseMaybeJson(await this.raw("lint", [path, budgetJson])));
+  }
+
+  /**
+   * Deletes a finished result file on the host (`{"ok":true}`; the host
+   * refuses anything outside `.zig-cache/assetty-app/` and treats a missing
+   * file as already discarded). Rejects with the host's error text otherwise.
+   */
+  async discardFile(path: string): Promise<void> {
+    if (!this.live) return this.demo.discardFile(path);
+    await this.raw("discardFile", [path]);
   }
 
   async presets(): Promise<string[]> {

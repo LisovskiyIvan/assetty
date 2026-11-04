@@ -80,6 +80,7 @@ pub const Backend = struct {
         .texturePreview = .{ "path", "index", "settings" },
         .diff = .{ "a", "b" },
         .lint = .{ "path", "budgetJson" },
+        .discardFile = .{"path"},
         .presetLoad = .{"name"},
         .presetSave = .{ "name", "zon" },
         .settingsLoad = .{},
@@ -235,6 +236,14 @@ pub const Backend = struct {
     /// the budget JSON itself or a path to it.
     pub fn lint(self: *Backend, call: *nanoui.Call, path: []const u8, budget_json: []const u8) !json.Raw {
         return self.lintImpl(call.arena, path, budget_json);
+    }
+
+    /// Deletes a finished result file and forgets it: `{"ok":true}`. Only
+    /// files strictly under `out_dir` may go (see `discardFileImpl`); anything
+    /// else is refused, and a file that is already gone counts as discarded.
+    /// Synchronous on the main thread — a single unlink, no pipeline work.
+    pub fn discardFile(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+        return discardFileImpl(self.io, call.arena, path);
     }
 
     // ---- presets ----------------------------------------------------------
@@ -1536,6 +1545,36 @@ fn copyExport(io: std.Io, a: std.mem.Allocator, src: []const u8, dst: []const u8
     return null;
 }
 
+/// Deletes a finished result file: `{"ok":true}`. Safety first — both
+/// `out_dir` and the target are resolved to canonical absolute paths and the
+/// target must sit strictly under `out_dir` (prefix + separator + longer),
+/// so `..`, symlinks and absolute escapes cannot reach anything else. A file
+/// that is already gone (unresolvable or unlink reports it missing) counts as
+/// discarded: the UI treats discard as idempotent.
+fn discardFileImpl(io: std.Io, a: std.mem.Allocator, path: []const u8) !json.Raw {
+    const trimmed = std.mem.trim(u8, path, " \t\r\n");
+    if (trimmed.len == 0) return json.errorRaw(a, "empty path", .{});
+    const out_abs = std.Io.Dir.cwd().realPathFileAlloc(io, out_dir, a) catch
+        return json.errorRaw(a, "only results in .zig-cache/assetty-app can be discarded", .{});
+    const target_abs = std.Io.Dir.cwd().realPathFileAlloc(io, trimmed, a) catch
+        return json.raw("{\"ok\":true}");
+    if (!isUnderDir(target_abs, out_abs))
+        return json.errorRaw(a, "only results in .zig-cache/assetty-app can be discarded", .{});
+    std.Io.Dir.cwd().deleteFile(io, target_abs) catch |err| {
+        if (err == error.FileNotFound) return json.raw("{\"ok\":true}");
+        return json.errorRaw(a, "{s}: {s}", .{ trimmed, @errorName(err) });
+    };
+    return json.raw("{\"ok\":true}");
+}
+
+/// Strict containment: `target` is longer than `dir`, starts with it, and the
+/// next byte is a separator — so `dir` itself and `dir-sibling` never match.
+fn isUnderDir(target: []const u8, dir: []const u8) bool {
+    if (target.len <= dir.len) return false;
+    if (!std.mem.startsWith(u8, target, dir)) return false;
+    return target[dir.len] == std.fs.path.sep;
+}
+
 fn validPresetName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
     for (name) |ch| {
@@ -2271,6 +2310,49 @@ test "export refuses a self-copy and reports a missing source" {
 
     const empty_msg = copyExport(testing.io, a, "", dst) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, empty_msg, "empty path") != null);
+}
+
+// ---- discardFile ------------------------------------------------------------
+
+test "discardFile deletes a result inside out_dir and is idempotent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.Io.Dir.cwd().createDirPath(testing.io, out_dir);
+    const rel = out_dir ++ "/discard_test_tmp.glb";
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = rel, .data = "opt-bytes" });
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, rel, a);
+
+    const r = try discardFileImpl(testing.io, a, abs);
+    try testing.expectEqualStrings("{\"ok\":true}", r.text);
+    // Gone from disk.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, abs, .{}));
+    // Second call: already gone, still ok.
+    const r2 = try discardFileImpl(testing.io, a, abs);
+    try testing.expectEqualStrings("{\"ok\":true}", r2.text);
+    // A relative in-dir path resolves the same way.
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = rel, .data = "opt-bytes" });
+    const r3 = try discardFileImpl(testing.io, a, rel);
+    try testing.expectEqualStrings("{\"ok\":true}", r3.text);
+}
+
+test "discardFile refuses paths outside out_dir" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const refused = "only results in .zig-cache/assetty-app can be discarded";
+    for ([_][]const u8{ "test/fixtures/box.glb", "/etc", out_dir }) |p| {
+        const r = try discardFileImpl(testing.io, a, p);
+        try testing.expect(std.mem.indexOf(u8, r.text, refused) != null);
+    }
+    // Nothing was touched: the fixture still reads.
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    try testing.expect(bytes.len > 0);
+    // Blank paths are refused, not deleted.
+    const blank = try discardFileImpl(testing.io, a, "   ");
+    try testing.expect(std.mem.indexOf(u8, blank.text, "\"error\"") != null);
 }
 
 // ---- custom step specs ----------------------------------------------------
