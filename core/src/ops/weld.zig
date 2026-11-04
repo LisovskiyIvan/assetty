@@ -112,14 +112,19 @@ fn weldPrim(
 
     var map: std.StringHashMapUnmanaged(u32) = .empty;
     defer map.deinit(a);
+    // Reserve the worst case up front: without this the map regrows ~log2(n)
+    // times and every regrow re-hashes ALL existing keys (keys can be KBs).
+    try map.ensureTotalCapacity(a, @intCast(@min(vcount, std.math.maxInt(u32))));
     var owned_keys: std.ArrayList([]u8) = .empty;
     defer {
         for (owned_keys.items) |k| a.free(k);
         owned_keys.deinit(a);
     }
+    try owned_keys.ensureUnusedCapacity(a, @intCast(@min(vcount, std.math.maxInt(usize) / 2)));
 
     var src: std.ArrayList(u32) = .empty; // unique id -> source vertex
     defer src.deinit(a);
+    try src.ensureUnusedCapacity(a, @intCast(@min(vcount, std.math.maxInt(usize) / 2)));
 
     const remap = try a.alloc(u32, vcount);
     defer a.free(remap);

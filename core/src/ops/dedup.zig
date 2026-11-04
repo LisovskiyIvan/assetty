@@ -281,6 +281,9 @@ fn dedupAccessors(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     const rep = try a.alloc(u32, n);
 
     var buckets: std.AutoHashMapUnmanaged(u64, std.ArrayList(u32)) = .empty;
+    // Accessor dedup hits n up to tens of thousands; pre-size so the map
+    // never regrows (each regrow re-hashes every stored key).
+    try buckets.ensureTotalCapacity(a, @intCast(n * 2));
     defer {
         var it = buckets.valueIterator();
         while (it.next()) |list| list.deinit(a);
