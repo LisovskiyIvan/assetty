@@ -1044,9 +1044,9 @@ test "run: weld and textures apply" {
 }
 
 fn testNowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+    // Portable monotonic clock (`std.c.clock_gettime` is unavailable on
+    // Windows; the old `std.time.milliTimestamp` is gone in 0.17).
+    return std.Io.Timestamp.now(std.testing.io, .awake).toMilliseconds();
 }
 
 /// Minimal GLB with `pngs.len` embedded PNG images and no geometry.

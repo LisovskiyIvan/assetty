@@ -64,8 +64,14 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Loaded {
         break :blk s;
     };
     const size: usize = @intCast(st.size);
+    // Empty files cannot be GLB/gltf: fail cleanly instead of mapping a
+    // zero-length region (length-0 mappings are not portable).
+    if (size == 0) {
+        file.close(io);
+        return Error.InvalidGlb;
+    }
     var mm = std.Io.File.MemoryMap.create(io, file, .{
-        .len = @max(size, 1),
+        .len = size,
         .protection = .{ .read = true },
     }) catch |err| {
         file.close(io);
@@ -136,10 +142,52 @@ const Maps = struct {
     samplers: std.AutoHashMapUnmanaged(*c.cgltf_sampler, u32) = .empty,
 };
 
-
 fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
     if (n == 0 or @intFromPtr(ptr) == 0) return &.{};
     return ptr[0..n];
+}
+
+/// Raw bytes of a buffer view, overflow-safe. Null when the buffer data is
+/// not loaded (external uri) or the view runs past its buffer.
+fn viewBytesChecked(v: *const c.cgltf_buffer_view) ?[]const u8 {
+    if (v.data) |d| {
+        const p: [*]const u8 = @ptrCast(d);
+        return p[0..v.size];
+    }
+    if (@intFromPtr(v.buffer) == 0) return null;
+    const bd = v.buffer.*.data orelse return null;
+    const bsize: usize = @intCast(v.buffer.*.size);
+    const off: usize = @intCast(v.offset);
+    const sz: usize = @intCast(v.size);
+    if (off > bsize or sz > bsize - off) return null;
+    const p: [*]const u8 = @ptrCast(bd);
+    return p[off .. off + sz];
+}
+
+/// Every accessor with plain (uncompressed, loaded) buffer data must fit in
+/// its view. Skips views that are missing, compressed (meshopt/draco payload
+/// sizes differ from decoded sizes), or extension-owned — those stay
+/// downstream-checked.
+fn validateAccessors(data: *c.cgltf_data) Error!void {
+    for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
+        const bv_ptr = acc.buffer_view orelse continue; // viewless: nothing to bound
+        const bv: *const c.cgltf_buffer_view = @ptrCast(bv_ptr);
+        if (bv.has_meshopt_compression != 0) continue;
+        const bytes = viewBytesChecked(bv) orelse continue; // unloaded (external uri): lenient
+        const count: usize = @intCast(acc.count);
+        // A view-backed accessor with no elements is corrupt (the schema
+        // minimum is 1); this also pins down negative JSON counts, which
+        // cgltf's float-to-unsigned cast resolves differently per CPU.
+        if (count == 0) return Error.AccessorOutOfRange;
+        const elem: usize = @intCast(c.cgltf_calc_size(acc.type, acc.component_type));
+        if (elem == 0) continue;
+        const stride: usize = if (acc.stride != 0) @intCast(acc.stride) else elem;
+        if (stride < elem) return Error.AccessorOutOfRange;
+        const span = std.math.mul(usize, count - 1, stride) catch return Error.AccessorOutOfRange;
+        const need = std.math.add(usize, span, elem) catch return Error.AccessorOutOfRange;
+        const off: usize = @intCast(acc.offset);
+        if (off > bytes.len or need > bytes.len - off) return Error.AccessorOutOfRange;
+    }
 }
 
 fn convMode(t: c_uint) model.Mode {
@@ -223,6 +271,12 @@ fn markExt(exts: *model.Extensions, name: [*c]const u8) void {
 
 fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !model.Asset {
     var maps: Maps = .{};
+
+    // Malformed files can declare accessor counts/offsets that no buffer
+    // holds (negative JSON counts wrap to huge unsigned values). Reject them
+    // here — ReleaseFast disables OOB checks, so every downstream slice
+    // trusts these bounds.
+    try validateAccessors(data);
 
     var out: model.Asset = .{
         .is_glb = map_bytes.len >= 4 and std.mem.readInt(u32, map_bytes[0..4], .little) == 0x46546C67,
@@ -308,12 +362,20 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         }
         if (im.buffer_view) |bv| {
             const view = bv.*;
-            // buffer->data points into the mmap after cgltf_load_buffers
+            // buffer->data points into the mmap after cgltf_load_buffers.
+            // Malformed files can declare out-of-range offset/size pairs;
+            // validate (overflow-safe) and leave the image dataless instead
+            // of slicing out of bounds (ReleaseFast has no OOB checks).
             if (view.buffer) |buf| {
                 if (buf.*.data) |bd| {
-                    const base: [*]const u8 = @ptrCast(bd);
-                    img.data = (base + view.offset)[0..view.size];
-                    img.disk_bytes = view.size;
+                    const bsize: usize = @intCast(buf.*.size);
+                    const off: usize = @intCast(view.offset);
+                    const sz: usize = @intCast(view.size);
+                    if (off <= bsize and sz <= bsize - off) {
+                        const base: [*]const u8 = @ptrCast(bd);
+                        img.data = (base + off)[0..sz];
+                        img.disk_bytes = view.size;
+                    }
                 }
             }
         }
@@ -411,7 +473,9 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     for (sl(c.cgltf_node, data.nodes, data.nodes_count), 0..) |*n, i| {
         const children = try a.alloc(u32, n.children_count);
         for (sl([*c]c.cgltf_node, n.children, n.children_count), 0..) |ch, k| {
-            children[k] = maps.nodes.get(ch) orelse continue;
+            // Unknown pointers (corrupt input) degrade to node 0 rather than
+            // leaving the slot uninitialized.
+            children[k] = maps.nodes.get(ch) orelse 0;
         }
         var mtx: [16]f32 = undefined;
         for (n.matrix, 0..) |v, k| mtx[k] = @floatCast(v);
@@ -440,7 +504,7 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     for (sl(c.cgltf_scene, data.scenes, data.scenes_count), 0..) |*s, i| {
         const roots = try a.alloc(u32, s.nodes_count);
         for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count), 0..) |n, k| {
-            roots[k] = maps.nodes.get(n) orelse continue;
+            roots[k] = maps.nodes.get(n) orelse 0;
         }
         scenes[i] = .{ .name = try dupName(a, s.name), .roots = roots };
     }
@@ -541,4 +605,202 @@ test "scanGlbChunks" {
     const chunks = scanGlbChunks(&buf);
     try std.testing.expectEqual(@as(u64, 4), chunks.bin);
     try std.testing.expectEqual(@as(u64, 0), chunks.json);
+}
+
+test "loadFile rejects corrupt inputs without crashing" {
+    // Fuzz regression: every input here must return an error (never crash or
+    // hang), even under ReleaseFast where OOB checks are disabled. Mirrors
+    // the `test/fuzz_corpus.py` classes at a size that keeps `zig build test` fast.
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const dir = ".zig-cache/fuzz-regression";
+
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const valid = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/box.glb", a, .limited(1 << 20));
+    defer a.free(valid);
+
+    const Case = struct { name: []const u8, make: *const fn (std.mem.Allocator, []const u8) anyerror![]u8, ok: bool };
+    const cases = [_]Case{
+        .{ .name = "valid", .make = &copyCase, .ok = true },
+        .{ .name = "empty", .make = &emptyCase, .ok = false },
+        .{ .name = "short", .make = &shortCase, .ok = false },
+        .{ .name = "bad-magic", .make = &badMagicCase, .ok = false },
+        .{ .name = "bad-version", .make = &badVersionCase, .ok = false },
+        .{ .name = "huge-chunk-len", .make = &hugeChunkLenCase, .ok = false },
+        .{ .name = "bad-chunk-type", .make = &badChunkTypeCase, .ok = false },
+        .{ .name = "neg-count", .make = &negCountCase, .ok = false },
+        // Lenient below: corrupt but safely degradable (dataless views are
+        // skipped, the GC walk is cycle-safe, `{}` is an empty asset).
+        .{ .name = "huge-bytelength", .make = &hugeByteLengthCase, .ok = true },
+        .{ .name = "huge-byteoffset", .make = &hugeByteOffsetCase, .ok = true },
+        .{ .name = "bad-buffer-view-ref", .make = &badBufferViewRefCase, .ok = false },
+        // cgltf rejects self-parenting, so cycles never reach the model;
+        // markSubtree stays cycle-safe as defense in depth.
+        .{ .name = "cyclic-children", .make = &cyclicChildrenCase, .ok = false },
+        .{ .name = "empty-json", .make = &emptyJsonCase, .ok = true },
+        .{ .name = "json-array", .make = &jsonArrayCase, .ok = false },
+    };
+
+    var path_buf: [256]u8 = undefined;
+    for (cases) |cs| {
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.glb", .{ dir, cs.name });
+        const bytes = try cs.make(a, valid);
+        defer a.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+        if (cs.ok) {
+            var loaded = loadFile(io, a, path) catch |err| {
+                std.debug.print("fuzz-case {s}: UNEXPECTED {s}\n", .{ cs.name, @errorName(err) });
+                return err;
+            };
+            loaded.deinit();
+        } else {
+            const res = loadFile(io, a, path);
+            if (res) |loaded_const| {
+                var loaded = loaded_const;
+                loaded.deinit();
+                std.debug.print("fuzz-case {s}: PARSED (unexpected)\n", .{cs.name});
+                // Lenient parse of garbage is allowed only when the result is
+                // still structurally sound; these cases must not parse cleanly.
+                return error.ExpectedLoadFailure;
+            } else |_| {
+                // Expected: corrupt input rejected (or degraded) without crashing.
+            }
+        }
+    }
+}
+
+fn copyCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return a.dupe(u8, valid);
+}
+
+fn emptyCase(a: std.mem.Allocator, _: []const u8) ![]u8 {
+    return a.dupe(u8, &.{});
+}
+
+fn shortCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return a.dupe(u8, valid[0..@min(valid.len, 13)]);
+}
+
+fn badMagicCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const b = try a.dupe(u8, valid);
+    @memcpy(b[0..4], "glFX");
+    return b;
+}
+
+fn badVersionCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const b = try a.dupe(u8, valid);
+    std.mem.writeInt(u32, b[4..8], 1, .little);
+    return b;
+}
+
+fn hugeChunkLenCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const b = try a.dupe(u8, valid);
+    if (b.len >= 20) std.mem.writeInt(u32, b[12..16], 0xFFFFFFFF, .little);
+    return b;
+}
+
+fn badChunkTypeCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const b = try a.dupe(u8, valid);
+    if (b.len >= 20) std.mem.writeInt(u32, b[16..20], 0xDEADBEEF, .little);
+    return b;
+}
+
+/// Replace the first `"count":<n>` with `"count":-1`.
+fn negCountCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return jsonPatch(a, valid, "\"count\":", "-1");
+}
+
+/// Replace the first `"byteLength":<n>` with the u32 max.
+fn hugeByteLengthCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return jsonPatch(a, valid, "\"byteLength\":", "4294967295");
+}
+
+/// Replace the first `"byteOffset":<n>` with the u32 max.
+fn hugeByteOffsetCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return jsonPatch(a, valid, "\"byteOffset\":", "4294967295");
+}
+
+/// Point the first `"bufferView":<n>` far out of range.
+fn badBufferViewRefCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    return jsonPatch(a, valid, "\"bufferView\":", "99999");
+}
+
+/// Make node 0 its own child (cycle must not hang the GC reachability walk).
+fn cyclicChildrenCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const parts = glbTestSplit(valid) orelse return error.BadFixture;
+    const needle = "\"children\":[1,2,3]";
+    const at = std.mem.indexOf(u8, parts.json, needle) orelse return error.BadFixture;
+    const patched = try std.mem.concat(a, u8, &.{
+        parts.json[0..at],
+        "\"children\":[0]",
+        parts.json[at + needle.len ..],
+    });
+    defer a.free(patched);
+    return glbTestJoin(a, parts.hdr, patched, parts.bin);
+}
+
+fn emptyJsonCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const parts = glbTestSplit(valid) orelse return error.BadFixture;
+    return glbTestJoin(a, parts.hdr, "{}", parts.bin);
+}
+
+fn jsonArrayCase(a: std.mem.Allocator, valid: []const u8) ![]u8 {
+    const parts = glbTestSplit(valid) orelse return error.BadFixture;
+    return glbTestJoin(a, parts.hdr, "[]", parts.bin);
+}
+
+/// Replace the JSON value after the first `key` with `replacement`, keeping
+/// the GLB container otherwise identical (lengths are recomputed on join).
+fn jsonPatch(a: std.mem.Allocator, valid: []const u8, key: []const u8, replacement: []const u8) ![]u8 {
+    const parts = glbTestSplit(valid) orelse return error.BadFixture;
+    const at = std.mem.indexOf(u8, parts.json, key) orelse return error.BadFixture;
+    const val_at = at + key.len;
+    // Skip the original number.
+    var end = val_at;
+    while (end < parts.json.len and (parts.json[end] == '-' or (parts.json[end] >= '0' and parts.json[end] <= '9'))) : (end += 1) {}
+    if (end == val_at) return error.BadFixture;
+    const patched = try std.mem.concat(a, u8, &.{ parts.json[0..val_at], replacement, parts.json[end..] });
+    defer a.free(patched);
+    return glbTestJoin(a, parts.hdr, patched, parts.bin);
+}
+
+const GlbTestParts = struct { hdr: []const u8, json: []const u8, bin: []const u8 };
+
+fn glbTestSplit(data: []const u8) ?GlbTestParts {
+    if (data.len < 20 or !std.mem.eql(u8, data[0..4], "glTF")) return null;
+    const jlen = std.mem.readInt(u32, data[12..16], .little);
+    if (20 + jlen > data.len) return null;
+    const jstart: usize = 20;
+    const bend: usize = jstart + jlen;
+    var bin: []const u8 = &.{};
+    if (bend + 8 <= data.len and std.mem.readInt(u32, data[bend + 4 ..][0..4], .little) == 0x004E4942) {
+        const blen = std.mem.readInt(u32, data[bend..][0..4], .little);
+        const bstart = bend + 8;
+        if (bstart + blen <= data.len) bin = data[bstart .. bstart + blen];
+    }
+    return .{ .hdr = data[0..12], .json = data[jstart..bend], .bin = bin };
+}
+
+fn glbTestJoin(a: std.mem.Allocator, hdr: []const u8, json: []const u8, bin: []const u8) ![]u8 {
+    const jp = std.mem.alignForward(usize, json.len, 4);
+    const bp = std.mem.alignForward(usize, bin.len, 4);
+    const total_len: usize = 12 + 8 + jp + (if (bin.len > 0) 8 + bp else 0);
+    const out = try a.alloc(u8, total_len);
+    @memset(out, 0);
+    @memcpy(out[0..4], hdr[0..4]);
+    std.mem.writeInt(u32, out[4..8], 2, .little);
+    std.mem.writeInt(u32, out[8..12], @intCast(total_len), .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(jp), .little);
+    std.mem.writeInt(u32, out[16..20], 0x4E4F534A, .little);
+    @memset(out[20 .. 20 + jp], ' ');
+    @memcpy(out[20 .. 20 + json.len], json);
+    if (bin.len > 0) {
+        const bh = 20 + jp;
+        std.mem.writeInt(u32, out[bh..][0..4], @intCast(bp), .little);
+        std.mem.writeInt(u32, out[bh + 4 ..][0..4], 0x004E4942, .little);
+        @memcpy(out[bh + 8 ..][0..bin.len], bin);
+    }
+    return out;
 }

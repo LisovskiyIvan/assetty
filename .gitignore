@@ -4,3 +4,4 @@ zig-out/
 app/web/node_modules/
 zig-pkg/
 assetty.settings.json
+test/corpus/

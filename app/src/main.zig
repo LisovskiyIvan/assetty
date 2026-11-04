@@ -1,17 +1,32 @@
 //! assetty desktop app: a nanoui window showing the web frontend, with the
 //! glTF toolkit exposed to it through `Backend`.
 //!
+//! The web UI runs in the system webview: WKWebView on macOS, WebView2 on
+//! Windows (nanoui 0.10+). Linux has no webview upstream (`PagesUnsupported`),
+//! and a Windows machine without the WebView2 runtime can't show a page
+//! either; both fall back to a native window pointing at the CLI, where the
+//! full toolkit stays available.
+//!
 //! Headless checks nanoui understands:
 //!   assetty-app --nanoui-eval='...' --nanoui-wait=2
 //!   assetty-app --nanoui-generate=app/web       (writes nanoui.js/d.ts)
 //! `--nanoui-snapshot` needs a native-UI window, so it does not apply here.
 const std = @import("std");
+const builtin = @import("builtin");
 const nanoui = @import("nanoui");
-const backend_mod = @import("backend.zig");
-const events = @import("events.zig");
-const assets = @import("assets.zig");
+
+const has_page = nanoui.Call != void;
 
 pub fn run(init: std.process.Init) !u8 {
+    if (has_page) return runPage(init);
+    return runNative(init);
+}
+
+fn runPage(init: std.process.Init) !u8 {
+    const backend_mod = @import("backend.zig");
+    const events = @import("events.zig");
+    const assets = @import("assets.zig");
+
     const app = try nanoui.App.create(init, .{ .name = "assetty" });
     defer app.destroy();
 
@@ -28,7 +43,7 @@ pub fn run(init: std.process.Init) !u8 {
     try app.registerEvent(events.TextureEncodeDone);
     try app.registerEvent(events.TexturePreviewDone);
 
-    _ = try app.newWindow(.{
+    const w = try app.newWindow(.{
         .title = "assetty",
         .width = 1400,
         .height = 900,
@@ -40,6 +55,46 @@ pub fn run(init: std.process.Init) !u8 {
         } },
     });
 
+    // Windows without the WebView2 runtime: nanoui keeps the window but shows
+    // its own notice view instead of a page (`page == null`). Swap it for
+    // ours, which points at the CLI.
+    if (builtin.os.tag == .windows and w.page == null) {
+        w.close();
+        try showNotice(app);
+    }
+
     try app.run();
     return 0;
 }
+
+/// Native fallback where there is no webview: a window pointing at the CLI.
+fn runNative(init: std.process.Init) !u8 {
+    const app = try nanoui.App.create(init, .{ .name = "assetty" });
+    defer app.destroy();
+
+    try showNotice(app);
+
+    try app.run();
+    return 0;
+}
+
+fn showNotice(app: *nanoui.App) !void {
+    var notice: Notice = .{};
+    _ = try app.newWindow(.{
+        .title = "assetty",
+        .width = 640,
+        .height = 320,
+        .content = .{ .view = nanoui.ui.View.init(&notice, Notice.view) },
+    });
+}
+
+const Notice = struct {
+    fn view(_: *Notice, c: *nanoui.ui.Context) void {
+        nanoui.ui.column(c, .{ .width = .fill, .height = .fill, .align_items = .center, .justify = .center, .gap = 8 });
+        defer nanoui.ui.end(c);
+        nanoui.ui.heading(c, "assetty");
+        nanoui.ui.label(c, "The web UI needs a system webview,");
+        nanoui.ui.label(c, "which this platform has none of.");
+        nanoui.ui.label(c, "Use the CLI: info | optimize | textures | presets");
+    }
+};

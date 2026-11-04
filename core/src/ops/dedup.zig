@@ -99,10 +99,13 @@ fn viewData(vp: [*c]c.cgltf_buffer_view) ?[]const u8 {
     }
     if (@intFromPtr(v.buffer) == 0) return null;
     const bd = v.buffer.*.data orelse return null;
-    if (v.offset > v.buffer.*.size) return null;
-    if (v.size > v.buffer.*.size - v.offset) return null;
+    // Overflow-safe: ReleaseFast wraps on arithmetic.
+    const bsize: usize = @intCast(v.buffer.*.size);
+    const off: usize = @intCast(v.offset);
+    const sz: usize = @intCast(v.size);
+    if (off > bsize or sz > bsize - off) return null;
     const p: [*]const u8 = @ptrCast(bd);
-    return p[v.offset .. v.offset + v.size];
+    return p[off .. off + sz];
 }
 
 /// A strided element stream over a buffer view (or the sparse sub-ranges).

@@ -50,9 +50,13 @@ fn viewBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
     }
     if (@intFromPtr(v.buffer) == 0) return null;
     const data = v.buffer.*.data orelse return null;
-    if (v.offset + v.size > v.buffer.*.size) return null;
+    // Overflow-safe: ReleaseFast wraps on `offset + size`.
+    const bsize: usize = @intCast(v.buffer.*.size);
+    const off: usize = @intCast(v.offset);
+    const sz: usize = @intCast(v.size);
+    if (off > bsize or sz > bsize - off) return null;
     const p: [*]const u8 = @ptrCast(data);
-    return p[v.offset .. v.offset + v.size];
+    return p[off .. off + sz];
 }
 
 fn componentTypeInt(t: c.cgltf_component_type) u32 {

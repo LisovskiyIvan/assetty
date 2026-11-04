@@ -2,7 +2,7 @@
 //! optimize pipeline and texture encoding.
 //!
 //! Every method is a thin wrapper around an `*Impl` function. The impls take
-//! an allocator instead of a `*nanoui.Call`, so tests cover them without a
+//! an allocator instead of a `*Call`, so tests cover them without a
 //! webview. Results that must keep the CLI's JSON shape are returned as
 //! `json.Raw` (pre-formatted).
 //!
@@ -19,6 +19,17 @@ const core = @import("core");
 const nanoui = @import("nanoui");
 const json = @import("json.zig");
 const events = @import("events.zig");
+
+/// Page IPC (`nanoui.Call`) exists wherever pages do (macOS and Windows): there
+/// it carries the call's arena and window. Where pages don't exist (Linux) it
+/// is `void` and bound methods are never invoked (`.page` windows are
+/// unsupported there). The wrappers still analyze on every platform, so they
+/// take this mirror of the fields they use instead.
+const has_page = nanoui.Call != void;
+const Call = if (has_page) nanoui.Call else struct {
+    arena: std.mem.Allocator,
+    window: ?*nanoui.Window = null,
+};
 
 const max_load_bytes: usize = 512 * 1024 * 1024;
 const max_text_bytes: usize = 1 << 20;
@@ -89,14 +100,14 @@ pub const Backend = struct {
 
     /// Native open panel: `{"path":"<abs>"}` on a pick, `{"path":null}` on
     /// cancel. Runs modally on the main thread, like every bound method.
-    pub fn openDialog(self: *Backend, call: *nanoui.Call) !json.Raw {
+    pub fn openDialog(self: *Backend, call: *Call) !json.Raw {
         return self.openDialogImpl(call.arena, null);
     }
 
     /// Same as `openDialog`, but the panel starts in `dir` when it names an
     /// existing directory; a missing/non-directory/null/blank `dir` falls
     /// back to the default location silently.
-    pub fn openDialogAt(self: *Backend, call: *nanoui.Call, dir: ?[]const u8) !json.Raw {
+    pub fn openDialogAt(self: *Backend, call: *Call, dir: ?[]const u8) !json.Raw {
         return self.openDialogImpl(call.arena, dir);
     }
 
@@ -106,7 +117,7 @@ pub const Backend = struct {
     /// `model.glb` when blank); `b64` the file's base64 bytes. Synchronous on
     /// the main thread — fine for moderate sizes, megabyte-scale drops may
     /// stall the UI for a beat.
-    pub fn dropFile(self: *Backend, call: *nanoui.Call, name: []const u8, b64: []const u8) !json.Raw {
+    pub fn dropFile(self: *Backend, call: *Call, name: []const u8, b64: []const u8) !json.Raw {
         return self.dropFileImpl(call.arena, name, b64);
     }
 
@@ -115,7 +126,7 @@ pub const Backend = struct {
     /// basename, or `default_save_name` when null/blank). Runs modally on the
     /// main thread, like every bound method. Headless testing is impossible
     /// (it blocks on the user), so tests cover `saveFileName` + `pathResultRaw`.
-    pub fn pickSavePath(self: *Backend, call: *nanoui.Call, name: ?[]const u8) !json.Raw {
+    pub fn pickSavePath(self: *Backend, call: *Call, name: ?[]const u8) !json.Raw {
         return self.pickSavePathImpl(call.arena, name);
     }
 
@@ -124,25 +135,25 @@ pub const Backend = struct {
     /// `dst` are created; `dst == src` is refused; overwriting is allowed (the
     /// page confirms first). Shares the pipeline gate: short, but keeps one
     /// writer at a time.
-    pub fn exportTo(self: *Backend, call: *nanoui.Call, src: []const u8, dst: []const u8) !json.Raw {
+    pub fn exportTo(self: *Backend, call: *Call, src: []const u8, dst: []const u8) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
         return self.launch(call.arena, Target.of(call.window), .export_file, src, null, 0, dst);
     }
 
     /// Lists a directory: `{"path":..,"entries":[{"name","dir","size"}]}`.
-    pub fn listDir(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+    pub fn listDir(self: *Backend, call: *Call, path: []const u8) !json.Raw {
         return self.listDirImpl(call.arena, path);
     }
 
     // ---- inspect ----------------------------------------------------------
 
     /// `assetty info <path> --json`.
-    pub fn info(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+    pub fn info(self: *Backend, call: *Call, path: []const u8) !json.Raw {
         return self.infoImpl(call.arena, path);
     }
 
     /// Raw file bytes as base64: `{"size":N,"b64":".."}`.
-    pub fn loadBytes(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+    pub fn loadBytes(self: *Backend, call: *Call, path: []const u8) !json.Raw {
         return self.loadBytesImpl(call.arena, path);
     }
 
@@ -153,7 +164,7 @@ pub const Backend = struct {
     /// once; each step arrives as a `progress` event and the report as
     /// `optimizeDone`. `{"error":..}` comes back synchronously for a bad
     /// preset, an unreadable path or a job already running.
-    pub fn optimize(self: *Backend, call: *nanoui.Call, path: []const u8, preset: []const u8) !json.Raw {
+    pub fn optimize(self: *Backend, call: *Call, path: []const u8, preset: []const u8) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
         const resolved = resolvePresetOrMessage(self.io, call.arena, preset);
         const p = switch (resolved) {
@@ -166,7 +177,7 @@ pub const Backend = struct {
     /// Same as `optimize`, but the steps come from the frontend's per-step UI
     /// as a JSON spec (`{"steps":[{"prune":{}}, ...]}`); the spec is either
     /// that JSON text or a JSON string containing it.
-    pub fn optimizeCustom(self: *Backend, call: *nanoui.Call, path: []const u8, spec: []const u8) !json.Raw {
+    pub fn optimizeCustom(self: *Backend, call: *Call, path: []const u8, spec: []const u8) !json.Raw {
         if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
         const resolved = specPresetOrMessage(call.arena, spec);
         const p = switch (resolved) {
@@ -179,7 +190,7 @@ pub const Backend = struct {
     // ---- textures ---------------------------------------------------------
 
     /// `assetty textures <path> --json`.
-    pub fn textures(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+    pub fn textures(self: *Backend, call: *Call, path: []const u8) !json.Raw {
         return self.texturesImpl(call.arena, path);
     }
 
@@ -192,7 +203,7 @@ pub const Backend = struct {
     /// defaults (the Textures tab sends the row's effective params).
     pub fn textureEncode(
         self: *Backend,
-        call: *nanoui.Call,
+        call: *Call,
         path: []const u8,
         index: u32,
         settings: ?[]const u8,
@@ -213,7 +224,7 @@ pub const Backend = struct {
     /// renders the decoded image, which no encode setting changes.
     pub fn texturePreview(
         self: *Backend,
-        call: *nanoui.Call,
+        call: *Call,
         path: []const u8,
         index: u32,
         settings: ?[]const u8,
@@ -227,37 +238,37 @@ pub const Backend = struct {
     /// files strictly under `out_dir` may go (see `discardFileImpl`); anything
     /// else is refused, and a file that is already gone counts as discarded.
     /// Synchronous on the main thread — a single unlink, no pipeline work.
-    pub fn discardFile(self: *Backend, call: *nanoui.Call, path: []const u8) !json.Raw {
+    pub fn discardFile(self: *Backend, call: *Call, path: []const u8) !json.Raw {
         return discardFileImpl(self.io, call.arena, path);
     }
 
     // ---- presets ----------------------------------------------------------
 
     /// Preset names found in `presets/*.zon`, sorted.
-    pub fn presets(self: *Backend, call: *nanoui.Call) ![]const []const u8 {
+    pub fn presets(self: *Backend, call: *Call) ![]const []const u8 {
         return self.presetsImpl(call.arena);
     }
 
     /// The `.zon` text of `presets/<name>.zon`.
-    pub fn presetLoad(self: *Backend, call: *nanoui.Call, name: []const u8) ![]const u8 {
+    pub fn presetLoad(self: *Backend, call: *Call, name: []const u8) ![]const u8 {
         return self.presetLoadImpl(call.arena, name);
     }
 
     /// Writes `presets/<name>.zon`; true on success.
-    pub fn presetSave(self: *Backend, call: *nanoui.Call, name: []const u8, zon: []const u8) !bool {
+    pub fn presetSave(self: *Backend, call: *Call, name: []const u8, zon: []const u8) !bool {
         return self.presetSaveImpl(call.arena, name, zon);
     }
 
     /// Settings blob (`assetty.settings.json` in the cwd) as raw JSON; `{}`
     /// when the file is absent or does not hold valid JSON. The schema is the
     /// frontend's business.
-    pub fn settingsLoad(self: *Backend, call: *nanoui.Call) !json.Raw {
+    pub fn settingsLoad(self: *Backend, call: *Call) !json.Raw {
         return self.settingsLoadFrom(call.arena, settings_file);
     }
 
     /// Validates `text` as JSON and replaces the settings file atomically:
     /// `{"ok":true}` or `{"error":".."}`.
-    pub fn settingsSave(self: *Backend, call: *nanoui.Call, text: []const u8) !json.Raw {
+    pub fn settingsSave(self: *Backend, call: *Call, text: []const u8) !json.Raw {
         return self.settingsSaveTo(call.arena, settings_file, text);
     }
 

@@ -4,6 +4,11 @@ const std = @import("std");
 /// Contains a placeholder when the frontend has not been built yet.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    // The desktop app shell: nanoui is cross-platform (AppKit/WebKit on
+    // macOS, GTK via runtime dlopen on Linux, Win32 + WebView2 pages on
+    // Windows), so `-Dapp` defaults to true everywhere. `-Dapp=false` builds the CLI alone.
+    const is_mac = target.result.os.tag == .macos;
+    const want_app = b.option(bool, "app", "Build the desktop app shell alongside the CLI") orelse true;
     // Plain `zig build` ships a fast binary; `-Doptimize=Debug` stays available.
     // Default .fast: measured ~25% faster optimize pipeline vs .safe on
     // DamagedHelmet/BoomBox (mobile preset), bit-identical outputs, 79/79 core
@@ -53,6 +58,10 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{ "-O3", "-DNDEBUG" },
     });
+    // OpenCL is a macOS-only acceleration path (and never enabled at runtime:
+    // the wrapper passes use_opencl=false). Everywhere else basisu falls
+    // back to CPU (basisu_opencl.cpp compiles to stubs when the define is 0).
+    const basisu_opencl_define: []const u8 = if (is_mac) "-DBASISU_SUPPORT_OPENCL=1" else "-DBASISU_SUPPORT_OPENCL=0";
     core_mod.addCSourceFiles(.{
         .root = b.path("vendor"),
         .files = &.{
@@ -84,11 +93,29 @@ pub fn build(b: *std.Build) void {
             "basisu/encoder/pvpngreader.cpp",
             "basisu/basisu_wrapper.cpp",
         },
-        .flags = &.{ "-O3", "-DNDEBUG", "-w", "-std=c++17", "-DBASISU_SUPPORT_OPENCL=1" },
+        .flags = &.{ "-O3", "-DNDEBUG", "-w", "-std=c++17", basisu_opencl_define },
     });
-    if (target.result.os.tag == .macos) {
+    if (is_mac) {
         core_mod.linkFramework("OpenCL", .{});
     }
+
+    // `config.has_app` is comptime-known, so a `-Dapp=false` CLI-only build
+    // prunes the app branch in main.zig entirely (nanoui is never referenced).
+    const config_src = b.addWriteFiles().add("config.zig", b.fmt("pub const has_app: bool = {s};\n", .{if (want_app) "true" else "false"}));
+    const config_mod = b.createModule(.{ .root_source_file = config_src });
+
+    const exe_imports: []const std.Build.Module.Import = if (want_app) &.{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "config", .module = config_mod },
+        .{ .name = "nanoui", .module = b.dependency("nanoui", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("nanoui") },
+        .{ .name = "dist_assets", .module = distAssets(b) },
+    } else &.{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "config", .module = config_mod },
+    };
 
     const exe = b.addExecutable(.{
         .name = "assetty",
@@ -96,17 +123,18 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "core", .module = core_mod },
-                .{ .name = "nanoui", .module = b.dependency("nanoui", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("nanoui") },
-                .{ .name = "dist_assets", .module = distAssets(b) },
-            },
+            .imports = exe_imports,
         }),
     });
     b.installArtifact(exe);
+    // The Windows backend calls kernel32/user32/gdi32/comdlg32/shell32/ole32
+    // directly (nanoui links nothing itself); Zig links the first three by
+    // default, the rest are added here.
+    if (target.result.os.tag == .windows) {
+        for ([_][]const u8{ "comdlg32", "shell32", "ole32" }) |lib| {
+            exe.root_module.linkSystemLibrary(lib, .{});
+        }
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -119,20 +147,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // ---- desktop app tests -------------------------------------------------
-    const app_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("app/src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core", .module = core_mod },
-            .{ .name = "nanoui", .module = b.dependency("nanoui", .{
-                .target = target,
-                .optimize = optimize,
-            }).module("nanoui") },
-            .{ .name = "dist_assets", .module = distAssets(b) },
-        },
-    }) });
-    test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    // Backend impls are platform-independent (the page/IPC glue is mac-only
+    // inside backend.zig); they run wherever the host can execute them.
+    {
+        const app_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("app/src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "nanoui", .module = b.dependency("nanoui", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("nanoui") },
+                .{ .name = "dist_assets", .module = distAssets(b) },
+            },
+        }) });
+        test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    }
 }
 
 /// Builds the `dist_assets` module from app/web/dist.

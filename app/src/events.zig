@@ -1,7 +1,23 @@
 //! Typed events pushed from Zig to the page (`window.nanoui.on("<name>")`).
+//!
+//! Pages (and their typed IPC) exist where nanoui has a webview (macOS,
+//! Windows): elsewhere (Linux) `Call` and `Event` are `void`. The payload
+//! structs below stay shared — tests and the background-job code construct
+//! them on every platform — while the `Event` bindings degrade to a no-op
+//! `emit` where pages don't exist.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const json = @import("json.zig");
+
+const has_page = nanoui.Call != void;
+
+fn Ev(comptime name: []const u8, comptime P: type) type {
+    if (has_page) return nanoui.Event(name, P);
+    return struct {
+        pub fn emit(_: *nanoui.Window, _: P) void {}
+        pub fn broadcast(_: *nanoui.App, _: P) void {}
+    };
+}
 
 /// One pipeline step finished (or started): `pct` is 0..1. `sub` is present
 /// only for steps that report finer-grained progress (the textures step's
@@ -38,13 +54,13 @@ pub const ProgressSub = struct {
     done: u32,
     total: u32,
 };
-pub const Progress = nanoui.Event("progress", ProgressPayload);
+pub const Progress = Ev("progress", ProgressPayload);
 
 /// A line for the app's log pane.
 pub const LogPayload = struct {
     line: []const u8,
 };
-pub const Log = nanoui.Event("log", LogPayload);
+pub const Log = Ev("log", LogPayload);
 
 /// A background `optimize`/`optimizeCustom` finished: `{"ok":true,
 /// "out_path":"..","report":<report>}` or `{"ok":false,"error":".."}`.
@@ -71,7 +87,7 @@ pub const OptimizeDonePayload = struct {
         }
     }
 };
-pub const OptimizeDone = nanoui.Event("optimizeDone", OptimizeDonePayload);
+pub const OptimizeDone = Ev("optimizeDone", OptimizeDonePayload);
 
 /// A background `textureEncode` finished: `{"ok":true,"index":N,
 /// "ktx2_size":..,"psnr":..,"vram_after":..,"before_png":"<abs>.png",
@@ -138,7 +154,7 @@ pub const TextureEncodeDonePayload = struct {
         }
     }
 };
-pub const TextureEncodeDone = nanoui.Event("textureEncodeDone", TextureEncodeDonePayload);
+pub const TextureEncodeDone = Ev("textureEncodeDone", TextureEncodeDonePayload);
 
 /// A background `texturePreview` finished: `{"ok":true,"index":N,
 /// "b64":"<base64 PNG>","width":W,"height":H}` or `{"ok":false,"index":N,
@@ -165,7 +181,7 @@ pub const TexturePreviewDonePayload = struct {
         }
     }
 };
-pub const TexturePreviewDone = nanoui.Event("texturePreviewDone", TexturePreviewDonePayload);
+pub const TexturePreviewDone = Ev("texturePreviewDone", TexturePreviewDonePayload);
 
 /// A background `exportTo` finished: `{"ok":true,"src":"..","dst":".."}` or
 /// `{"ok":false,"error":".."}`. The copy is byte-identical; the source the
@@ -191,4 +207,4 @@ pub const ExportDonePayload = struct {
         }
     }
 };
-pub const ExportDone = nanoui.Event("exportDone", ExportDonePayload);
+pub const ExportDone = Ev("exportDone", ExportDonePayload);
