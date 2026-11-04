@@ -4,6 +4,17 @@ const model = @import("../gltf/model.zig");
 /// Remove unused graph elements: unreachable nodes, unused meshes, materials,
 /// textures, images, samplers. Skins are kept as-is; while the asset has any
 /// skins, node pruning is skipped (model does not track joint lists).
+///
+/// `Options.animations == false` strips ALL animations gltfpack-style: the
+/// result carries zero animations and stripped channels keep nothing alive, so
+/// a node referenced only by a removed animation is pruned as unused while
+/// scene-graph referenced nodes always stay. (Those pruned nodes vanish from
+/// the model; the writer's reachability GC then drops the orphaned animation
+/// sampler accessors and buffer views from the file on its own.)
+pub const Options = struct {
+    animations: bool = true,
+};
+
 pub const Removed = struct {
     nodes: u32 = 0,
     meshes: u32 = 0,
@@ -11,6 +22,7 @@ pub const Removed = struct {
     textures: u32 = 0,
     images: u32 = 0,
     samplers: u32 = 0,
+    animations: u32 = 0,
 };
 
 pub const Result = struct {
@@ -37,7 +49,7 @@ fn markSubtree(asset: model.Asset, used_nodes: []bool, root: u32, stack: []u32) 
     }
 }
 
-pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
+pub fn run(a: std.mem.Allocator, asset: model.Asset, opts: Options) !Result {
     const nn = asset.nodes.len;
     const used_nodes = try a.alloc(bool, nn);
     const used_meshes = try a.alloc(bool, asset.meshes.len);
@@ -60,11 +72,14 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
             if (root < nn) markSubtree(asset, used_nodes, root, stack);
         }
     }
-    // animation targets are live even when unreachable from scenes
+    // animation targets are live even when unreachable from scenes —
+    // unless animations are being stripped, in which case they keep nothing.
     if (allow_node_prune) {
-        for (asset.animations) |anim| {
-            for (anim.targets) |t| {
-                if (t < nn) markSubtree(asset, used_nodes, t, stack);
+        if (opts.animations) {
+            for (asset.animations) |anim| {
+                for (anim.targets) |t| {
+                    if (t < nn) markSubtree(asset, used_nodes, t, stack);
+                }
             }
         }
     } else {
@@ -115,6 +130,7 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
         .textures = @intCast(countRemoved(used_textures)),
         .images = @intCast(countRemoved(used_images)),
         .samplers = @intCast(countRemoved(used_samplers)),
+        .animations = if (opts.animations) 0 else @intCast(asset.animations.len),
     };
 
     // nodes
@@ -210,25 +226,30 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset) !Result {
         new_scenes[i] = .{ .name = s.name, .roots = roots[0..rn] };
     }
 
-    // animations: remap targets (all targets are kept by construction)
-    const new_anims = try a.alloc(model.Animation, asset.animations.len);
-    for (asset.animations, 0..) |an, i| {
-        const targets = try a.alloc(u32, an.targets.len);
-        var tn: usize = 0;
-        for (an.targets) |t| {
-            if (nodeMapGet(node_map, t)) |nt| {
-                targets[tn] = nt;
-                tn += 1;
+    // animations: remap targets (all targets are kept by construction).
+    // With stripping on, emit none — the writer's GC drops the orphaned
+    // sampler accessors and buffer views on its own.
+    const new_anims: []model.Animation = if (opts.animations) blk: {
+        const out = try a.alloc(model.Animation, asset.animations.len);
+        for (asset.animations, 0..) |an, i| {
+            const targets = try a.alloc(u32, an.targets.len);
+            var tn: usize = 0;
+            for (an.targets) |t| {
+                if (nodeMapGet(node_map, t)) |nt| {
+                    targets[tn] = nt;
+                    tn += 1;
+                }
             }
+            out[i] = .{
+                .name = an.name,
+                .channels = an.channels,
+                .samplers = an.samplers,
+                .duration = an.duration,
+                .targets = targets[0..tn],
+            };
         }
-        new_anims[i] = .{
-            .name = an.name,
-            .channels = an.channels,
-            .samplers = an.samplers,
-            .duration = an.duration,
-            .targets = targets[0..tn],
-        };
-    }
+        break :blk out;
+    } else try a.alloc(model.Animation, 0);
 
     return .{
         .asset = .{
@@ -312,7 +333,7 @@ fn testAsset() model.Asset {
             .{ .mime = .png, .name = "img0" },
             .{ .mime = .png, .name = "img_orphan" },
         },
-        .samplers = &.{.{}, .{}},
+        .samplers = &.{ .{}, .{} },
         .animations = &.{
             .{ .name = "spin", .channels = 1, .targets = &.{1} },
             .{ .name = "orphan_anim", .channels = 1, .targets = &.{} },
@@ -325,7 +346,7 @@ test "prune removes orphans" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const res = try run(a, testAsset());
+    const res = try run(a, testAsset(), .{});
     try std.testing.expectEqual(@as(u32, 1), res.removed.nodes); // orphan node
     try std.testing.expectEqual(@as(u32, 1), res.removed.meshes);
     try std.testing.expectEqual(@as(u32, 1), res.removed.materials);
@@ -352,11 +373,53 @@ test "pruned asset has no garbage" {
     const a = arena.allocator();
 
     const stats = @import("../stats.zig");
-    const res = try run(a, testAsset());
+    const res = try run(a, testAsset(), .{});
     const st = try stats.compute(a, res.asset);
     try std.testing.expectEqual(@as(usize, 0), st.garbage.unused_nodes.len);
     try std.testing.expectEqual(@as(usize, 0), st.garbage.unused_materials.len);
     try std.testing.expectEqual(@as(usize, 0), st.garbage.unused_textures.len);
     // no_mips still flags png
     try std.testing.expectEqual(@as(usize, 1), st.garbage.no_mips_images.len);
+}
+
+test "prune strips all animations when disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const res = try run(a, testAsset(), .{ .animations = false });
+    try std.testing.expectEqual(@as(u32, 2), res.removed.animations);
+    try std.testing.expectEqual(@as(usize, 0), res.asset.animations.len);
+
+    // scene nodes stay, remapped as before; orphan still pruned
+    const out = res.asset;
+    try std.testing.expectEqual(@as(usize, 2), out.nodes.len);
+    try std.testing.expectEqualStrings("root", out.nodes[0].name.?);
+    try std.testing.expectEqualStrings("used", out.nodes[1].name.?);
+    try std.testing.expectEqual(@as(u32, 1), res.removed.nodes);
+}
+
+test "prune with animations keeps animation-only nodes, strip prunes them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const asset: model.Asset = .{
+        .scenes = &.{.{ .roots = &.{0} }},
+        .nodes = &.{ .{ .name = "root" }, .{ .name = "floater" } },
+        .animations = &.{.{ .name = "spin", .channels = 1, .targets = &.{1} }},
+    };
+
+    const kept = try run(a, asset, .{ .animations = true });
+    try std.testing.expectEqual(@as(usize, 1), kept.asset.animations.len);
+    try std.testing.expectEqual(@as(usize, 2), kept.asset.nodes.len);
+    try std.testing.expectEqual(@as(u32, 0), kept.removed.animations);
+    try std.testing.expectEqual(@as(u32, 0), kept.removed.nodes);
+
+    const stripped = try run(a, asset, .{ .animations = false });
+    try std.testing.expectEqual(@as(usize, 0), stripped.asset.animations.len);
+    try std.testing.expectEqual(@as(u32, 1), stripped.removed.animations);
+    // floater was reachable only through the stripped animation
+    try std.testing.expectEqual(@as(usize, 1), stripped.asset.nodes.len);
+    try std.testing.expectEqual(@as(u32, 1), stripped.removed.nodes);
 }

@@ -131,13 +131,14 @@ const PRESET_PREFS: Record<string, ((steps: OptimizeSteps) => void) | undefined>
 function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   if (steps.prune.enabled) {
-    out.push({
-      prune: {
-        unused_nodes: steps.prune.unused_nodes,
-        unused_materials: steps.prune.unused_materials,
-        unused_textures: steps.prune.unused_textures,
-      },
-    });
+    const prune: Record<string, unknown> = {
+      unused_nodes: steps.prune.unused_nodes,
+      unused_materials: steps.prune.unused_materials,
+      unused_textures: steps.prune.unused_textures,
+    };
+    // Backend default keeps animations; only send the flag when stripping.
+    if (!steps.prune.animations) prune["animations"] = false;
+    out.push({ prune });
   }
   if (steps.dedup.enabled) {
     out.push({

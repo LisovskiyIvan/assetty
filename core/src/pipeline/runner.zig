@@ -112,9 +112,18 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
 
         const t_step = nowNs(io);
         steps[i] = switch (step) {
-            .prune => blk: {
-                const res = try prune.run(a, asset);
+            .prune => |p| blk: {
+                const res = try prune.run(a, asset, .{ .animations = p.animations });
                 asset = res.asset;
+                if (!p.animations) {
+                    // model-level strip is not enough: the writer serializes
+                    // the cgltf graph, so drop the animations there too. The
+                    // writer's reachability GC then drops the orphaned sampler
+                    // accessors and buffer views on its own. Any cdata op
+                    // order is safe: quantize/etc. only touch accessors, and
+                    // stripping later just unreferences them.
+                    loaded.cdata.animations_count = 0;
+                }
                 break :blk .{
                     .kind = kind,
                     .applied = true,
@@ -878,13 +887,15 @@ fn dupImageNames(a: std.mem.Allocator, st: *stats.Stats) !void {
 }
 
 fn pruneNote(a: std.mem.Allocator, r: prune.Removed) ![]const u8 {
-    const total = r.nodes + r.meshes + r.materials + r.textures + r.images + r.samplers;
+    const total = r.nodes + r.meshes + r.materials + r.textures + r.images + r.samplers + r.animations;
     if (total == 0) return "nothing to remove";
-    return std.fmt.allocPrint(
+    const base = try std.fmt.allocPrint(
         a,
         "removed {d} node(s), {d} mesh(es), {d} mat(s), {d} tex(s), {d} img(s), {d} sampler(s); model-level; cdata sync pending",
         .{ r.nodes, r.meshes, r.materials, r.textures, r.images, r.samplers },
     );
+    if (r.animations == 0) return base;
+    return std.fmt.allocPrint(a, "{s}; stripped {d} animation(s)", .{ base, r.animations });
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +968,9 @@ test "run noop preset on box fixture" {
     try testing.expect(rep.before.vertices > 0);
     try testing.expectEqual(rep.before.triangles, rep.after.triangles);
     try testing.expect(rep.after.disk_total > 0);
+    // default prune keeps the fixture's animation
+    try testing.expectEqual(@as(u64, 1), rep.before.animations);
+    try testing.expectEqual(@as(u64, 1), rep.after.animations);
 
     // Progress fired for load + every step + write.
     try testing.expect(log.saw_load);
@@ -977,6 +991,34 @@ test "run noop preset on box fixture" {
     }
 
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+}
+
+test "run: prune strips animations end to end" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // quantize BEFORE prune: animation-driven accessors are quantized first,
+    // stripping later must still drop the animations without a panic.
+    const steps = [_]preset.Step{ .{ .quantize = .{} }, .{ .prune = .{ .animations = false } } };
+    const rep = try run(io, a, "test/fixtures/box.glb", .{
+        .preset = .{ .name = "strip", .target = .desktop, .steps = &steps },
+        .out_path = ".zig-cache/pipeline_runner_test_strip.glb",
+    });
+    defer std.Io.Dir.cwd().deleteFile(io, ".zig-cache/pipeline_runner_test_strip.glb") catch {};
+
+    // the fixture is actually animated — otherwise this test proves nothing
+    try testing.expectEqual(@as(u64, 1), rep.before.animations);
+    try testing.expectEqual(@as(u64, 0), rep.after.animations);
+    try testing.expect(std.mem.indexOf(u8, rep.steps[1].note, "stripped 1 animation") != null);
+
+    var reloaded = try parse.loadFile(io, a, ".zig-cache/pipeline_runner_test_strip.glb");
+    defer reloaded.deinit();
+    try testing.expectEqual(@as(usize, 0), reloaded.asset.animations.len);
+    // writer emitted no animations key at all
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, ".zig-cache/pipeline_runner_test_strip.glb", a, .limited(16 << 20));
+    try testing.expect(std.mem.indexOf(u8, raw, "\"animations\"") == null);
 }
 
 test "run: weld and textures apply" {

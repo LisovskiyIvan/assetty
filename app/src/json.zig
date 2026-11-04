@@ -266,6 +266,8 @@ pub fn writeOptimize(
     try deltaJson(w, rep.before.vram_total, rep.after.vram_total);
     try w.writeAll(",\n    \"disk_bytes\": ");
     try deltaJson(w, rep.before.disk_total, rep.after.disk_total);
+    try w.writeAll(",\n    \"animations\": ");
+    try deltaJson(w, rep.before.animations, rep.after.animations);
     try w.writeAll("\n  },\n  \"before\": {\"triangles\":");
     try w.print("{d},\"vertices\":{d},\"draw_calls\":{d},\"vram\":{d},\"disk\":{d}", .{
         rep.before.triangles,

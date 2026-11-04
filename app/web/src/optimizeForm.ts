@@ -31,6 +31,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Drops materials no mesh references. Smaller file and a shorter material list; rendering is unchanged.",
   "prune.unused_textures":
     "Drops images and samplers no material references. Smaller file and less texture memory reserved; rendering is unchanged.",
+  "prune.animations":
+    "Strips every animation track from the output. Animated nodes stay as static scene nodes and skeleton/skin data is kept; the file is smaller and loads faster. Re-run from the source to get animations back — results never mutate the source.",
   "dedup.accessors":
     "Merges byte-identical GPU buffers so they are stored once. Smaller disk size and less VRAM; rendering is unchanged.",
   "dedup.meshes":
@@ -398,6 +400,15 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
             steps.prune.unused_textures = value;
           }),
         "prune.unused_textures",
+      ),
+      check(
+        t("opt.stripAnimations"),
+        () => !opts.get().prune.animations,
+        (value) =>
+          edit((steps) => {
+            steps.prune.animations = !value;
+          }),
+        "prune.animations",
       ),
     ),
   ]);

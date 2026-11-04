@@ -1826,6 +1826,7 @@ fn stepFromSpec(
                 .unused_nodes = (try r.boolField("unused_nodes")) orelse d.unused_nodes,
                 .unused_materials = (try r.boolField("unused_materials")) orelse d.unused_materials,
                 .unused_textures = (try r.boolField("unused_textures")) orelse d.unused_textures,
+                .animations = (try r.boolField("animations")) orelse d.animations,
             } };
         },
         .dedup => blk: {
@@ -2400,6 +2401,8 @@ test "custom spec maps steps in canonical order with params" {
     try testing.expectEqual(defaults.unused_nodes, p.steps[0].prune.unused_nodes);
     try testing.expectEqual(defaults.unused_materials, p.steps[0].prune.unused_materials);
     try testing.expectEqual(defaults.unused_textures, p.steps[0].prune.unused_textures);
+    try testing.expectEqual(defaults.animations, p.steps[0].prune.animations);
+    try testing.expect(p.steps[0].prune.animations);
     const tex_defaults = core.preset.TextureParams{};
     try testing.expectEqual(tex_defaults.rdo_lambda, p.steps[2].textures.rdo_lambda);
     try testing.expectEqual(tex_defaults.generate_mips, p.steps[2].textures.generate_mips);
@@ -2431,6 +2434,27 @@ test "custom spec maps simplify attribute fields" {
     try testing.expectEqual(d.use_attributes, p2.steps[0].simplify.use_attributes);
     try testing.expectEqual(d.weight_normal, p2.steps[0].simplify.weight_normal);
     try testing.expectEqual(d.weight_uv, p2.steps[0].simplify.weight_uv);
+}
+
+test "custom spec maps prune animations flag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{\"animations\":false}}]}", &detail);
+    try testing.expectEqual(@as(usize, 1), p.steps.len);
+    try testing.expect(!p.steps[0].prune.animations);
+    // other prune fields keep defaults
+    const d = core.preset.PruneParams{};
+    try testing.expectEqual(d.unused_nodes, p.steps[0].prune.unused_nodes);
+
+    // mistyped animations is a BadParam naming the step
+    try testing.expectError(
+        error.BadParam,
+        customPresetFromSpec(a, "{\"steps\":[{\"prune\":{\"animations\":\"no\"}}]}", &detail),
+    );
+    try testing.expectEqualStrings("prune", detail);
 }
 
 test "custom spec accepts a json string value" {

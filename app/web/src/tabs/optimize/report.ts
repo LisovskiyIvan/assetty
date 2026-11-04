@@ -20,6 +20,7 @@ const ROWS: RowSpec[] = [
   { key: "draw_calls", labelKey: "opt.rowDraws" },
   { key: "vram_total", labelKey: "opt.rowVram", bytes: true, deltaKey: "vram_bytes" },
   { key: "disk_total", labelKey: "opt.rowDisk", bytes: true, deltaKey: "disk_bytes" },
+  { key: "animations", labelKey: "opt.rowAnimations" },
 ];
 
 function stat(stats: Stats | undefined, key: string): number | undefined {

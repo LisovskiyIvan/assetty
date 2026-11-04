@@ -10,6 +10,8 @@ export interface PruneSettings {
   unused_nodes: boolean;
   unused_materials: boolean;
   unused_textures: boolean;
+  /** Keep animation tracks in the output (false = strip them). */
+  animations: boolean;
 }
 
 export interface DedupSettings {
@@ -126,6 +128,7 @@ export function defaultSettings(): Settings {
           unused_nodes: true,
           unused_materials: true,
           unused_textures: true,
+          animations: true,
         },
         dedup: { enabled: true, accessors: true, meshes: true, materials: true },
         weld: { enabled: true, tolerance: 0 },
@@ -277,6 +280,13 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
       "unused_textures",
       s.prune.unused_textures,
       "optimize.steps.prune.unused_textures",
+      strict,
+    ),
+    animations: readBool(
+      prune,
+      "animations",
+      s.prune.animations,
+      "optimize.steps.prune.animations",
       strict,
     ),
   };

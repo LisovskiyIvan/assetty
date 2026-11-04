@@ -79,6 +79,10 @@ pub const PruneParams = struct {
     unused_materials: bool = true,
     /// Drop images/textures/samplers not referenced by any material.
     unused_textures: bool = true,
+    /// Drop ALL animations (gltfpack-style strip). Animation channel targets
+    /// are regular nodes: scene-graph nodes always stay, nodes referenced
+    /// only by a stripped animation are pruned as unused. Skins untouched.
+    animations: bool = true,
 };
 
 pub const DedupParams = struct {
@@ -307,10 +311,14 @@ pub fn describe(p: Preset, w: anytype) !void {
     for (p.steps, 0..) |step, i| {
         try w.print("  {d:>2}. ", .{i + 1});
         switch (step) {
-            .prune => |v| try w.print(
-                "prune     unused_nodes={} unused_materials={} unused_textures={}\n",
-                .{ v.unused_nodes, v.unused_materials, v.unused_textures },
-            ),
+            .prune => |v| {
+                try w.print(
+                    "prune     unused_nodes={} unused_materials={} unused_textures={} animations={}",
+                    .{ v.unused_nodes, v.unused_materials, v.unused_textures, v.animations },
+                );
+                if (!v.animations) try w.writeAll(" strip_animations");
+                try w.writeByte('\n');
+            },
             .dedup => |v| try w.print(
                 "dedup     accessors={} meshes={} materials={}\n",
                 .{ v.accessors, v.meshes, v.materials },
@@ -469,6 +477,23 @@ test "parse honours defaults and overrides" {
     try testing.expectEqual(@as(f32, 0.25), p.steps[2].simplify.target_ratio);
     try testing.expect(p.steps[2].simplify.aggressive);
     try testing.expect(p.steps[2].simplify.lock_borders);
+}
+
+test "parse prune animations flag defaults true" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const d = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .prune = .{} } } }");
+    try testing.expect(d.steps[0].prune.animations);
+
+    const s = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .prune = .{ .animations = false } } } }");
+    try testing.expect(!s.steps[0].prune.animations);
+
+    // describe marks the strip.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(s, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "strip_animations") != null);
 }
 
 test "parse rejects garbage" {

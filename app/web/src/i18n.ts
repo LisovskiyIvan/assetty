@@ -120,6 +120,7 @@ const en: Dict = {
   "opt.exporting": "Exporting…",
   "opt.stepsTitle": "Steps",
   "opt.hint.prune": "unused nodes / materials / textures",
+  "opt.stripAnimations": "Strip animations",
   "opt.hint.dedup": "share identical data",
   "opt.hint.weld": "merge duplicate vertices",
   "opt.hint.join": "merge primitives sharing a material",
@@ -148,6 +149,7 @@ const en: Dict = {
   "opt.rowDraws": "draw calls",
   "opt.rowVram": "VRAM est",
   "opt.rowDisk": "disk size",
+  "opt.rowAnimations": "animations",
   "opt.colMetric": "metric",
   "opt.colBefore": "before",
   "opt.colAfter": "after",
@@ -390,6 +392,8 @@ const en: Dict = {
     "Drops materials no mesh references. Smaller file and a shorter material list; rendering is unchanged.",
   "help.prune.unused_textures":
     "Drops images and samplers no material references. Smaller file and less texture memory reserved; rendering is unchanged.",
+  "help.prune.animations":
+    "Strips every animation track from the output. Animated nodes stay as static scene nodes and skeleton/skin data is kept; the file is smaller and loads faster. Re-run from the source to get animations back — results never mutate the source.",
   "help.dedup.accessors":
     "Merges byte-identical GPU buffers so they are stored once. Smaller disk size and less VRAM; rendering is unchanged.",
   "help.dedup.meshes":
@@ -525,6 +529,7 @@ const ru: Dict = {
   "opt.exporting": "Экспорт…",
   "opt.stepsTitle": "Шаги",
   "opt.hint.prune": "неиспользуемые узлы / материалы / текстуры",
+  "opt.stripAnimations": "Убрать анимации",
   "opt.hint.dedup": "общие данные — один раз",
   "opt.hint.weld": "склейка совпадающих вершин",
   "opt.hint.join": "склейка примитивов с общим материалом",
@@ -553,6 +558,7 @@ const ru: Dict = {
   "opt.rowDraws": "вызовы отрисовки",
   "opt.rowVram": "оценка VRAM",
   "opt.rowDisk": "размер файла",
+  "opt.rowAnimations": "анимации",
   "opt.colMetric": "метрика",
   "opt.colBefore": "до",
   "opt.colAfter": "после",
@@ -788,6 +794,8 @@ const ru: Dict = {
     "Удаляет материалы, на которые не ссылается ни один меш. Файл меньше, список материалов короче; рендеринг не меняется.",
   "help.prune.unused_textures":
     "Удаляет изображения и сэмплеры, на которые не ссылается ни один материал. Файл меньше, под текстуры резервируется меньше памяти; рендеринг не меняется.",
+  "help.prune.animations":
+    "Убирает все анимационные треки из результата. Анимированные узлы остаются статичными узлами сцены, скелет/скин сохраняются; файл меньше и грузится быстрее. Чтобы вернуть анимации, перезапустите из источника — результаты никогда не меняют источник.",
   "help.dedup.accessors":
     "Склеивает байтово-одинаковые GPU-буферы, чтобы хранить их один раз. Меньше размер на диске и меньше VRAM; рендеринг не меняется.",
   "help.dedup.meshes":

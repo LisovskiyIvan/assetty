@@ -50,7 +50,8 @@ function schemaSample(): string {
   "optimize": {
     "steps": {
       "prune":    { "enabled": true, "unused_nodes": true,
-                    "unused_materials": true, "unused_textures": true },
+                    "unused_materials": true, "unused_textures": true,
+                    "animations": true },
       "dedup":    { "enabled": true, "accessors": true,
                     "meshes": true, "materials": true },
       "weld":     { "enabled": true, "tolerance": 0 },

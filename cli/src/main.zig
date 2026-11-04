@@ -12,7 +12,7 @@ const usage =
     \\  assetty lint <file-or-dir> --budget <budget.json> [--json]
     \\  assetty textures <file.glb> [--encode N] [--json]
     \\  assetty presets
-    \\  assetty optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>]
+    \\  assetty optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>] [--strip-animations]
     \\
     \\Exit codes: 0 ok, 1 lint violations, 2 error
 ;
@@ -932,6 +932,7 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     var preset_spec: ?[]const u8 = null;
     var out_arg: ?[]const u8 = null;
     var report_arg: ?[]const u8 = null;
+    var strip_animations = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -963,6 +964,8 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
             report_arg = args[i];
         } else if (std.mem.startsWith(u8, a, "--report=")) {
             report_arg = a["--report=".len..];
+        } else if (std.mem.eql(u8, a, "--strip-animations")) {
+            strip_animations = true;
         } else if (!std.mem.startsWith(u8, a, "-")) {
             if (input == null) input = a;
         }
@@ -981,7 +984,7 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const p = resolvePreset(io, a, spec) catch |err| switch (err) {
+    var p = resolvePreset(io, a, spec) catch |err| switch (err) {
         error.UnknownPreset => {
             std.debug.print("optimize: unknown preset '{s}' (expected mobile/desktop/web or a .zon file)\n", .{spec});
             return 2;
@@ -992,6 +995,17 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
             return 2;
         },
     };
+
+    // Convenience override: strip every animation from whichever prune steps
+    // the preset carries. Composes with --preset (built-in or .zon file).
+    if (strip_animations) {
+        const steps = try a.dupe(core.preset.Step, p.steps);
+        for (steps) |*s| switch (s.*) {
+            .prune => |*pp| pp.animations = false,
+            else => {},
+        };
+        p.steps = steps;
+    }
 
     const out_path = out_arg orelse blk: {
         const base = std.fs.path.basename(file_path);
