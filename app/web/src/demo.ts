@@ -5,8 +5,10 @@ import type {
   Info,
   LintResult,
   OptimizeResult,
+  TexturePreview,
   TexturesResult,
 } from "./types";
+import type { ProgressEvent } from "./bridge/types";
 
 const helmetImages = [
   {
@@ -259,3 +261,155 @@ export const demoBudget = `{
   "allowed_image_formats": ["ktx2"]
 }
 `;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Demo-mode stand-in for `assetty.settings.json`. */
+const DEMO_SETTINGS_KEY = "assetty.settings.json";
+
+export class DemoBackend {
+  async info(path: string): Promise<Info> {
+    await sleep(120);
+    return { ...demoInfo, file: path };
+  }
+
+  async optimize(
+    path: string,
+    preset: string,
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<OptimizeResult> {
+    const kinds = demoOptimize.report.steps.map((s) => s.kind);
+    for (let i = 0; i < kinds.length; i++) {
+      onProgress?.({ step: kinds[i], pct: Math.round(((i + 1) / kinds.length) * 100) });
+      await sleep(180);
+    }
+    return {
+      out_path: demoOptimize.out_path,
+      report: { ...demoOptimize.report, preset },
+    };
+  }
+
+  /** Mirrors `optimizeCustom(path, spec)`: only the requested steps run. */
+  async optimizeCustom(
+    path: string,
+    specJson: string,
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<OptimizeResult> {
+    void path;
+    let kinds: string[] = [];
+    try {
+      const spec = JSON.parse(specJson) as { steps?: Array<Record<string, unknown>> };
+      kinds = (spec.steps ?? []).flatMap((step) => Object.keys(step));
+    } catch {
+      kinds = [];
+    }
+    if (kinds.length === 0) kinds = ["prune"];
+    for (let i = 0; i < kinds.length; i++) {
+      onProgress?.({ step: kinds[i], pct: Math.round(((i + 1) / kinds.length) * 100) });
+      await sleep(160);
+    }
+    const all = demoOptimize.report.steps;
+    const steps = kinds.map(
+      (kind) => all.find((s) => s.kind === kind) ?? { kind, applied: true, note: "ok" },
+    );
+    return {
+      out_path: demoOptimize.out_path,
+      report: { ...demoOptimize.report, preset: "custom", steps },
+    };
+  }
+
+  async textures(): Promise<TexturesResult> {
+    await sleep(120);
+    return demoTextures;
+  }
+
+  async texturePreview(path: string, index: number): Promise<TexturePreview> {
+    await sleep(220);
+    const img = demoTextures.images[index] ?? demoTextures.images[0];
+    const dataUrl = demoPngDataUrl(`${path}#preview-${index}`);
+    return {
+      index,
+      b64: dataUrl.replace(/^data:image\/png;base64,/, ""),
+      width: img?.width ?? 0,
+      height: img?.height ?? 0,
+    };
+  }
+
+  async textureEncode(_path: string, index: number): Promise<EncodeResult> {
+    await sleep(400);
+    const img = demoTextures.images[index];
+    const ratio = img ? Math.max(0.06, (img.width * img.height) / 22_369_621) : 1;
+    return {
+      ktx2_size: Math.round(demoEncode.ktx2_size * ratio),
+      psnr: demoEncode.psnr - (index % 3) * 2.4,
+      vram_after: Math.round(demoEncode.vram_after * ratio),
+      before_png: `/demo/image${index}_before.png`,
+      after_png: `/demo/image${index}_after.png`,
+      width: img?.width,
+      height: img?.height,
+      mip_levels: img ? Math.floor(Math.log2(Math.max(img.width, img.height))) + 1 : undefined,
+      format: "ETC1S",
+      settings: { format: "etc1s", quality: 128, max_size: 0, generate_mips: true },
+    };
+  }
+
+  async diff(a: string, b: string): Promise<DiffReport> {
+    await sleep(200);
+    void a;
+    void b;
+    return demoDiff;
+  }
+
+  async lint(): Promise<LintResult> {
+    await sleep(200);
+    return demoLint;
+  }
+
+  /**
+   * Demo mode never touches disk — the real host only deletes inside
+   * `.zig-cache/assetty-app/` anyway. Waits a beat so the UI path (banner
+   * teardown, toasts) stays identical to the live one.
+   */
+  async discardFile(_path: string): Promise<void> {
+    await sleep(120);
+  }
+
+  async presets(): Promise<string[]> {
+    await sleep(40);
+    return [...demoPresets];
+  }
+
+  async presetLoad(name: string): Promise<string> {
+    await sleep(60);
+    return name === "desktop" ? demoZon : demoZon.replace(/\.desktop/g, `.${name}`);
+  }
+
+  async presetSave(): Promise<void> {
+    await sleep(80);
+  }
+
+  /**
+   * Demo mode persists settings in localStorage so a plain `vite dev` session
+   * still round-trips them (the real host uses assetty.settings.json).
+   */
+  async settingsLoad(): Promise<string> {
+    try {
+      return window.localStorage.getItem(DEMO_SETTINGS_KEY) ?? "{}";
+    } catch {
+      return "{}";
+    }
+  }
+
+  async settingsSave(text: string): Promise<void> {
+    try {
+      JSON.parse(text);
+    } catch (err) {
+      throw new Error(`invalid settings JSON: ${(err as Error).message}`);
+    }
+    try {
+      window.localStorage.setItem(DEMO_SETTINGS_KEY, text);
+    } catch {
+      throw new Error("localStorage unavailable");
+    }
+  }
+}

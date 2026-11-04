@@ -186,3 +186,20 @@ export function makeTable(headers: Array<[string, boolean?]>, rows: HTMLElement[
   );
   return el("table", null, thead, el("tbody", null, ...rows));
 }
+
+/** Last segment of a path (the save panel's suggested file name). */
+export function basename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : path;
+}
+
+/** basename() or the localized "no file" placeholder for null/empty paths. */
+export function displayName(path: string | null | undefined): string {
+  return path ? basename(path) : t("common.noFile");
+}
+
+/** Short duration (`850 ms`, `1.25 s`, `—`) shared by the Optimize/Textures tabs. */
+export function fmtSecs(secs: number | undefined | null): string {
+  if (secs == null || !Number.isFinite(secs)) return "—";
+  return secs < 1 ? `${Math.round(secs * 1000)} ms` : `${secs.toFixed(2)} s`;
+}

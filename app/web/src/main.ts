@@ -18,7 +18,7 @@ import {
   toggleTheme,
 } from "./settings";
 import { lang, onLang, setLang, t } from "./i18n";
-import { clear, el, fmtBytes, fmtCompact, statChip } from "./ui";
+import { clear, el, fmtBytes, fmtCompact, statChip, basename } from "./ui";
 import type { StatChip } from "./ui";
 import { mountViewer } from "./tabs/viewer";
 import { mountOptimize } from "./tabs/optimize";
@@ -91,11 +91,6 @@ const openSplit = el("div", { class: "open-split" }, openBtn, caretBtn);
 const recentMenu = el("div", { class: "recent-menu" });
 recentMenu.hidden = true;
 
-function shortName(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : path;
-}
-
 function closeRecentMenu(): void {
   recentMenu.hidden = true;
   clear(recentMenu);
@@ -120,7 +115,7 @@ async function renderRecentMenu(): Promise<void> {
   for (const dir of dirs) {
     const row = el("button", {
       class: "recent-dir",
-      text: shortName(dir),
+      text: basename(dir),
       title: dir,
     });
     const filesHost = el("div", { class: "recent-files" });
@@ -160,7 +155,7 @@ async function renderRecentMenu(): Promise<void> {
             filesHost.append(
               el("button", {
                 class: "recent-file",
-                text: shortName(file),
+                text: basename(file),
                 title: file,
                 onclick: (ev2: Event) => {
                   ev2.stopPropagation();
