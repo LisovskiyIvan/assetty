@@ -12,7 +12,6 @@ import { findNative, rawCall } from "./host";
 import {
   cleanEncodeArgs,
   isStartedAck,
-  normalizeDiff,
   normalizeEncodeDone,
   normalizeEncodeResult,
   normalizeExportDone,
@@ -20,7 +19,6 @@ import {
   normalizeOptimize,
   normalizeOptimizeDone,
   normalizePreviewDone,
-  normalizeViolations,
   parseMaybeJson,
   subscribeBridge,
   watchProgress,
@@ -37,7 +35,7 @@ import type {
   TextureEncodeDoneEvent,
   TexturePreviewDoneEvent,
 } from "./types";
-import type { DiffReport, EncodeSettings, Info, LintResult, TexturesResult } from "../types";
+import type { EncodeSettings, Info, TexturesResult } from "../types";
 
 export class Bridge {
   readonly native: NativeBackend | null;
@@ -205,16 +203,6 @@ export class Bridge {
     const payload =
       res.result && typeof res.result === "object" ? (res.result as Record<string, unknown>) : res;
     return { started: false, result: normalizeEncodeResult(payload) };
-  }
-
-  async diff(a: string, b: string): Promise<DiffReport> {
-    if (!this.live) return this.demo.diff(a, b);
-    return normalizeDiff(parseMaybeJson(await this.raw("diff", [a, b])));
-  }
-
-  async lint(path: string, budgetJson: string): Promise<LintResult> {
-    if (!this.live) return this.demo.lint();
-    return normalizeViolations(parseMaybeJson(await this.raw("lint", [path, budgetJson])));
   }
 
   /**

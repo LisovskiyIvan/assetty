@@ -1,13 +1,5 @@
 /** Static fixtures so the whole layout is inspectable in a plain browser (no nanoui). */
-import type {
-  DiffReport,
-  EncodeResult,
-  Info,
-  LintResult,
-  OptimizeResult,
-  TexturePreview,
-  TexturesResult,
-} from "./types";
+import type { EncodeResult, Info, OptimizeResult, TexturePreview, TexturesResult } from "./types";
 import type { ProgressEvent } from "./bridge/types";
 
 const helmetImages = [
@@ -181,39 +173,6 @@ export const demoOptimize: OptimizeResult = {
   },
 };
 
-export const demoDiff: DiffReport = {
-  nodes: { added: [], removed: [{ index: 7, name: "Empty_Node_17" }], changed: [] },
-  meshes: {
-    added: [],
-    removed: [],
-    changed: [{ index: 0, name: "Helmet", fields: ["primitives[0].indices"] }],
-  },
-  materials: {
-    added: [],
-    removed: [],
-    changed: [{ index: 0, name: "Material_MR", fields: ["occlusionTexture.index"] }],
-  },
-  textures: { added: [], removed: [], changed: [{ index: 3, name: "normal", fields: ["source"] }] },
-  images: {
-    added: [],
-    removed: [],
-    changed: [{ index: 3, name: "normal", fields: ["mimeType", "byteLength"] }],
-  },
-  animations: { added: [], removed: [], changed: [] },
-  skins: { added: [], removed: [], changed: [] },
-  totals: { added: 0, removed: 1, changed: 4 },
-};
-
-export const demoLint: LintResult = {
-  total: 4,
-  violations: [
-    { code: "max_draw_calls", message: "draw calls 71 exceed budget 64", index: null },
-    { code: "missing_mips", message: "image has no mip chain", index: 0 },
-    { code: "format_not_allowed", message: "image format jpeg not in [ktx2]", index: 0 },
-    { code: "texture_too_large", message: "2048x2048 exceeds max_texture_size 1024", index: 4 },
-  ],
-};
-
 export const demoPresets = ["desktop", "mobile", "web"];
 
 export const demoZon = `// Desktop pipeline: BC7 textures, highest quality, meshopt compression.
@@ -248,17 +207,6 @@ export const demoZon = `// Desktop pipeline: BC7 textures, highest quality, mesh
             .compress = true,
         } },
     },
-}
-`;
-
-export const demoBudget = `{
-  "max_triangles": 100000,
-  "max_vertices": 50000,
-  "max_draw_calls": 64,
-  "max_vram_bytes": 33554432,
-  "max_texture_size": 2048,
-  "require_mips": true,
-  "allowed_image_formats": ["ktx2"]
 }
 `;
 
@@ -351,18 +299,6 @@ export class DemoBackend {
       format: "ETC1S",
       settings: { format: "etc1s", quality: 128, max_size: 0, generate_mips: true },
     };
-  }
-
-  async diff(a: string, b: string): Promise<DiffReport> {
-    await sleep(200);
-    void a;
-    void b;
-    return demoDiff;
-  }
-
-  async lint(): Promise<LintResult> {
-    await sleep(200);
-    return demoLint;
   }
 
   /**

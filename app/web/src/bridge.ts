@@ -20,8 +20,6 @@
  *                              (missing on older hosts: feature-detected, preview disabled)
  *   textureEncode(path, i)  -> { started: true } — result arrives as "textureEncodeDone"
  *                              (older hosts: { ktx2_size, psnr, vram_after } synchronously)
- *   diff(a, b)              -> DiffReport
- *   lint(path, budgetJson)  -> { violations, total }
  *   discardFile(path)       -> {"ok":true} (only under .zig-cache/assetty-app; missing counts as discarded)
  *   presets()               -> ["desktop", ...] | { presets: [...] }
  *   presetLoad(name)        -> zon text | { zon }

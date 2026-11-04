@@ -15,19 +15,17 @@ cd app/web && bun install && bun run build   # frontend → app/web/dist (GUI)
 
 ```sh
 assetty info <file.glb> [--json]                 # статистика: трисы, draw calls, VRAM, мусор
-assetty diff a.glb b.glb [--json]                # что добавилось/удалилось/изменилось
-assetty lint <dir|file> --budget budgets.json    # лимиты; exit 1 при нарушениях (CI)
 assetty optimize f.glb --preset mobile -o out.glb [--report r.json]
 assetty textures <file.glb> [--encode N] [--json] # список текстур; encode → KTX2 + PSNR
 assetty presets                                  # список пресетов
 ```
 
-Exit codes: `0` ok, `1` lint-нарушения, `2` ошибка.
+Exit codes: `0` ok, `2` ошибка.
 
 ## App
 
 Вкладки: Viewer (Babylon, анимации, scene explorer) / Optimize (2 вьюпорта до/после,
-синхронизация камер, метрики Δ) / Textures (encode → KTX2, PSNR) / Diff / Lint /
+синхронизация камер, метрики Δ) / Textures (encode → KTX2, PSNR) /
 Settings (редактор zon-пресетов). Bridge: JS → nanoui bind → core in-process;
 прогресс — события `progress`/`log`.
 
@@ -40,11 +38,10 @@ core/src/
   ops/        prune, dedup, weld, join, quantize (meshopt), simplify, geom.zig (builder)
   tex/        decode (stb), formats (KTX2/DFD), mips, encode_ktx (basisu)
   pipeline/   preset.zig (zon), runner.zig
-  diff.zig, lint.zig
 app/          src/ (nanoui shell + bridge backend), web/ (vite + Babylon)
 vendor/       cgltf, stb_image, meshoptimizer, basisu, zstd
 presets/      mobile.zon, desktop.zon, web.zon
-test/         fixtures (синтетика + 12 моделей glTF-Sample-Assets), budgets.json
+test/         fixtures (синтетика + 12 моделей glTF-Sample-Assets)
 ```
 
 ## Status
@@ -54,8 +51,8 @@ test/         fixtures (синтетика + 12 моделей glTF-Sample-Asset
 - [x] ops: prune, dedup, weld, join, quantize, simplify
 - [x] tex: decode, mips, KTX2 encode (ETC1S/UASTC) + PSNR
 - [x] pipeline: zon-пресеты, runner, `optimize`
-- [x] diff, lint, CLI
-- [x] app: nanoui + Babylon (Viewer/Optimize/Textures/Diff/Lint/Settings)
+- [x] CLI
+- [x] app: nanoui + Babylon (Viewer/Optimize/Textures/Settings)
 - [ ] EXT_meshopt_compression (пока quantize в core glTF: UNORM16/SNORM16)
 - [ ] webview за пределами macOS (nanoui page windows: только macOS)
 

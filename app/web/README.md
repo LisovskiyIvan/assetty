@@ -32,8 +32,6 @@ Methods called (JSON string in / out, promises or plain values):
 | `textures(path)` | path | `{ images: [...] }` |
 | `texturePreview(path, i)` | path, index | `{ started: true }` → `texturePreviewDone` |
 | `textureEncode(path, i)` | path, index | `{ started: true }` → `textureEncodeDone` (legacy hosts may still return the encode result directly) |
-| `diff(a, b)` | paths | diff report (`nodes`/`meshes`/… categories) |
-| `lint(path, budgetJson)` | path, JSON text | `{ violations, total }` (array of per-file results also accepted) |
 | `presets()` | — | `["desktop", …]` |
 | `presetLoad(name)` | name | zon text |
 | `presetSave(name, zon)` | name, text | anything |

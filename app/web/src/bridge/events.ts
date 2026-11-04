@@ -1,11 +1,8 @@
 /** Backend event subscriptions + payload normalization (tolerant to old hosts). */
 import type { NativeBackend } from "./types";
 import type {
-  DiffReport,
   EncodeResult,
   EncodeSettings,
-  LintResult,
-  LintViolation,
   OptimizeReport,
   OptimizeResult,
   Stats,
@@ -77,47 +74,6 @@ export function normalizeOptimize(raw: unknown): OptimizeResult {
     deltas: (rep.deltas as OptimizeReport["deltas"]) ?? undefined,
   };
   return { out_path, report };
-}
-
-export function normalizeViolations(raw: unknown): LintResult {
-  const r = raw as unknown;
-  if (Array.isArray(r)) {
-    const violations: LintViolation[] = [];
-    for (const file of r) {
-      const f = (file ?? {}) as Record<string, unknown>;
-      const list = Array.isArray(f.violations) ? f.violations : [];
-      for (const v of list) violations.push(normalizeViolation(v));
-    }
-    return { violations, total: violations.length };
-  }
-  const obj = (r ?? {}) as Record<string, unknown>;
-  const list = Array.isArray(obj.violations) ? obj.violations : [];
-  const violations = list.map(normalizeViolation);
-  return { violations, total: asNumber(obj.total, violations.length) };
-}
-
-function normalizeViolation(raw: unknown): LintViolation {
-  const v = (raw ?? {}) as Record<string, unknown>;
-  return {
-    code: String(v.code ?? "unknown"),
-    message: String(v.message ?? ""),
-    index: v.index == null ? null : asNumber(v.index),
-  };
-}
-
-export function normalizeDiff(raw: unknown): DiffReport {
-  const obj = (raw ?? {}) as Record<string, unknown>;
-  const categories = ["nodes", "meshes", "materials", "textures", "images", "animations", "skins"];
-  const out = { totals: obj.totals } as unknown as DiffReport;
-  for (const cat of categories) {
-    const c = (obj[cat] ?? {}) as Record<string, unknown>;
-    (out as unknown as Record<string, unknown>)[cat] = {
-      added: Array.isArray(c.added) ? c.added : [],
-      removed: Array.isArray(c.removed) ? c.removed : [],
-      changed: Array.isArray(c.changed) ? c.changed : [],
-    };
-  }
-  return out;
 }
 
 export function normalizeImages(raw: unknown): TexturesResult {

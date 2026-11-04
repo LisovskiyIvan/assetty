@@ -13,8 +13,6 @@ const METHOD_NAMES = [
   "textures",
   "texturePreview",
   "textureEncode",
-  "diff",
-  "lint",
   "discardFile",
   "presets",
   "presetLoad",
@@ -100,7 +98,7 @@ export function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|diff|lint|discardFile|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|discardFile|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
         key,
       );
     if (!m) continue;

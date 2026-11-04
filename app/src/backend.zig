@@ -1,5 +1,5 @@
 //! The IPC service bound to the page: file browsing, glTF inspection, the
-//! optimize pipeline, texture encoding, diff and lint.
+//! optimize pipeline and texture encoding.
 //!
 //! Every method is a thin wrapper around an `*Impl` function. The impls take
 //! an allocator instead of a `*nanoui.Call`, so tests cover them without a
@@ -78,8 +78,6 @@ pub const Backend = struct {
         .textures = .{"path"},
         .textureEncode = .{ "path", "index", "settings" },
         .texturePreview = .{ "path", "index", "settings" },
-        .diff = .{ "a", "b" },
-        .lint = .{ "path", "budgetJson" },
         .discardFile = .{"path"},
         .presetLoad = .{"name"},
         .presetSave = .{ "name", "zon" },
@@ -223,19 +221,6 @@ pub const Backend = struct {
         _ = settings;
         if (self.previewBusy()) return json.errorRaw(call.arena, "busy", .{});
         return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index, null);
-    }
-
-    // ---- report -----------------------------------------------------------
-
-    /// `assetty diff <a> <b> --json`.
-    pub fn diff(self: *Backend, call: *nanoui.Call, a: []const u8, b: []const u8) !json.Raw {
-        return self.diffImpl(call.arena, a, b);
-    }
-
-    /// `assetty lint <path> --budget <json> --json`; `budget_json` is either
-    /// the budget JSON itself or a path to it.
-    pub fn lint(self: *Backend, call: *nanoui.Call, path: []const u8, budget_json: []const u8) !json.Raw {
-        return self.lintImpl(call.arena, path, budget_json);
     }
 
     /// Deletes a finished result file and forgets it: `{"ok":true}`. Only
@@ -518,49 +503,6 @@ pub const Backend = struct {
         var aw: std.Io.Writer.Allocating = .init(a);
         errdefer aw.deinit();
         try json.writeTextures(&aw.writer, path, loaded.asset, st, null, null);
-        return json.raw(try aw.toOwnedSlice());
-    }
-
-    fn diffImpl(self: *Backend, a: std.mem.Allocator, old_path: []const u8, new_path: []const u8) !json.Raw {
-        var old = core.parse.loadFile(self.io, a, old_path) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ old_path, @errorName(err) });
-        defer old.deinit();
-        var new = core.parse.loadFile(self.io, a, new_path) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ new_path, @errorName(err) });
-        defer new.deinit();
-
-        const rep = core.diff.compare(a, old.asset, new.asset) catch |err|
-            return json.errorRaw(a, "diff: {s}", .{@errorName(err)});
-
-        var aw: std.Io.Writer.Allocating = .init(a);
-        errdefer aw.deinit();
-        try core.diff.reportJson(&aw.writer, rep);
-        return json.raw(try aw.toOwnedSlice());
-    }
-
-    fn lintImpl(self: *Backend, a: std.mem.Allocator, path: []const u8, budget_json: []const u8) !json.Raw {
-        const trimmed = std.mem.trimStart(u8, budget_json, " \t\r\n");
-        const bytes = if (std.mem.startsWith(u8, trimmed, "{"))
-            trimmed
-        else
-            std.Io.Dir.cwd().readFileAlloc(self.io, budget_json, a, .limited(max_text_bytes)) catch |err|
-                return json.errorRaw(a, "budget {s}: {s}", .{ budget_json, @errorName(err) });
-
-        var budget = core.lint.parseBudget(a, bytes) catch
-            return json.errorRaw(a, "invalid budget", .{});
-        defer budget.deinit(a);
-
-        var loaded = core.parse.loadFile(self.io, a, path) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        defer loaded.deinit();
-        const st = core.stats.compute(a, loaded.asset) catch |err|
-            return json.errorRaw(a, "stats {s}: {s}", .{ path, @errorName(err) });
-        const vs = core.lint.check(a, st, budget) catch |err|
-            return json.errorRaw(a, "lint: {s}", .{@errorName(err)});
-
-        var aw: std.Io.Writer.Allocating = .init(a);
-        errdefer aw.deinit();
-        try json.writeLint(&aw.writer, path, vs);
         return json.raw(try aw.toOwnedSlice());
     }
 
@@ -2102,23 +2044,6 @@ test "textures impl on a fixture" {
     var b = testBackend();
     const r = try b.texturesImpl(arena.allocator(), "test/fixtures/box.glb");
     try testing.expect(std.mem.indexOf(u8, r.text, "\"images\": [") != null);
-}
-
-test "diff impl matches the CLI report" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var b = testBackend();
-    const r = try b.diffImpl(arena.allocator(), "test/fixtures/box.glb", "test/fixtures/box.glb");
-    try testing.expect(std.mem.indexOf(u8, r.text, "\"nodes\":") != null);
-}
-
-test "lint impl accepts inline budget json" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var b = testBackend();
-    const r = try b.lintImpl(arena.allocator(), "test/fixtures/box.glb", "{\"max_triangles\": 1}");
-    try testing.expect(std.mem.indexOf(u8, r.text, "max_triangles") != null);
-    try testing.expect(std.mem.indexOf(u8, r.text, "\"total\": 1") != null);
 }
 
 test "loadBytes impl returns base64" {

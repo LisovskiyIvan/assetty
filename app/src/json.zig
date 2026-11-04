@@ -300,28 +300,6 @@ pub fn writeOptimize(
     try w.print("}},\n  \"total_secs\": {d:.3}\n}}\n", .{rep.total_secs});
 }
 
-/// Lint result for one file: mirrors `assetty lint --json` for a single path.
-pub fn writeLint(w: anytype, path: []const u8, vs: []const core.lint.Violation) !void {
-    try w.writeAll("{\"file\": ");
-    try jsonStr(w, path);
-    try w.writeAll(", \"violations\": [");
-    for (vs, 0..) |v, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.writeAll("{\"code\": ");
-        try jsonStr(w, v.code);
-        try w.writeAll(", \"message\": ");
-        try jsonStr(w, v.message);
-        try w.writeAll(", \"index\": ");
-        if (v.index) |ix| {
-            try w.print("{d}", .{ix});
-        } else {
-            try w.writeAll("null");
-        }
-        try w.writeByte('}');
-    }
-    try w.print("],\n  \"total\": {d}\n}}\n", .{vs.len});
-}
-
 test "raw json is emitted verbatim" {
     var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
