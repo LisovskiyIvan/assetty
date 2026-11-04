@@ -357,9 +357,13 @@ export function mountOptimize(): TabHandle {
    * strip) the container still sees them. The strip sits above both canvases,
    * so these pointerdowns never reach the master camera. */
   let splitDragging = false;
+  let splitRect: DOMRect | null = null;
   splitGrip.addEventListener("pointerdown", (ev) => {
     if (compareMode !== "split" || lastResult === null) return;
     splitDragging = true;
+    // Cache the container rect once per drag: reading it on every pointermove
+    // after a clip-path write forces a synchronous reflow each event.
+    splitRect = dual.getBoundingClientRect();
     try {
       splitGrip.setPointerCapture(ev.pointerId);
     } catch {
@@ -370,13 +374,14 @@ export function mountOptimize(): TabHandle {
   });
   dual.addEventListener("pointermove", (ev) => {
     if (!splitDragging) return;
-    const rect = dual.getBoundingClientRect();
+    const rect = splitRect ?? (splitRect = dual.getBoundingClientRect());
     if (rect.width <= 0) return;
     splitPos = Math.max(0, Math.min(100, ((ev.clientX - rect.left) / rect.width) * 100));
     applySplit();
   });
   const endSplitDrag = (): void => {
     splitDragging = false;
+    splitRect = null;
   };
   dual.addEventListener("pointerup", endSplitDrag);
   dual.addEventListener("pointercancel", endSplitDrag);

@@ -65,12 +65,16 @@ export class ViewerScene {
     this.canvas = canvas;
     this.engine = new Engine(canvas, true, {
       antialias: true,
-      adaptToDeviceRatio: true,
+      // DPR is clamped by hand below: adaptToDeviceRatio would render at the
+      // full device ratio (2x on Retina Macs = 4x pixels) in EVERY scene
+      // (viewer + two optimize panes), and HighlightLayer blur on top.
+      adaptToDeviceRatio: false,
       stencil: true,
-      preserveDrawingBuffer: true,
       premultipliedAlpha: false,
       powerPreference: "high-performance",
     });
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    this.engine.setHardwareScalingLevel(1 / dpr);
 
     this.scene = new Scene(this.engine);
     this.scene.clearColor = new Color4(0.05, 0.07, 0.09, 1);
