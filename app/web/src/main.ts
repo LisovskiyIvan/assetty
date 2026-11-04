@@ -12,6 +12,8 @@ import {
   setLanguage,
   settingsToJson,
   getRecentDirs,
+  inspectorOpenPref,
+  setInspectorOpenPref,
   themeMode,
   toggleTheme,
 } from "./settings";
@@ -279,11 +281,22 @@ async function handleDroppedFile(file: File): Promise<void> {
   }
 }
 
-/** The inspector belongs to the Viewer scene: closed by default, it opens
- * only on a successful viewer model load (see the `assetty:viewer-loaded`
- * hook below) and hides whenever the user leaves the Viewer tab. Returning
- * to the Viewer tab never reopens it — only a fresh load does. */
+/**
+ * The inspector belongs to the Viewer scene and renders inline in its canvas
+ * pane (explorer LEFT, canvas CENTER, properties RIGHT — one container, one
+ * shared selection).
+ *
+ * Session policy: closed by default; leaving the Viewer tab hides it but
+ * remembers that it was open, and returning re-opens it. Leaving it closed
+ * stays closed. The persisted `viewer.inspector_open` preference (default
+ * false) decides whether a fresh model load auto-opens it; every manual ⌘I
+ * toggle rewrites the preference.
+ */
 const inspectorDock = createInspectorDock(() => syncInspectorChrome());
+/** The inspector was open when the user left the Viewer tab (session-only). */
+let leftWithOpen = false;
+/** A tab return is waiting for the scene/load to re-open against. */
+let pendingReopen = false;
 
 const inspectorBtn = el("button", {
   class: "small",
@@ -364,13 +377,16 @@ function syncInspectorChrome(): void {
 }
 
 async function toggleInspector(): Promise<void> {
-  const scene = app.viewer?.scene ?? null;
-  if (!scene) {
+  if (!app.viewer?.scene) {
     // Nothing rendered yet: point at the Viewer tab; the toggle below then
     // reports that a model is needed.
     selectTab("viewer");
   }
-  await inspectorDock.toggle(app.viewer?.scene ?? null);
+  const scene = app.viewer?.scene ?? null;
+  await inspectorDock.toggle(scene);
+  // A manual toggle is an explicit preference: persist it (a no-scene toggle
+  // only reports the missing model and must not clobber the stored value).
+  if (scene) setInspectorOpenPref(inspectorDock.isOpen);
   syncInspectorChrome();
 }
 
@@ -476,7 +492,6 @@ appRoot.append(
   ),
   banner,
   content,
-  inspectorDock.el,
   el(
     "footer",
     { class: "statusbar" },
@@ -550,10 +565,25 @@ function selectTab(id: TabId): void {
   }
   handle.el.style.display = "";
   handle.activate();
-  if (id !== "viewer" && inspectorDock.isOpen) {
-    // The inspector belongs to the Viewer scene: leaving the tab hides it,
-    // and coming back does not reopen it (only a fresh model load does).
-    void inspectorDock.hide().then(() => syncInspectorChrome());
+  if (id !== "viewer") {
+    pendingReopen = false;
+    if (inspectorDock.isOpen) {
+      // The inspector belongs to the Viewer scene: leaving the tab hides it,
+      // but returning re-opens the same config (tracked by `leftWithOpen`).
+      leftWithOpen = true;
+      void inspectorDock.hide().then(() => syncInspectorChrome());
+    }
+  } else if (leftWithOpen) {
+    // Back on the Viewer tab with the inspector left open: re-open now when
+    // the scene is already there, else wait for the load to finish (the
+    // viewer-loaded hook below consumes `pendingReopen`).
+    leftWithOpen = false;
+    pendingReopen = true;
+    const scene = app.viewer?.scene ?? null;
+    if (scene) {
+      pendingReopen = false;
+      void inspectorDock.show(scene).then(() => syncInspectorChrome());
+    }
   }
 }
 
@@ -575,12 +605,21 @@ window.addEventListener("assetty:select-tab", (ev) => {
 });
 
 // The Viewer tab dispatches this after a model loads successfully (failed
-// and demo loads don't). Only a fresh load opens the inspector.
+// and demo loads don't). A fresh load opens the inspector only when the
+// stored preference says so — or when a tab return is waiting for the scene.
+// (An already-open inspector, e.g. across a discard reload on the same
+// scene, simply stays bound and refreshes.)
 window.addEventListener("assetty:viewer-loaded", () => {
-  if (activeTab !== "viewer" || inspectorDock.isOpen) return;
+  if (activeTab !== "viewer" || inspectorDock.isOpen) {
+    pendingReopen = false;
+    return;
+  }
   const scene = app.viewer?.scene ?? null;
   if (!scene) return;
-  void inspectorDock.show(scene).then(() => syncInspectorChrome());
+  if (pendingReopen || inspectorOpenPref()) {
+    pendingReopen = false;
+    void inspectorDock.show(scene).then(() => syncInspectorChrome());
+  }
 });
 
 /* ---------------------------------------------------------------- status bar */
@@ -659,6 +698,8 @@ void checkKtx2Assets().then((missing) => {
   toggleTheme,
   lang: () => lang(),
   setLang: (next: "en" | "ru") => switchLanguage(next),
+  inspectorPref: () => inspectorOpenPref(),
+  inspectorWasOpenOnLeave: () => leftWithOpen,
   settings: () => settingsToJson(),
   applySettingsText,
   saveSettings,

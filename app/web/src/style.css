@@ -105,7 +105,7 @@ body {
 
 #app {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   height: 100vh;
   height: 100dvh;
@@ -912,31 +912,23 @@ tr.selected {
   }
 }
 
+/* Side-panel preview: the image sits directly under the panel header, full
+ * width; facts/settings/dry-run/compare follow below. */
 .preview-figure {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  align-items: flex-start;
+  display: block;
   min-width: 0;
+  margin: 0;
 }
 
 .preview-img {
-  max-width: min(52%, 420px);
-  max-height: 34vh;
-  width: auto;
+  display: block;
+  width: 100%;
   height: auto;
+  max-height: 40vh;
   object-fit: contain;
   background: var(--img-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-}
-
-.preview-meta {
-  flex: 1 1 180px;
-  min-width: 160px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
 }
 
 .compare-grid {
@@ -1243,72 +1235,20 @@ tr.selected {
   font-size: 10px;
 }
 
-/* --- inspector dock (grid column next to the tab content) --- */
-.inspector-dock {
-  grid-column: 2;
-  grid-row: 3;
-  display: flex;
-  flex-direction: column;
-  width: clamp(420px, 50vw, 780px);
-  max-width: calc(100vw - 200px);
-  min-width: 0;
-  min-height: 0;
-  border-left: 1px solid var(--border);
-  background: var(--bg-alt);
-  overflow: hidden;
-}
+/* --- viewer tab: inline inspector (explorer LEFT | canvas CENTER | properties RIGHT)
+ *
+ * The inspector wraps the canvas pane itself (`layoutMode: "inline"` with no
+ * container element), so no app-level dock column exists. Its container is
+ * absolutely positioned over the wrap; the center cell holds the canvas and
+ * the side panes carry the explorer tree and the property editor.
+ * `inspector-open` on #app is only a state hook (button chrome, tests). */
 
-.inspector-dock[hidden] {
-  display: none;
-}
-
-/* While inspecting, the tab's own side panel gives up its space to the 3D
-   view: the inspector already carries a scene tree and property editor. */
-#app.inspector-open .tab-side {
-  display: none;
-}
-
-#app.inspector-open .tab-body {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.dock-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 10px;
-  min-height: 34px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-raised);
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-}
-
-.dock-head > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dock-body {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-}
-
-/* The inspector's two panes have a natural minimum; below it the dock scrolls
-   instead of silently clipping the property controls. */
-.dock-body > #babylon-inspector-container {
-  position: relative !important;
-  inset: auto !important;
+.canvas-wrap > #babylon-inspector-container {
+  position: absolute !important;
+  inset: 0 !important;
   width: 100%;
-  min-width: 660px;
   height: 100%;
+  overflow: hidden;
 }
 
 /* --- per-property help ("?" popover, shared by optimize + settings forms) --- */

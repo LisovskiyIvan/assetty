@@ -1,18 +1,24 @@
 /**
- * Babylon Inspector v2, docked into the app shell.
+ * Babylon Inspector v2, inline inside the Viewer tab's canvas pane.
  *
  * The inspector is loaded lazily (`import("@babylonjs/inspector")` only when
  * first opened) so the React/FluentUI payload never delays app start.
  *
- * It is configured with `layoutMode: "overlay"` plus an explicit
- * `containerElement`: the inspector renders inside our dock column instead of
- * covering the canvas (that is what `layoutMode: "inline"` would do — it
- * re-parents the rendering canvas, which would break the tab layout). The dock
- * is a normal grid column, so opening/closing it resizes the canvas and the
- * engine follows through its ResizeObserver.
+ * It uses `layoutMode: "inline"` with NO `containerElement`: the inspector
+ * wraps the rendering canvas's parent (`.canvas-wrap`), so the stock layout —
+ * Scene Explorer LEFT, canvas CENTER, Properties/Debug/Statistics/Tools
+ * RIGHT — shares one ServiceContainer and one SelectionService (clicking a
+ * node in the tree drives the properties pane; two `ShowInspector` instances
+ * on one scene cannot coexist anyway — the second disposes the first, see
+ * `InspectorTokens` in the inspector bundle). On dispose the inspector
+ * restores the wrap's original children, so the canvas never gets stranded.
+ *
+ * Pane widths are fixed-but-sane (300/360, min 240/260) and resizable through
+ * the inspector's own drag handles; the engine follows resizes through
+ * `autoResizeEngine` plus the ViewerScene ResizeObserver.
  */
 import type { Scene } from "@babylonjs/core/scene";
-import { onLang, t } from "./i18n";
+import { t } from "./i18n";
 import { notify } from "./notify";
 import { themeMode } from "./settings";
 
@@ -28,53 +34,22 @@ export function createInspectorDock(onChange?: (open: boolean) => void): Inspect
 }
 
 export class InspectorDock {
-  readonly el: HTMLElement;
-  readonly body: HTMLElement;
   private token: InspectorToken | null = null;
   private scene: Scene | null = null;
   private busy = false;
-  private readonly title: HTMLElement;
-  private readonly closeBtn: HTMLButtonElement;
   private readonly onChange?: (open: boolean) => void;
 
   constructor(onChange?: (open: boolean) => void) {
     this.onChange = onChange;
-    this.title = document.createElement("span");
-    this.title.textContent = t("toast.inspNoScene");
-
-    const close = document.createElement("button");
-    close.className = "small";
-    close.textContent = t("common.close");
-    close.title = t("common.closeTitle");
-    this.closeBtn = close;
-    close.addEventListener("click", () => void this.hide());
-
-    const head = document.createElement("div");
-    head.className = "dock-head";
-    head.append(this.title, close);
-
-    this.body = document.createElement("div");
-    this.body.className = "dock-body";
-
-    this.el = document.createElement("aside");
-    this.el.id = "inspector-dock";
-    this.el.className = "inspector-dock";
-    this.el.hidden = true;
-    this.el.append(head, this.body);
-    onLang(() => this.syncStrings());
-  }
-
-  /** Re-renders dock chrome in the active language. */
-  private syncStrings(): void {
-    this.closeBtn.textContent = t("common.close");
-    this.closeBtn.title = t("common.closeTitle");
-    this.title.textContent = this.scene
-      ? t("toast.inspMeshes", { n: this.scene.meshes.length })
-      : t("toast.inspNoScene");
   }
 
   get isOpen(): boolean {
-    return this.token !== null && !this.el.hidden;
+    return this.token !== null && !this.token.isDisposed;
+  }
+
+  /** Scene the open inspector is bound to (null when closed). */
+  get boundScene(): Scene | null {
+    return this.isOpen ? this.scene : null;
   }
 
   /** Opens the inspector for `scene` (or closes it when already open). */
@@ -90,30 +65,31 @@ export class InspectorDock {
     }
     this.busy = true;
     try {
-      this.el.hidden = false;
-      this.el.dataset.state = "loading";
       const mod = (await import("@babylonjs/inspector")) as unknown as {
         ShowInspector?: ShowInspectorFn;
       };
       if (typeof mod.ShowInspector !== "function") {
         throw new Error("inspector bundle has no ShowInspector()");
       }
+      // No containerElement: inline mode wraps the rendering canvas's parent,
+      // yielding explorer | canvas | properties with a shared selection.
       this.token = mod.ShowInspector(scene, {
-        containerElement: this.body,
-        layoutMode: "overlay",
+        layoutMode: "inline",
         autoResizeEngine: true,
         // The inspector has its own Fluent theme: follow the app's current one.
         themeMode: themeMode(),
         disableTeachingMoments: true,
+        leftPaneDefaultWidth: 300,
+        leftPaneMinWidth: 240,
+        rightPaneDefaultWidth: 360,
+        rightPaneMinWidth: 260,
       });
       this.scene = scene;
-      this.title.textContent = t("toast.inspMeshes", { n: scene.meshes.length });
-      this.el.dataset.state = "ready";
       this.onChange?.(true);
       return true;
     } catch (err) {
-      this.el.hidden = true;
-      this.el.dataset.state = "failed";
+      this.token = null;
+      this.scene = null;
       this.onChange?.(false);
       notify(t("toast.inspectorFail", { message: (err as Error).message }), "error");
       return false;
@@ -131,8 +107,6 @@ export class InspectorDock {
     const token = this.token;
     this.token = null;
     this.scene = null;
-    this.el.hidden = true;
-    this.el.dataset.state = "hidden";
     if (token && !token.isDisposed) {
       try {
         await token.dispose();

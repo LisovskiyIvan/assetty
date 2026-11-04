@@ -165,6 +165,8 @@ export function mountTextures(): TabHandle {
       shot.width > 0 && shot.height > 0
         ? `${shot.width}×${shot.height}`
         : `${img.width}×${img.height}`;
+    // Image only: the facts block below carries format/size/disk/vram/mips,
+    // so the figure stays a pure top-of-panel preview.
     return el(
       "div",
       { class: "preview-figure" },
@@ -174,18 +176,6 @@ export function mountTextures(): TabHandle {
         alt: img.name ?? `image ${img.index}`,
         title: `${dims} · ${img.format}`,
       }),
-      el(
-        "div",
-        { class: "preview-meta" },
-        el("div", { class: "hint", text: t("tex.asStored") }),
-        kv([
-          [t("tex.kvFormat"), img.format],
-          [t("tex.kvSize"), dims],
-          [t("tex.kvDisk"), fmtBytes(img.disk)],
-          [t("tex.kvVram"), fmtBytes(img.vram)],
-          [t("tex.kvMips"), img.has_mips ? t("tex.yes") : t("tex.no")],
-        ]),
-      ),
     );
   }
 
@@ -701,13 +691,25 @@ export function mountTextures(): TabHandle {
       title: t("tex.ovTitle"),
     });
     devBadge.hidden = !dev;
-    /* One coherent panel: header (ellipsized name) + a single padded body
-     * holding facts, preview, settings, dry-run and compare — no detached
-     * floating blocks. The side column itself scrolls. */
+    /* One coherent panel: header (ellipsized name) + a single padded body.
+     * Order is deliberate: the PREVIEW IMAGE sits directly under the header,
+     * then the kv facts, then Texture settings, dry-run and compare. The
+     * side column itself scrolls. */
     const name = img.name ?? `image ${img.index}`;
-    const body = el(
-      "div",
-      { class: "panel-body" },
+    const body = el("div", { class: "panel-body" });
+
+    /* Preview image first (loading / error / decoded states share the slot). */
+    if (previewing === img.index) {
+      body.append(previewLoadingInner());
+    } else if (previewError && previewErrorIndex === img.index) {
+      body.append(
+        el("div", { class: "empty", text: t("tex.previewFail", { message: previewError }) }),
+      );
+    } else if (preview && preview.index === img.index) {
+      body.append(renderPreviewInner(img, preview));
+    }
+
+    body.append(
       el("div", { class: "hint mono", text: t("tex.imageN", { index: img.index }) }),
       kv([
         [t("tex.kvFormat"), img.effective_format ?? img.format],
@@ -718,24 +720,6 @@ export function mountTextures(): TabHandle {
         [t("tex.kvMips"), img.has_mips ? t("tex.yes") : t("tex.no")],
       ]),
     );
-
-    /* Preview thumbnail (existing flow: loading / error / decoded image). */
-    if (previewing === img.index) {
-      body.append(
-        el("div", { class: "section-title", text: t("tex.preview") }),
-        previewLoadingInner(),
-      );
-    } else if (previewError && previewErrorIndex === img.index) {
-      body.append(
-        el("div", { class: "section-title", text: t("tex.preview") }),
-        el("div", { class: "empty", text: t("tex.previewFail", { message: previewError }) }),
-      );
-    } else if (preview && preview.index === img.index) {
-      body.append(
-        el("div", { class: "section-title", text: t("tex.preview") }),
-        renderPreviewInner(img, preview),
-      );
-    }
 
     /* Per-texture editor, moved here verbatim from the old inline row. */
     body.append(

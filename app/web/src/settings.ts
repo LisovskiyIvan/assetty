@@ -10,6 +10,7 @@
  *   "theme": "dark" | "light",
  *   "language": "en" | "ru",
  *   "recent_dirs": string[] (absolute dirs, most-recent-first, cap 8),
+ *   "viewer": { "inspector_open": boolean },
  *   "optimize": {
  *     "steps": {
  *       "prune":    { "enabled": true, "unused_nodes": true, "unused_materials": true, "unused_textures": true },
@@ -145,6 +146,8 @@ export interface Settings {
   theme: ThemeMode;
   language: Language;
   recent_dirs: string[];
+  /** Viewer prefs: whether the inspector auto-opens on model load. */
+  viewer: { inspector_open: boolean };
   optimize: { steps: OptimizeSteps; per_model: Record<string, PerModelEntry> };
 }
 
@@ -166,6 +169,7 @@ export function defaultSettings(): Settings {
     theme: "dark",
     language: detectLanguage(),
     recent_dirs: [],
+    viewer: { inspector_open: false },
     optimize: {
       steps: {
         prune: {
@@ -277,6 +281,19 @@ export function languageMode(): Language {
 export function toggleTheme(): ThemeMode {
   setTheme(current.theme === "dark" ? "light" : "dark");
   return current.theme;
+}
+
+/** Whether the viewer inspector auto-opens on model load (persisted). */
+export function inspectorOpenPref(): boolean {
+  return current.viewer.inspector_open;
+}
+
+/** Records a manual ⌘I toggle so the next load/tab return restores it. */
+export function setInspectorOpenPref(open: boolean): void {
+  if (current.viewer.inspector_open === open) return;
+  updateSettings((settings) => {
+    settings.viewer.inspector_open = open;
+  });
 }
 
 function scheduleSave(): void {
@@ -414,6 +431,17 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
   out.theme = readEnum(raw, "theme", out.theme, THEMES, "theme", strict);
   out.language = readEnum(raw, "language", out.language, LANGUAGES, "language", strict);
   out.recent_dirs = readRecentDirs(raw, strict);
+
+  const viewerRaw = readObject(raw, "viewer", "viewer", strict);
+  out.viewer = {
+    inspector_open: readBool(
+      viewerRaw,
+      "inspector_open",
+      out.viewer.inspector_open,
+      "viewer.inspector_open",
+      strict,
+    ),
+  };
 
   const optimize = readObject(raw, "optimize", "optimize", strict);
   const stepsRaw = readObject(optimize, "steps", "optimize.steps", strict);
