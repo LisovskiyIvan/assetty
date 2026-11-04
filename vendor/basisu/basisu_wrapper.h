@@ -23,6 +23,11 @@ typedef struct basset_basisu_params {
 // Idempotent, thread-safe. Returns 0 on success, -1 on failure.
 int basset_basisu_init(void);
 
+// Cap on the per-encode basisu job-pool thread count. Default 8 (the
+// historical hardcoded cap). Clamped to >= 1. Global pool state: set once
+// before spawning encode workers, not per-encode.
+void basset_basisu_set_max_threads(int n);
+
 // Encodes RGBA8 (w*h*4) to a KTX2 file buffer. On success returns 0 and sets
 // *out_ktx2 (malloc'd, free with basset_basisu_free) / *out_len.
 // On failure returns -1 and fills err_buf (NUL terminated when err_len > 0).

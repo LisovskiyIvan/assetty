@@ -415,10 +415,28 @@ fn setMimeKtx2(d: *c.cgltf_data, im: *c.cgltf_image) void {
 /// main thread once every view exists.
 const PendingView = struct { img: *c.cgltf_image, view_idx: usize, normal: bool };
 
-/// Outer concurrency for the per-image encode phase. basisu threads a single
-/// encode internally, so the cap stays small: oversubscribing the machine
-/// (4 outer x 8 inner basisu threads) only adds context switching.
+/// Outer concurrency for the per-image encode phase: at most 4 workers.
+/// Measured (10-core macOS arm64, 5x2048px ETC1S + 5-image UASTC models):
+/// 4 outer x 8 inner beats 5-10 outer x 1-2 inner by 1.5-2x and ties 3-6
+/// outer x 6-8 inner within noise. basisu's pool threads block enough that
+/// ~3x oversubscription keeps all cores fed, while inner < 4 starves
+/// per-image scaling — so the cap stays small and inner stays at 8.
+/// Tune via basset_basisu_set_max_threads / ASSETTY_TEX_{OUTER,INNER}.
 const max_parallel_encodes = 4;
+
+/// Test/debug override for the outer worker count (ASSETTY_TEX_OUTER=N).
+/// Unset or unparsable means the default cap (see `encodeThreadCount`).
+fn envOuterOverride() ?usize {
+    const v = std.c.getenv("ASSETTY_TEX_OUTER") orelse return null;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
+}
+
+/// Test/debug override for the per-encode basisu thread count
+/// (ASSETTY_TEX_INNER=N). Unset or unparsable means the default of 8.
+fn envInnerOverride() ?usize {
+    const v = std.c.getenv("ASSETTY_TEX_INNER") orelse return null;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
+}
 
 /// One image to encode, in `cdata.images` order, with its resolved params.
 const ImageJob = struct {
@@ -561,7 +579,8 @@ fn encodeTexturesWith(
     const details_ptr: ?*std.ArrayList(TextureImageOutcome) = if (p.overrides.len > 0) &details else null;
 
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
-    const n_threads = @min(thread_cap, encodeThreadCount(images.len));
+    var n_threads = @min(thread_cap, encodeThreadCount(images.len));
+    if (envOuterOverride()) |o| n_threads = @max(1, @min(o, images.len));
     if (n_threads <= 1) {
         try encodeImagesSequential(a, loaded.cdata, p, target, images, &gb, &pending, &res, details_ptr, prog);
     } else {
@@ -629,6 +648,9 @@ fn encodeImagesSequential(
 ) !void {
     const total: u32 = @intCast(images.len);
     var done: u32 = 0;
+    // Pin the global basisu pool to the historical default so the sequential
+    // reference is independent of whatever a previous parallel call set.
+    encode_ktx.setMaxThreads(8);
     for (images, 0..) |*im, idx| {
         const index: u32 = @intCast(idx);
         const eff = resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri));
@@ -769,6 +791,11 @@ fn encodeImagesParallel(
     _ = encode_ktx.init();
 
     const n_workers = @min(n_threads, jobs.items.len);
+    // basisu's per-encode pool size is global state: set once here, before
+    // the workers spawn — never per-encode. Default 8 is the measured
+    // optimum (see max_parallel_encodes); ASSETTY_TEX_INNER overrides it.
+    const inner: usize = envInnerOverride() orelse 8;
+    encode_ktx.setMaxThreads(@intCast(inner));
     const workers = try a.alloc(Worker, n_workers);
     for (workers) |*w| w.* = .{ .ctx = &ctx, .arena = .init(std.heap.c_allocator) };
 
@@ -1057,8 +1084,9 @@ fn testGradient(a: std.mem.Allocator, w: u32, h: u32, seed: u8) ![]u8 {
 }
 
 // Every encoded image must carry a KTX2 view, in image order, with strictly
-// increasing BIN offsets, and (since basisu's per-encode thread count is the
-// same either way) bytes identical to the sequential result.
+// increasing BIN offsets, and (both paths pin the basisu pool to 8 threads,
+// and basisu output is thread-count deterministic anyway) bytes identical to
+// the sequential result.
 test "textures: progress carries per-image done/total" {
     const io = testing.io;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -54,6 +54,13 @@ pub fn init() bool {
     return c.basset_basisu_init() == 0;
 }
 
+/// Cap on the per-encode basisu job-pool thread count (default 8 when never
+/// called). Global pool state: call once before spawning encode workers,
+/// not per-encode.
+pub fn setMaxThreads(n: u32) void {
+    c.basset_basisu_set_max_threads(@intCast(n));
+}
+
 pub fn encode(a: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, opts: Options) Error!Output {
     if (w == 0 or h == 0) return error.InvalidImage;
     const needed = @as(usize, w) * h * 4;

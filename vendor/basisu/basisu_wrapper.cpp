@@ -17,6 +17,10 @@ namespace {
 std::once_flag g_init_flag;
 bool g_init_ok = false;
 
+// Cap on the per-encode job-pool thread count. Default 8 preserves the
+// historical behaviour when the setter is never called.
+std::atomic<int> g_max_threads{8};
+
 void set_err(char* err_buf, int err_len, const char* msg) {
     if (!err_buf || err_len <= 0) return;
     std::snprintf(err_buf, static_cast<size_t>(err_len), "%s", msg ? msg : "unknown error");
@@ -32,6 +36,12 @@ void do_init() {
 extern "C" int basset_basisu_init(void) {
     std::call_once(g_init_flag, do_init);
     return g_init_ok ? 0 : -1;
+}
+
+extern "C" void basset_basisu_set_max_threads(int n) {
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    g_max_threads.store(n, std::memory_order_relaxed);
 }
 
 extern "C" void basset_basisu_free(void* ptr) {
@@ -110,8 +120,11 @@ extern "C" int basset_basisu_encode(const uint8_t* rgba, int32_t w, int32_t h,
 
     uint32_t hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
-    if (hw > 8) hw = 8;
-    basisu::job_pool jpool(hw);
+    int cap = g_max_threads.load(std::memory_order_relaxed);
+    if (cap < 1) cap = 1;
+    uint32_t n_threads = hw;
+    if (n_threads > static_cast<uint32_t>(cap)) n_threads = static_cast<uint32_t>(cap);
+    basisu::job_pool jpool(n_threads);
     cp.m_pJob_pool = &jpool;
 
     basisu::basis_compressor compressor;
