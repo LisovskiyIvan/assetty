@@ -5,12 +5,81 @@
 import { app } from "../../app";
 import { isBusyError, notifyExportError, pickSaveTarget } from "../../guards";
 import { t } from "../../i18n";
-import { el } from "../../ui";
+import { el, fmtSecs } from "../../ui";
 import { getSettings, getTextureOverrides, updateSettings } from "../../settings";
 import type { OptimizeSteps } from "../../settings";
 import { notify, onLog } from "../../notify";
 import type { ImageInfo, Info, OptimizeResult } from "../../types";
 import type { DualApi } from "./dual";
+
+/** Pipeline stages shown as chips. Geometry merges every mesh-op step kind
+ * the backend reports (prune/dedup/weld/join/simplify/quantize); textures and
+ * write map 1:1. Unknown future step names resolve to null (chip stays put). */
+type StageId = "load" | "geometry" | "textures" | "write" | "done";
+
+const GEOMETRY_KINDS = new Set(["prune", "dedup", "weld", "join", "simplify", "quantize"]);
+
+function stageForStep(raw: string): StageId | null {
+  const s = raw.trim().toLowerCase();
+  if (!s) return null;
+  if (s === "load" || s.startsWith("load")) return "load";
+  if (s === "write" || s.startsWith("writ")) return "write";
+  if (s === "done" || s === "complete" || s === "finished") return "done";
+  if (GEOMETRY_KINDS.has(s)) return "geometry";
+  if (
+    s.includes("texture") ||
+    s.includes("ktx") ||
+    s.includes("basis") ||
+    s.includes("image") ||
+    s.includes("encode")
+  )
+    return "textures";
+  if (
+    s.includes("geometr") ||
+    s.includes("mesh") ||
+    s.includes("prune") ||
+    s.includes("dedup") ||
+    s.includes("weld") ||
+    s.includes("join") ||
+    s.includes("simplif") ||
+    s.includes("quant")
+  )
+    return "geometry";
+  return null;
+}
+
+/** Stages that will run, inferred from the spec at Run time (no future-step
+ * announcements on the wire): load + write + done always, geometry iff any
+ * mesh-op step is checked, textures iff the textures step is checked. */
+function planStages(spec: Array<Record<string, unknown>>): StageId[] {
+  const kinds = new Set(spec.map((s) => String(Object.keys(s)[0] ?? "").toLowerCase()));
+  const plan: StageId[] = ["load"];
+  if ([...kinds].some((k) => GEOMETRY_KINDS.has(k))) plan.push("geometry");
+  if (kinds.has("textures")) plan.push("textures");
+  plan.push("write", "done");
+  return plan;
+}
+
+function stageLabel(id: StageId): string {
+  switch (id) {
+    case "load":
+      return t("opt.stageLoad");
+    case "geometry":
+      return t("opt.stageGeometry");
+    case "textures":
+      return t("opt.stageTextures");
+    case "write":
+      return t("opt.stageWrite");
+    case "done":
+      return t("opt.stageDone");
+  }
+}
+
+/** Live elapsed clock (mm:ss, tabular). */
+function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
 
 /** Encodable by the textures step: anything that is not already KTX2/basis. */
 export function isEncodableImage(img: ImageInfo): boolean {
@@ -178,6 +247,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
   const progressFill = el("div");
   const progressMeta = el("span", { class: "run-progress-meta" });
   const progressBar = el("div", { class: "progress grow" }, progressFill);
+  /** Stage chips (`load → geometry → textures → write → done`): one row above
+   * the numeric bar. Always in the DOM (reserved min-height) so the report
+   * below never shifts; empty until the first run plans it. */
+  const chipsRow = el("div", { class: "stage-row" });
   const logLine = el("div", { class: "logline mono", text: "—" });
   /** Pre-run guard: shown when the source has no encodable images left. */
   const guardBox = el("div", { class: "guard-box" });
@@ -209,6 +282,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       guardBox,
       presetRow,
       el("div", { class: "row" }, runBtn, exportBtn),
+      chipsRow,
       el("div", { class: "row run-progress" }, progressBar, progressMeta),
       logLine,
     ),
@@ -230,6 +304,91 @@ export function createRunFlow(deps: RunDeps): RunApi {
   let progressTotal = 0;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
+  /** Stage chips: the plan (hidden-if-not-run) + the active stage. Done-all
+   * persists until the next run; a source change clears the plan. */
+  let stagePlan: StageId[] = [];
+  let stageActive: StageId | null = null;
+  let stageDoneAll = false;
+  /** Elapsed clock: 1 Hz while running, frozen total at completion. */
+  let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  let runStartMs = 0;
+  let elapsedFrozen: string | null = null;
+  /** Last source the chips were planned/cleared for (loadSource also fires on
+   * plain tab switches — only a real path change resets the chips). */
+  let chipSource: string | null = null;
+
+  function stopClock(): void {
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  }
+
+  function startClock(): void {
+    stopClock();
+    runStartMs = Date.now();
+    elapsedFrozen = null;
+    elapsedTimer = setInterval(() => {
+      if (running) renderProgress();
+    }, 1000);
+  }
+
+  /** Freeze the clock: report total_secs preferred, live timer fallback. */
+  function freezeClock(totalSecs?: number): void {
+    stopClock();
+    elapsedFrozen =
+      totalSecs != null && Number.isFinite(totalSecs)
+        ? fmtSecs(totalSecs)
+        : fmtElapsed(Date.now() - runStartMs);
+    renderProgress();
+  }
+
+  /** Renders the stage chips from the plan + active stage + texture sub. */
+  function renderChips(): void {
+    chipsRow.replaceChildren();
+    chipsRow.title = running ? t("opt.workingNow") : "";
+    if (stagePlan.length === 0) return;
+    const activeIdx = stageActive != null ? stagePlan.indexOf(stageActive) : -1;
+    stagePlan.forEach((id, i) => {
+      if (i > 0) chipsRow.append(el("span", { class: "stage-sep", text: "→" }));
+      const done = stageDoneAll || (activeIdx >= 0 && i < activeIdx);
+      const active = !stageDoneAll && running && i === activeIdx;
+      const chip = el("span", {
+        class: `stage-chip${done ? " done" : ""}${active ? " active" : ""}`,
+      });
+      chip.dataset.stage = id;
+      if (active) chip.append(el("span", { class: "stage-spin", "aria-hidden": "true" }));
+      chip.append(el("span", { class: "stage-label", text: stageLabel(id) }));
+      if (done) chip.append(el("span", { class: "stage-mark", text: "✓" }));
+      if (id === "textures" && progressDone >= 0) {
+        const frac = progressTotal > 0 ? Math.max(0, Math.min(1, progressDone / progressTotal)) : 0;
+        const mini = el(
+          "span",
+          { class: "stage-subbar" },
+          el("span", { style: { width: `${frac * 100}%` } }),
+        );
+        chip.append(
+          el("span", {
+            class: "stage-sub",
+            text: t("progress.texture", { done: progressDone, total: progressTotal }),
+          }),
+          mini,
+        );
+      }
+      chipsRow.append(chip);
+    });
+  }
+
+  /** Clears the chips (new run plans them again; failures blank them). */
+  function resetStages(): void {
+    stagePlan = [];
+    stageActive = null;
+    stageDoneAll = false;
+    stopClock();
+    elapsedFrozen = null;
+    renderProgress();
+    renderChips();
+  }
 
   /** Renders the progress strip from the last known state. */
   function renderProgress(): void {
@@ -237,10 +396,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
       progressStep || progressPct > 0
         ? `${progressStep || t("opt.working")} · ${Math.round(progressPct)}%`
         : t("opt.progressIdle");
-    progressMeta.textContent =
-      progressDone >= 0
-        ? `${base} · ${t("progress.texture", { done: progressDone, total: progressTotal })}`
-        : base;
+    const clock = elapsedFrozen ?? (running ? fmtElapsed(Date.now() - runStartMs) : null);
+    progressMeta.textContent = clock ? `${base} · ${clock}` : base;
+    progressMeta.title = clock ? t("opt.elapsedTitle") : "";
     progressFill.style.width = `${progressPct}%`;
   }
 
@@ -248,6 +406,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
     const clamped = Math.max(0, Math.min(100, pct));
     progressStep = step;
     progressPct = clamped;
+    // Backend steps are raw ("load", mesh-op kinds, "textures", "write");
+    // localized frame strings ("starting…", "running…") resolve to null.
+    const st = stageForStep(step);
+    if (st && st !== "done" && stagePlan.includes(st)) stageActive = st;
     if (sub) {
       progressDone = Math.max(progressDone, sub.done);
       progressTotal = sub.total;
@@ -256,6 +418,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       resetSub();
     }
     renderProgress();
+    renderChips();
   }
 
   /** Clears the texture sub-progress (new run / finished job). */
@@ -271,10 +434,13 @@ export function createRunFlow(deps: RunDeps): RunApi {
 
   function setRunning(on: boolean): void {
     running = on;
+    if (on) startClock();
+    else stopClock();
     runBtn.textContent = on ? t("opt.running") : t("opt.run");
     runBtn.disabled = on || !app.bridge.live || !app.sourcePath;
     exportBtn.disabled = on || exporting || !deps.getResult();
     progressBar.classList.toggle("running", on);
+    renderChips();
   }
 
   function setExporting(on: boolean): void {
@@ -337,6 +503,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
   function finishJobError(message: string): void {
     stopJob();
     resetSub();
+    resetStages();
+    freezeClock();
     setProgress(t("common.failed"), 0);
     notify(t("opt.failedMsg", { message }), "error");
   }
@@ -364,6 +532,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
     }
     stopJob();
     resetSub();
+    stageActive = "done";
+    stageDoneAll = true;
+    freezeClock(event.result.report.total_secs);
     setProgress(t("common.done"), 100);
     deps.onFinished(event.result);
     void loadOptimized(event.result.out_path);
@@ -420,6 +591,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
   }
 
   async function loadSource(path: string): Promise<void> {
+    if (chipSource !== path) {
+      chipSource = path;
+      resetStages();
+    }
     sourceLabel.textContent = t("opt.sourceLabel", { path });
     sourceLabel.title = path;
     syncSourceHead();
@@ -507,6 +682,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
     /* The run supersedes the previous result: drop it before doing any work. */
     deps.onRunStarted();
     resetSub();
+    stagePlan = planStages(specSteps);
+    stageActive = "load";
+    stageDoneAll = false;
+    renderChips();
     setProgress(t("opt.starting"), 0);
     try {
       const call = await app.bridge.optimizeCustom(
@@ -543,16 +722,22 @@ export function createRunFlow(deps: RunDeps): RunApi {
       // Older hosts: the call itself returned the finished report.
       stopJob();
       resetSub();
+      stageActive = "done";
+      stageDoneAll = true;
+      freezeClock(call.result.report.total_secs);
       setProgress(t("common.done"), 100);
       deps.onFinished(call.result);
       void loadOptimized(call.result.out_path);
       notify(t("opt.finished"), "ok");
     } catch (err) {
       stopJob();
+      resetSub();
+      resetStages();
       if (isBusyError(err)) {
         setProgress(t("opt.runningShort"), 0);
         notify(t("opt.busyMsg"), "error");
       } else {
+        freezeClock();
         setProgress(t("common.failed"), 0);
         notify(t("opt.failedMsg", { message: (err as Error).message }), "error");
       }
@@ -583,6 +768,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       exportBtn.textContent = exporting ? t("opt.exporting") : t("opt.export");
       exportNote.textContent = t("opt.exportNote");
       renderProgress();
+      renderChips();
     },
     loadSource,
     loadPresets,
