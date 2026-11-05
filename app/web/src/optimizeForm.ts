@@ -72,6 +72,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Generates the mip chain for minified sampling. Sharper, shimmer-free minification at ~33% more VRAM; almost always keep on.",
   "textures.normal_map":
     "Encodes with normal-map settings (renormalization, no sRGB). Required for correct lighting on normal maps; using it on color textures washes them out.",
+  "textures.supercompression":
+    "Zstd-compresses the UASTC KTX2 payload (supercompressionScheme=2). 20–40% smaller files at the same pixels — no VRAM change — but the loader must support KTX2 zstd supercompression (Babylon.js does). UASTC only; ignored for ETC1S.",
   "quantize.position_bits":
     "Quantizes vertex positions to this many bits (14 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
   "quantize.uv_bits":
@@ -630,12 +632,35 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           "textures.generate_mips",
         ),
       ),
+      field(
+        "zstd",
+        (() => {
+          const lab = check(
+            "supercompression",
+            () => opts.get().textures.supercompression === "zstd",
+            (value) =>
+              edit((steps) => {
+                steps.textures.supercompression = value ? "zstd" : "none";
+              }),
+            "textures.supercompression",
+          );
+          const box = lab.querySelector("input");
+          // Backend ignores supercompression for ETC1S; grey out unless UASTC.
+          refreshSyncers.push(() => {
+            const active = opts.get().textures.format === "uastc";
+            if (box) (box as HTMLInputElement).disabled = !active;
+            lab.title = active ? "" : t("opt.zstdUastcOnly");
+          });
+          return lab;
+        })(),
+      ),
     ],
     undefined,
     () => {
       const tx = opts.get().textures;
       const size = tx.max_size > 0 ? String(tx.max_size) : t("common.noResize");
-      return `${tx.format} · q${tx.quality} · ${size} · ${tx.generate_mips ? t("tex.mips") : t("tex.noMips")}`;
+      const zstd = tx.supercompression === "zstd" ? " · zstd" : "";
+      return `${tx.format} · q${tx.quality} · ${size} · ${tx.generate_mips ? t("tex.mips") : t("tex.noMips")}${zstd}`;
     },
   );
 

@@ -2629,7 +2629,14 @@ fn meshoptHelmetOn() !void {
     );
     // NOTE: value checks run on the REPARSED output: only there do the
     // extension's (buffer, byteOffset) references resolve to real bytes.
+    // (The reparse inflates meshopt views at load, so the payload loops
+    // inside become no-ops — inflated-data checks live in parse/write
+    // tests; here we pin the inflate itself.)
     try expectMeshoptDecodes(aa, orig_l.cdata, rp.loaded.cdata);
+    for (sl(c.cgltf_buffer_view, rp.loaded.cdata.buffer_views, rp.loaded.cdata.buffer_views_count)) |*v| {
+        try std.testing.expectEqual(@as(c_int, 0), v.has_meshopt_compression);
+    }
+    try std.testing.expectEqual(orig_l.cdata.meshes_count, rp.loaded.cdata.meshes_count);
 }
 
 fn meshoptHelmetNoCodec() !void {

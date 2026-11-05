@@ -3,12 +3,14 @@ const c = @import("cgltf");
 const model = @import("model.zig");
 const decode = @import("../tex/decode.zig");
 const formats = @import("../tex/formats.zig");
+const mc = @import("../ops/meshopt.zig");
 
 pub const Error = error{
     NotGltf,
     Unsupported,
     InvalidGlb,
     AccessorOutOfRange,
+    DecodeFailed,
 } || std.mem.Allocator.Error;
 
 pub const Loaded = struct {
@@ -97,6 +99,12 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Loaded {
     // by cgltf; failure is non-fatal here (counts are still available).
     _ = c.cgltf_load_buffers(&options, cdata, map.ptr);
 
+    // Meshopt-compressed input is inflated here, once, so every downstream
+    // consumer (ops, writer, info) sees plain buffer views: the payload is
+    // decoded into cgltf-owned memory (cgltf_free releases it with the same
+    // hooks), the view flag is cleared, and nodes/TRS are untouched.
+    try inflateMeshopt(cdata.?);
+
     var loaded = Loaded{
         .asset = .{},
         .cdata = cdata.?,
@@ -124,11 +132,13 @@ fn sniffMime(data: ?[]const u8, mime_type: [*c]const u8) model.Mime {
         if (d.len >= 8 and std.meta.eql(d[0..8].*, [8]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A })) return .png;
         if (d.len >= 3 and d[0] == 0xFF and d[1] == 0xD8 and d[2] == 0xFF) return .jpeg;
         if (d.len >= 8 and std.meta.eql(d[0..8].*, [8]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB })) return .ktx2;
+        if (d.len >= 12 and std.mem.eql(u8, d[0..4], "RIFF") and std.mem.eql(u8, d[8..12], "WEBP")) return .webp;
     }
     const m = mime_type orelse return .other;
     const s = std.mem.span(m);
     if (std.mem.eql(u8, s, "image/png")) return .png;
     if (std.mem.eql(u8, s, "image/jpeg")) return .jpeg;
+    if (std.mem.eql(u8, s, "image/webp")) return .webp;
     if (std.mem.eql(u8, s, "image/ktx2")) return .ktx2;
     return .other;
 }
@@ -164,10 +174,136 @@ fn viewBytesChecked(v: *const c.cgltf_buffer_view) ?[]const u8 {
     return p[off .. off + sz];
 }
 
+/// Allocate decoded-view bytes through cgltf's hooks (libc malloc when the
+/// options carry no allocator), so `cgltf_free` — which releases `view.data`
+/// with `memory.free_func` — stays balanced.
+fn mcAlloc(data: *c.cgltf_data, n: usize) ?[*]u8 {
+    const mem = data.memory;
+    if (mem.alloc_func) |f| {
+        const p = f(mem.user_data, n) orelse return null;
+        return @ptrCast(p);
+    }
+    const p = std.c.malloc(n) orelse return null;
+    return @ptrCast(p);
+}
+
+fn mcFree(data: *c.cgltf_data, p: [*]u8) void {
+    const mem = data.memory;
+    if (mem.free_func) |f| {
+        f(mem.user_data, p);
+    } else {
+        std.c.free(p);
+    }
+}
+
+/// Inflate every EXT_meshopt_compression view in place: decode the payload
+/// into cgltf-owned memory, point the view at it, clear the flag. Nodes/TRS
+/// are untouched (pure buffer inflation). Views that fail to decode abort
+/// the load — half-inflated geometry must never reach the ops.
+fn inflateMeshopt(data: *c.cgltf_data) Error!void {
+    var any = false;
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count)) |*v| {
+        if (v.has_meshopt_compression != 0) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return;
+    if (!mc.have_codec) return error.Unsupported;
+    var inflated: usize = 0;
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count)) |*v| {
+        if (v.has_meshopt_compression == 0) continue;
+        const e = &v.meshopt_compression;
+        const src_buf = e.buffer orelse return error.InvalidGlb;
+        const bd = src_buf.*.data orelse return error.InvalidGlb;
+        const bsize: usize = @intCast(src_buf.*.size);
+        const off: usize = @intCast(e.offset);
+        const sz: usize = @intCast(e.size);
+        if (off > bsize or sz > bsize - off) return error.InvalidGlb;
+        const base: [*]const u8 = @ptrCast(bd);
+        const src = base[off .. off + sz];
+        const stride: usize = @intCast(e.stride);
+        const count: usize = @intCast(e.count);
+        if (stride == 0 or count == 0) return error.InvalidGlb;
+        const total = std.math.mul(usize, count, stride) catch return error.InvalidGlb;
+        const vsize: usize = @intCast(v.size);
+        // cgltf's fixup already asserted size == stride * count; re-check
+        // (overflow-safe) since ReleaseFast trusts every slice below.
+        if (total != vsize) return error.InvalidGlb;
+
+        const mem = mcAlloc(data, total) orelse return error.OutOfMemory;
+        const dst = mem[0..total];
+        const failed = blk: {
+            if (e.mode == c.cgltf_meshopt_compression_mode_attributes) {
+                mc.decodeVertices(dst, src, count, stride) catch break :blk true;
+                const f = e.filter;
+                if (f == c.cgltf_meshopt_compression_filter_octahedral) {
+                    mc.decodeFilterOct(dst, count, stride) catch break :blk true;
+                } else if (f == c.cgltf_meshopt_compression_filter_quaternion) {
+                    mc.decodeFilterQuat(dst, count, stride) catch break :blk true;
+                } else if (f == c.cgltf_meshopt_compression_filter_exponential) {
+                    mc.decodeFilterExp(dst, count, stride) catch break :blk true;
+                } else if (f == c.cgltf_meshopt_compression_filter_color) {
+                    mc.decodeFilterColor(dst, count, stride) catch break :blk true;
+                } else if (f != c.cgltf_meshopt_compression_filter_none) {
+                    break :blk true;
+                }
+            } else if (e.mode == c.cgltf_meshopt_compression_mode_triangles) {
+                if (e.filter != c.cgltf_meshopt_compression_filter_none) break :blk true;
+                mc.decodeIndices(dst, src, count, stride, false) catch break :blk true;
+            } else if (e.mode == c.cgltf_meshopt_compression_mode_indices) {
+                if (e.filter != c.cgltf_meshopt_compression_filter_none) break :blk true;
+                mc.decodeIndices(dst, src, count, stride, true) catch break :blk true;
+            } else {
+                break :blk true;
+            }
+            break :blk false;
+        };
+        if (failed) {
+            mcFree(data, mem);
+            return error.DecodeFailed;
+        }
+        v.data = mem;
+        v.has_meshopt_compression = 0;
+        // The stale placeholder (buffer/offset) is dead — every reader
+        // prefers v.data, and cgltf_validate still sees the consistent
+        // original layout. The writer re-emits these views as plain data.
+        inflated += 1;
+    }
+    if (inflated > 0) trimDeadBuffers(data);
+}
+
+/// Drop trailing buffers referenced only by inflated (data-carrying) views:
+/// a meshopt file's placeholder buffer is dead once its views carry decoded
+/// bytes. The array itself is never reallocated, so stale pointers stay
+/// valid — the count just hides them, and `cgltf_free` still releases the
+/// whole array. Only dataless, uri-less buffers are trimmed, so no payload
+/// is orphaned and single-buffer downstream ops (quantize `meshopt_compression`
+/// anchors new payloads at buffer 0) keep working.
+fn trimDeadBuffers(data: *c.cgltf_data) void {
+    while (data.buffers_count > 1) {
+        const last: usize = data.buffers_count - 1;
+        const buf: *c.cgltf_buffer = @ptrCast(&data.buffers[last]);
+        if (@intFromPtr(buf.data) != 0) break;
+        if (@intFromPtr(buf.uri) != 0) break;
+        var pinned = false;
+        for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count)) |*v| {
+            if (v.data != null) continue; // inflated: self-contained
+            if (@intFromPtr(v.buffer) == @intFromPtr(buf)) {
+                pinned = true;
+                break;
+            }
+        }
+        if (pinned) break;
+        data.buffers_count = last;
+    }
+}
+
 /// Every accessor with plain (uncompressed, loaded) buffer data must fit in
-/// its view. Skips views that are missing, compressed (meshopt/draco payload
-/// sizes differ from decoded sizes), or extension-owned — those stay
-/// downstream-checked.
+/// its view. Skips views that are missing, draco-compressed (payload sizes
+/// differ from decoded sizes), or extension-owned — those stay
+/// downstream-checked. (Meshopt views are inflated at load, so they validate
+/// as plain views here.)
 fn validateAccessors(data: *c.cgltf_data) Error!void {
     for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
         const bv_ptr = acc.buffer_view orelse continue; // viewless: nothing to bound
@@ -593,6 +729,62 @@ fn convWrap(v: c_uint) model.Wrap {
 fn indexOf(skins: [*]const c.cgltf_skin, ptr: *const c.cgltf_skin) usize {
     const byte_off = @intFromPtr(ptr) - @intFromPtr(skins);
     return byte_off / @sizeOf(c.cgltf_skin);
+}
+
+test "loadFile inflates meshopt views to plain data" {
+    // Real-world meshopt fixture (Arena rock, 4 compressed views, no
+    // images): the loader must decode every view so ops see plain data.
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var loaded = try loadFile(io, a, "test/fixtures/compressed/rock_mc.glb");
+    defer loaded.deinit();
+
+    // No compressed view survives: every view carries decoded bytes.
+    for (sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count)) |*v| {
+        try std.testing.expectEqual(@as(c_int, 0), v.has_meshopt_compression);
+        try std.testing.expect(@intFromPtr(v.data) != 0);
+    }
+    // The dead placeholder buffer is trimmed: single-buffer downstream.
+    try std.testing.expectEqual(@as(usize, 1), loaded.cdata.buffers_count);
+    // Accessor metadata is untouched by the inflation (pure buffer swap).
+    try std.testing.expectEqual(@as(usize, 4), loaded.cdata.accessors_count);
+    const accs = sl(c.cgltf_accessor, loaded.cdata.accessors, loaded.cdata.accessors_count);
+    try std.testing.expectEqual(@as(usize, 3219), accs[0].count);
+    try std.testing.expectEqual(@as(usize, 3219), accs[1].count);
+    try std.testing.expectEqual(@as(usize, 3219), accs[2].count);
+    try std.testing.expectEqual(@as(usize, 5151), accs[3].count);
+    // Decompressed view sizes match stride * count (f32x3, f32x3, f32x2, u16).
+    const views = sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
+    try std.testing.expectEqual(@as(usize, 3219 * 12), views[0].size);
+    try std.testing.expectEqual(@as(usize, 3219 * 12), views[1].size);
+    try std.testing.expectEqual(@as(usize, 3219 * 8), views[2].size);
+    try std.testing.expectEqual(@as(usize, 5151 * 2), views[3].size);
+    // Model level: node name, mesh shape, primitive counts preserved.
+    try std.testing.expectEqual(@as(usize, 1), loaded.asset.nodes.len);
+    try std.testing.expectEqualStrings("Rocks", loaded.asset.nodes[0].name.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.asset.meshes.len);
+    const prim = loaded.asset.meshes[0].primitives[0];
+    try std.testing.expectEqual(@as(u32, 3219), prim.vertex_count);
+    try std.testing.expectEqual(@as(u32, 5151), prim.index_count);
+    try std.testing.expect(prim.indexed);
+    // The inflated scene validates clean.
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(loaded.cdata)),
+    );
+}
+
+test "webp image sniffs mime and dims" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var loaded = try loadFile(io, a, "test/fixtures/webp/image_webp.glb");
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.asset.images.len);
+    const img = loaded.asset.images[0];
+    try std.testing.expectEqual(model.Mime.webp, img.mime);
+    try std.testing.expect(img.has_dims);
+    try std.testing.expectEqual(@as(u32, 8), img.width);
+    try std.testing.expectEqual(@as(u32, 8), img.height);
 }
 
 test "scanGlbChunks" {

@@ -7,6 +7,7 @@ pub const formats = @import("tex/formats.zig");
 pub const mips = @import("tex/mips.zig");
 pub const encode_ktx = @import("tex/encode_ktx.zig");
 pub const preset = @import("pipeline/preset.zig");
+pub const spec_json = @import("pipeline/spec_json.zig");
 pub const runner = @import("pipeline/runner.zig");
 pub const prune = @import("ops/prune.zig");
 pub const dedup = @import("ops/dedup.zig");

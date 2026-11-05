@@ -18,6 +18,7 @@ typedef struct basset_basisu_params {
     int32_t max_size;    // reserved: caller pre-downscales; 0 = unset
     int32_t srgb;        // sRGB transfer function / perceptual metrics
     int32_t uastc_level; // 0..4 UASTC pack level
+    int32_t supercompression; // 0 = none, 1 = zstd (UASTC KTX2 payload)
 } basset_basisu_params;
 
 // Idempotent, thread-safe. Returns 0 on success, -1 on failure.

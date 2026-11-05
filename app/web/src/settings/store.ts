@@ -12,6 +12,7 @@ import type {
   Language,
   Settings,
   SettingsStatus,
+  Supercompression,
   TextureFormat,
   TextureOverride,
   ThemeMode,
@@ -219,6 +220,7 @@ function cleanOverride(patch: TextureOverride): TextureOverride {
   if (patch.generate_mips !== undefined) out.generate_mips = patch.generate_mips;
   if (patch.skip !== undefined) out.skip = patch.skip;
   if (patch.normal_map !== undefined) out.normal_map = patch.normal_map;
+  if (patch.supercompression !== undefined) out.supercompression = patch.supercompression;
   return out;
 }
 
@@ -269,6 +271,7 @@ export interface EffectiveTextureParams {
   max_size: number;
   generate_mips: boolean;
   normal_map?: boolean;
+  supercompression: Supercompression;
   skip: boolean;
 }
 
@@ -284,6 +287,7 @@ export function effectiveTextureParams(
     quality: base.quality,
     max_size: base.max_size,
     generate_mips: base.generate_mips,
+    supercompression: base.supercompression,
     skip: false,
   };
   for (const o of getTextureOverrides(sourcePath)) {
@@ -293,6 +297,7 @@ export function effectiveTextureParams(
     if (o.max_size !== undefined) eff.max_size = o.max_size;
     if (o.generate_mips !== undefined) eff.generate_mips = o.generate_mips;
     if (o.normal_map !== undefined) eff.normal_map = o.normal_map;
+    if (o.supercompression !== undefined) eff.supercompression = o.supercompression;
     if (o.skip !== undefined) eff.skip = o.skip;
   }
   return eff;
@@ -320,6 +325,9 @@ export function describeTextureDeviation(
     parts.push(eff.generate_mips ? t("tex.devMips") : t("tex.devNoMips"));
   }
   if (eff.normal_map) parts.push(t("tex.devNormal"));
+  if (eff.supercompression !== base.supercompression) {
+    parts.push(eff.supercompression === "zstd" ? t("tex.devZstd") : t("tex.devNoZstd"));
+  }
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 

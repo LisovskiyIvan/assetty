@@ -44,10 +44,11 @@ fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
 }
 
 fn viewBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
-    // Meshopt-compressed views keep the COMPRESSED payload in `data` while
-    // `size` reports the DECOMPRESSED length: slice the payload, not the view.
-    // (Parsed files without a linked decoder have `data == null` here and
-    // correctly fall through to the graceful `error.Unsupported` in serialize.)
+    // Writer-produced meshopt views (quantize `meshopt_compression`) keep the
+    // COMPRESSED payload in `data` while `size` reports the DECOMPRESSED
+    // length: slice the payload, not the view. (Parsed meshopt files are
+    // inflated at load, so they never take this branch — only fresh op
+    // output does.)
     if (v.has_meshopt_compression != 0) {
         const d = v.data orelse return null;
         const p: [*]const u8 = @ptrCast(d);
@@ -237,6 +238,18 @@ fn isEmptyObjSlice(s: []const u8) bool {
         if (ch != ' ' and ch != '\t' and ch != '\n' and ch != '\r') return false;
     }
     return true;
+}
+
+/// Entries of an extensionsUsed/Required list that survive emission: the
+/// meshopt declaration is dropped once its views are inflated to plain data.
+fn keptExtCount(list: [*c][*c]u8, n: usize, has_mc: bool) usize {
+    if (has_mc) return n;
+    var n_kept: usize = 0;
+    for (sl([*c]u8, @ptrCast(list), n)) |p| {
+        if (std.mem.eql(u8, cstr(p) orelse "", "EXT_meshopt_compression")) continue;
+        n_kept += 1;
+    }
+    return n_kept;
 }
 
 fn writeExtras(o: *Out, extras: *const c.cgltf_extras) !void {
@@ -709,7 +722,14 @@ fn writeBufferView(o: *Out, ctx: *const Ctx, i: usize, v: *const c.cgltf_buffer_
         try o.key("name");
         try o.str(s);
     }
-    if (ptrIndex(c.cgltf_buffer, ctx.d.buffers, ctx.d.buffers_count, v.buffer)) |bi| {
+    if (ctx.d.buffers_count > 0) {
+        // Single-buffer output: the BIN chunk holds every kept view, so all
+        // of them address buffer 0 (stale placeholder pointers on inflated
+        // meshopt input are ignored; writer-produced mc views take the
+        // dedicated branch above and never reach this).
+        try o.key("buffer");
+        try o.int(0);
+    } else if (ptrIndex(c.cgltf_buffer, ctx.d.buffers, ctx.d.buffers_count, v.buffer)) |bi| {
         try o.key("buffer");
         try o.int(bi);
     }
@@ -1652,20 +1672,15 @@ fn computeBounds(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !Bounds {
 /// Serialize `data` (parsed from `file_bytes`) into a self-contained GLB.
 ///
 /// All allocations are made with `a`.  Returns `error.Unsupported` when the
-/// asset cannot be represented as a single-buffer GLB (external buffer uri or
-/// meshopt-compressed data).
+/// asset cannot be represented as a single-buffer GLB (external buffer uri,
+/// or writer-produced meshopt output without exactly one real buffer).
+/// Inflated meshopt input (decoded at parse) serializes as plain views.
 pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8) ![]u8 {
     _ = file_bytes;
 
-    if (data.buffers_count > 1) return error.Unsupported;
     for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
         if (@intFromPtr(b.uri) != 0) return error.Unsupported;
     }
-    // Meshopt-compressed views are first-class: the BIN chunk carries the
-    // compressed payloads, each view's extension object points at them, and a
-    // placeholder buffer backs the decompressed layout (see spec: fallback
-    // buffers). Re-serializing a parsed meshopt file still fails gracefully
-    // (`viewBytes` finds no decoded data) — no decoder is linked.
 
     // --- reachability GC: which pool entries are actually referenced? ---
     const keep = try Keep.compute(a, data);
@@ -1689,6 +1704,16 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     // The compressed payloads live in buffer 0 (the BIN chunk): without any
     // real buffer there is nowhere to point the extension objects.
     if (has_mc and data.buffers_count == 0) return error.Unsupported;
+    if (has_mc) {
+        // Writer-produced meshopt output needs exactly one real buffer (the
+        // BIN payloads) plus the appended placeholder.
+        if (data.buffers_count != 1) return error.Unsupported;
+    }
+    // Plain path (!has_mc): the BIN chunk below carries every kept view's
+    // bytes (inflated meshopt views, concatenated multi-buffer input), so a
+    // single output buffer suffices however many inputs were parsed. Views
+    // whose bytes are unavailable still fail in the BIN loop with the same
+    // error as before.
 
     // --- BIN chunk: copy every kept buffer view, 4-byte aligned ---
     const view_off = try a.alloc(u64, data.buffer_views_count);
@@ -1843,11 +1868,11 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     if (data.buffers_count > 0) {
         try o.key("buffers");
         try o.beginArr();
-        for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
-            try o.item();
-            try writeBuffer(&o, &ctx, b);
-        }
         if (ctx.has_mc) {
+            for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
+                try o.item();
+                try writeBuffer(&o, &ctx, b);
+            }
             // Fallback buffer backing the decompressed layout (no URI, no
             // BIN data): loaders with the extension ignore it, loaders
             // without it fail on extensionsRequired, as the spec requires.
@@ -1864,6 +1889,13 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
             try o.endObj();
             try o.endObj();
             try o.endObj();
+        } else {
+            // Single-buffer output: the BIN chunk holds every kept view, so
+            // one entry (buffer 0's name/extras) describes it. Inflated
+            // meshopt input drops its dead placeholder buffer here.
+            try o.item();
+            const b0: *c.cgltf_buffer = @ptrCast(&data.buffers[0]);
+            try writeBuffer(&o, &ctx, b0);
         }
         try o.endArr();
     }
@@ -1972,21 +2004,27 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
 
     try writeExtras(&o, &data.extras);
 
-    if (data.extensions_used_count > 0) {
+    // Inflated meshopt input serializes as plain views: drop the extension
+    // declaration (writer-produced mc output keeps it verbatim).
+    if (keptExtCount(data.extensions_used, data.extensions_used_count, ctx.has_mc) > 0) {
         try o.key("extensionsUsed");
         try o.beginArr();
         for (sl([*c]u8, @ptrCast(data.extensions_used), data.extensions_used_count)) |p| {
+            const s = cstr(p) orelse "";
+            if (!ctx.has_mc and std.mem.eql(u8, s, "EXT_meshopt_compression")) continue;
             try o.item();
-            try o.str(cstr(p) orelse "");
+            try o.str(s);
         }
         try o.endArr();
     }
-    if (data.extensions_required_count > 0) {
+    if (keptExtCount(data.extensions_required, data.extensions_required_count, ctx.has_mc) > 0) {
         try o.key("extensionsRequired");
         try o.beginArr();
         for (sl([*c]u8, @ptrCast(data.extensions_required), data.extensions_required_count)) |p| {
+            const s = cstr(p) orelse "";
+            if (!ctx.has_mc and std.mem.eql(u8, s, "EXT_meshopt_compression")) continue;
             try o.item();
-            try o.str(cstr(p) orelse "");
+            try o.str(s);
         }
         try o.endArr();
     }
@@ -2406,4 +2444,50 @@ test "glb writer: computes missing POSITION min/max" {
     // idempotent
     const out2 = try serialize(a, p.data, out);
     try std.testing.expectEqualSlices(u8, out, out2);
+}
+
+test "glb writer: meshopt input serializes as plain views" {
+    // Fixture is inflated at load (see parse test): output must be a plain
+    // single-buffer GLB with no meshopt declarations, carrying the same
+    // values, and re-serializing must be byte-identical.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(std.testing.io, a, "test/fixtures/compressed/rock_mc.glb");
+    defer loaded.deinit();
+
+    const out1 = try serialize(a, loaded.cdata, loaded.map);
+    try std.testing.expect(std.mem.indexOf(u8, out1, "EXT_meshopt_compression") == null);
+
+    var p1 = try parseBytes(std.testing.allocator, out1);
+    defer p1.deinit();
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(p1.data)),
+    );
+    // Dead placeholder buffer is dropped: exactly one buffer, plain views.
+    try std.testing.expectEqual(@as(usize, 1), p1.data.buffers_count);
+    for (sl(c.cgltf_buffer_view, p1.data.buffer_views, p1.data.buffer_views_count)) |*v| {
+        try std.testing.expectEqual(@as(c_int, 0), v.has_meshopt_compression);
+    }
+    try std.testing.expectEqual(@as(usize, 0), p1.data.extensions_used_count);
+    try std.testing.expectEqual(@as(usize, 0), p1.data.extensions_required_count);
+
+    // Values survive the inflate -> serialize loop exactly (f32 positions /
+    // normals / uvs unpack identically; u16 indices compare as floats too).
+    try std.testing.expectEqual(loaded.cdata.accessors_count, p1.data.accessors_count);
+    const oa = sl(c.cgltf_accessor, loaded.cdata.accessors, loaded.cdata.accessors_count);
+    const na = sl(c.cgltf_accessor, p1.data.accessors, p1.data.accessors_count);
+    for (oa, na) |*o, *n| {
+        try std.testing.expectEqual(o.count, n.count);
+        try std.testing.expectEqual(o.component_type, n.component_type);
+        try std.testing.expectEqual(o.type, n.type);
+        const of = try readLogFloats(a, o);
+        const nf = try readLogFloats(a, n);
+        try std.testing.expectEqualSlices(f32, of, nf);
+    }
+
+    const out2 = try serialize(a, p1.data, out1);
+    try std.testing.expectEqualSlices(u8, out1, out2);
 }

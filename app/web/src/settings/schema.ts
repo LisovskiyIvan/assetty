@@ -4,6 +4,7 @@ import type { Lang } from "../i18n";
 export type ThemeMode = "dark" | "light";
 export type Language = Lang;
 export type TextureFormat = "auto" | "etc1s" | "uastc";
+export type Supercompression = "none" | "zstd";
 
 export interface PruneSettings {
   enabled: boolean;
@@ -38,6 +39,8 @@ export interface TextureSettings {
   /** 0 = keep the source size. */
   max_size: number;
   generate_mips: boolean;
+  /** KTX2 payload supercompression (UASTC only; "none" = off). */
+  supercompression: Supercompression;
 }
 
 /**
@@ -55,6 +58,7 @@ export interface TextureOverride {
   generate_mips?: boolean;
   skip?: boolean;
   normal_map?: boolean;
+  supercompression?: Supercompression;
 }
 
 export interface PerModelTextures {
@@ -114,6 +118,7 @@ export class SettingsError extends Error {}
 const THEMES: readonly ThemeMode[] = ["dark", "light"];
 const LANGUAGES: readonly Language[] = ["en", "ru"];
 const TEXTURE_FORMATS: readonly TextureFormat[] = ["auto", "etc1s", "uastc"];
+const SUPERCOMPRESSIONS: readonly Supercompression[] = ["none", "zstd"];
 
 export function defaultSettings(): Settings {
   return {
@@ -139,6 +144,7 @@ export function defaultSettings(): Settings {
           quality: 128,
           max_size: 0,
           generate_mips: true,
+          supercompression: "none",
         },
         quantize: { enabled: true, position_bits: 14, uv_bits: 12, normal_oct: true },
         simplify: {
@@ -374,6 +380,14 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
       "optimize.steps.textures.generate_mips",
       strict,
     ),
+    supercompression: readEnum(
+      textures,
+      "supercompression",
+      s.textures.supercompression,
+      SUPERCOMPRESSIONS,
+      "optimize.steps.textures.supercompression",
+      strict,
+    ),
   };
 
   const quantize = readObject(stepsRaw, "quantize", "optimize.steps.quantize", strict);
@@ -520,6 +534,18 @@ function sanitizeTextureOverride(
       );
     }
     out.format = v as TextureFormat;
+  }
+  if (raw["supercompression"] !== undefined) {
+    const v = raw["supercompression"];
+    if (typeof v !== "string" || !(SUPERCOMPRESSIONS as readonly string[]).includes(v)) {
+      return reject(
+        strict,
+        `${label}.supercompression`,
+        `must be one of ${SUPERCOMPRESSIONS.join(", ")}`,
+        null,
+      );
+    }
+    out.supercompression = v as Supercompression;
   }
   const num = (key: string, min: number, max: number): number | undefined => {
     if (raw[key] === undefined) return undefined;

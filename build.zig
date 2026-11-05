@@ -60,6 +60,85 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{ "-O3", "-DNDEBUG" },
     });
+    // libwebp v1.4.0 decoder-only (see vendor/webp/README.md): WebP becomes a
+    // decodable input image. Runtime-dispatched SIMD files are per-arch.
+    core_mod.addIncludePath(b.path("vendor/webp"));
+    core_mod.addCSourceFiles(.{
+        .root = b.path("vendor/webp"),
+        .files = &.{
+            "webp_impl.c",
+            "src/dec/alpha_dec.c",
+            "src/dec/buffer_dec.c",
+            "src/dec/frame_dec.c",
+            "src/dec/idec_dec.c",
+            "src/dec/io_dec.c",
+            "src/dec/quant_dec.c",
+            "src/dec/tree_dec.c",
+            "src/dec/vp8_dec.c",
+            "src/dec/vp8l_dec.c",
+            "src/dec/webp_dec.c",
+            "src/dsp/alpha_processing.c",
+            "src/dsp/cpu.c",
+            "src/dsp/dec.c",
+            "src/dsp/dec_clip_tables.c",
+            "src/dsp/filters.c",
+            "src/dsp/lossless.c",
+            "src/dsp/rescaler.c",
+            "src/dsp/upsampling.c",
+            "src/dsp/yuv.c",
+            "src/utils/bit_reader_utils.c",
+            "src/utils/color_cache_utils.c",
+            "src/utils/filters_utils.c",
+            "src/utils/huffman_utils.c",
+            "src/utils/palette.c",
+            "src/utils/quant_levels_dec_utils.c",
+            "src/utils/rescaler_utils.c",
+            "src/utils/random_utils.c",
+            "src/utils/thread_utils.c",
+            "src/utils/utils.c",
+        },
+        .flags = &.{ "-O3", "-DNDEBUG", "-w" },
+    });
+    const webp_arch = target.result.cpu.arch;
+    if (webp_arch == .x86_64) {
+        core_mod.addCSourceFiles(.{
+            .root = b.path("vendor/webp"),
+            .files = &.{
+                "src/dsp/alpha_processing_sse2.c",
+                "src/dsp/dec_sse2.c",
+                "src/dsp/filters_sse2.c",
+                "src/dsp/lossless_sse2.c",
+                "src/dsp/rescaler_sse2.c",
+                "src/dsp/upsampling_sse2.c",
+                "src/dsp/yuv_sse2.c",
+            },
+            .flags = &.{ "-O3", "-DNDEBUG", "-w", "-msse2" },
+        });
+        core_mod.addCSourceFiles(.{
+            .root = b.path("vendor/webp"),
+            .files = &.{
+                "src/dsp/dec_sse41.c",
+                "src/dsp/lossless_enc_sse41.c",
+                "src/dsp/upsampling_sse41.c",
+                "src/dsp/yuv_sse41.c",
+            },
+            .flags = &.{ "-O3", "-DNDEBUG", "-w", "-msse4.1" },
+        });
+    } else if (webp_arch == .aarch64) {
+        core_mod.addCSourceFiles(.{
+            .root = b.path("vendor/webp"),
+            .files = &.{
+                "src/dsp/alpha_processing_neon.c",
+                "src/dsp/dec_neon.c",
+                "src/dsp/filters_neon.c",
+                "src/dsp/lossless_neon.c",
+                "src/dsp/rescaler_neon.c",
+                "src/dsp/upsampling_neon.c",
+                "src/dsp/yuv_neon.c",
+            },
+            .flags = &.{ "-O3", "-DNDEBUG", "-w" },
+        });
+    }
     // OpenCL is a macOS-only acceleration path (and never enabled at runtime:
     // the wrapper passes use_opencl=false). Everywhere else basisu falls
     // back to CPU (basisu_opencl.cpp compiles to stubs when the define is 0).

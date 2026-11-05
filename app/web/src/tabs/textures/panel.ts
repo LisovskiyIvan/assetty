@@ -23,7 +23,7 @@ import {
   getSettings,
   getTextureOverrides,
 } from "../../settings";
-import type { TextureFormat, TextureOverride } from "../../settings";
+import type { Supercompression, TextureFormat, TextureOverride } from "../../settings";
 import type { EncodeResult, EncodeSettings, ImageInfo, TexturePreview } from "../../types";
 
 export interface CompareImages {
@@ -262,9 +262,14 @@ const OV_TERNARY: Array<[string, string]> = [
   ["yes", "yes"],
   ["no", "no"],
 ];
+const OV_ZSTD: Array<[string, string]> = [
+  ["base", "base"],
+  ["none", "none"],
+  ["zstd", "zstd"],
+];
 
 /** Localized caption for an override option value. */
-function ovLabel(group: "format" | "size" | "binary" | "ternary", value: string): string {
+function ovLabel(group: "format" | "size" | "binary" | "ternary" | "zstd", value: string): string {
   if (value === "base") return t("common.base");
   if (group === "size" && value === "original") return t("common.original");
   if (group === "binary") return value === "on" ? t("common.on") : t("common.off");
@@ -287,6 +292,7 @@ function overrideEditor(img: ImageInfo, cbs: SidePanelCbs): HTMLElement {
     if (found.max_size !== undefined) draft.max_size = found.max_size;
     if (found.generate_mips !== undefined) draft.generate_mips = found.generate_mips;
     if (found.normal_map !== undefined) draft.normal_map = found.normal_map;
+    if (found.supercompression !== undefined) draft.supercompression = found.supercompression;
     if (found.skip !== undefined) draft.skip = found.skip;
   }
 
@@ -299,7 +305,7 @@ function overrideEditor(img: ImageInfo, cbs: SidePanelCbs): HTMLElement {
   const mkSelect = (
     label: string,
     options: Array<[string, string]>,
-    group: "format" | "size" | "binary" | "ternary",
+    group: "format" | "size" | "binary" | "ternary" | "zstd",
     get: () => string,
     set: (value: string) => void,
     title?: string,
@@ -386,6 +392,18 @@ function overrideEditor(img: ImageInfo, cbs: SidePanelCbs): HTMLElement {
       },
       t("tex.normalHint"),
       "textures.normal_map",
+    ),
+    mkSelect(
+      "zstd",
+      OV_ZSTD,
+      "zstd",
+      () => draft.supercompression ?? "base",
+      (v) => {
+        if (v === "base") delete draft.supercompression;
+        else draft.supercompression = v as Supercompression;
+      },
+      t("tex.zstdHint"),
+      "textures.supercompression",
     ),
   );
 

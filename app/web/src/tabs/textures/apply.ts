@@ -121,6 +121,7 @@ export function createApplyFlow(nodes: ApplyBarNodes): ApplyFlow {
       generate_mips: override?.generate_mips ?? b.generate_mips,
       max_size: override?.max_size ?? b.max_size,
     };
+    if (b.supercompression !== "none") spec.supercompression = b.supercompression;
     if (override?.normal_map !== undefined) spec.normal_map = override.normal_map;
     const src = app.sourcePath;
     const list = getTextureOverrides(src);
@@ -133,7 +134,8 @@ export function createApplyFlow(nodes: ApplyBarNodes): ApplyFlow {
     const size = b.max_size === 0 ? t("common.original") : String(b.max_size);
     const n = textureOverridesCount(app.sourcePath);
     const base = `${b.format} · q${b.quality} · ${size} · mips ${b.generate_mips ? t("common.on") : t("common.off")}`;
-    return n > 0 ? `${base} · ${t("tex.paramsOv", { n })}` : base;
+    const zstd = b.supercompression === "zstd" ? ` · ${t("tex.devZstd")}` : "";
+    return n > 0 ? `${base}${zstd} · ${t("tex.paramsOv", { n })}` : `${base}${zstd}`;
   }
 
   function setApplyStatus(text: string): void {

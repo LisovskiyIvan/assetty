@@ -160,6 +160,9 @@ function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
       generate_mips: steps.textures.generate_mips,
       max_size: steps.textures.max_size,
     };
+    if (steps.textures.supercompression !== "none") {
+      textures.supercompression = steps.textures.supercompression;
+    }
     const overrides = getTextureOverrides(app.sourcePath);
     if (overrides.length > 0) textures.overrides = overrides.map((o) => ({ ...o }));
     out.push({ textures });
@@ -870,6 +873,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
             steps.textures.quality = Math.round(num(p.quality, 128, 1, 255));
             steps.textures.max_size = Math.round(num(p.max_size, 0, 0, 8192));
             steps.textures.generate_mips = flag(p.generate_mips, true);
+            if (p.supercompression === "zstd" || p.supercompression === "none") {
+              steps.textures.supercompression = p.supercompression;
+            }
             const list = p.overrides;
             if (Array.isArray(list)) {
               for (const item of list) {
@@ -898,6 +904,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
                 }
                 if (typeof fields.max_size === "number" && Number.isFinite(fields.max_size)) {
                   ov.max_size = Math.round(Math.min(8192, Math.max(0, fields.max_size)));
+                }
+                if (fields.supercompression === "zstd" || fields.supercompression === "none") {
+                  ov.supercompression = fields.supercompression;
                 }
                 for (const key of ["generate_mips", "skip", "normal_map"] as const) {
                   if (typeof fields[key] === "boolean") ov[key] = fields[key] as boolean;

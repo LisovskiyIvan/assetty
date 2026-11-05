@@ -17,6 +17,10 @@ pub const Error = error{
 
 pub const Mode = enum { etc1s, uastc };
 
+/// KTX2 payload supercompression. Only meaningful for UASTC (the basisu
+/// encoder ignores it for ETC1S); `zstd` writes supercompressionScheme=2.
+pub const Supercompression = enum { none, zstd };
+
 pub const Options = struct {
     mode: Mode = .etc1s,
     quality: u8 = 128,
@@ -26,6 +30,7 @@ pub const Options = struct {
     max_size: u32 = 0,
     srgb: bool = true,
     uastc_level: u3 = 2,
+    supercompression: Supercompression = .none,
 };
 
 pub const Output = struct {
@@ -89,6 +94,7 @@ pub fn encode(a: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, opts: Opti
     params.max_size = @intCast(opts.max_size);
     params.srgb = if (opts.srgb) 1 else 0;
     params.uastc_level = @intCast(opts.uastc_level);
+    params.supercompression = if (opts.supercompression == .zstd) 1 else 0;
 
     var out_ptr: ?[*]u8 = null;
     var out_len: usize = 0;
@@ -269,6 +275,51 @@ test "uastc 64x64 smoke" {
     const p = psnr(src, rt.pixels);
     std.debug.print("uastc 64x64: {d:.2} dB, {d} bytes, {s}\n", .{ p, out.ktx2.len, out.format_label });
     try std.testing.expect(p > 30.0);
+}
+
+test "uastc zstd supercompression header + decode roundtrip" {
+    const a = std.testing.allocator;
+    const src = try makeGradient(a, 64, 64);
+    defer a.free(src);
+
+    // Default: no supercompression (byte-compat with existing outputs).
+    const plain = try encode(a, src, 64, 64, .{ .mode = .uastc, .uastc_level = 2 });
+    defer a.free(plain.ktx2);
+    const plain_hdr = formats.parseHeader(plain.ktx2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 0), plain_hdr.supercompression);
+
+    // zstd: header scheme 2, smaller, still decodes to the same dims.
+    const z = try encode(a, src, 64, 64, .{ .mode = .uastc, .uastc_level = 2, .supercompression = .zstd });
+    defer a.free(z.ktx2);
+    const z_hdr = formats.parseHeader(z.ktx2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 2), z_hdr.supercompression);
+    try std.testing.expect(z.ktx2.len < plain.ktx2.len);
+
+    const rt = try decodeToRgba(a, z.ktx2);
+    defer a.free(rt.pixels);
+    try std.testing.expectEqual(@as(u32, 64), rt.width);
+    try std.testing.expectEqual(@as(u32, 64), rt.height);
+    const rt_plain = try decodeToRgba(a, plain.ktx2);
+    defer a.free(rt_plain.pixels);
+    const p_plain = psnr(src, rt_plain.pixels);
+    // zstd is lossless on the payload: same pixels as the plain encode.
+    try std.testing.expectEqual(@as(f32, 99.0), psnr(rt.pixels, rt_plain.pixels));
+    std.debug.print("uastc 64x64 plain {d} B vs zstd {d} B, psnr {d:.2}\n", .{ plain.ktx2.len, z.ktx2.len, p_plain });
+}
+
+test "zstd ignored for etc1s (scheme unchanged)" {
+    const a = std.testing.allocator;
+    const src = try makeGradient(a, 32, 32);
+    defer a.free(src);
+    const plain = try encode(a, src, 32, 32, .{ .mode = .etc1s });
+    defer a.free(plain.ktx2);
+    const out = try encode(a, src, 32, 32, .{ .mode = .etc1s, .supercompression = .zstd });
+    defer a.free(out.ktx2);
+    // ETC1S KTX2 always carries BASISLZ (1); the zstd flag must not change it.
+    const p_hdr = formats.parseHeader(plain.ktx2) orelse return error.TestUnexpectedResult;
+    const hdr = formats.parseHeader(out.ktx2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(p_hdr.supercompression, hdr.supercompression);
+    try std.testing.expectEqualSlices(u8, plain.ktx2, out.ktx2);
 }
 
 test "normal map smoke" {

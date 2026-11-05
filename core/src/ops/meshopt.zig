@@ -162,6 +162,31 @@ pub fn decodeFilterOct(buf: []u8, count: usize, stride: usize) Error!void {
     mo.meshopt_decodeFilterOct(buf.ptr, count, stride);
 }
 
+/// In-place quaternion decode of a decoded vertex buffer (stride must be 8).
+pub fn decodeFilterQuat(buf: []u8, count: usize, stride: usize) Error!void {
+    if (!have_codec) return error.CodecUnavailable;
+    if (buf.len != count * stride) return error.CodecFailed;
+    if (stride != 8) return error.CodecFailed;
+    mo.meshopt_decodeFilterQuat(buf.ptr, count, stride);
+}
+
+/// In-place exponential decode of a decoded vertex buffer (stride divisible
+/// by 4). Each 32-bit component is decoded in isolation.
+pub fn decodeFilterExp(buf: []u8, count: usize, stride: usize) Error!void {
+    if (!have_codec) return error.CodecUnavailable;
+    if (buf.len != count * stride) return error.CodecFailed;
+    if (stride == 0 or stride % 4 != 0) return error.CodecFailed;
+    mo.meshopt_decodeFilterExp(buf.ptr, count, stride);
+}
+
+/// In-place color (YCoCg) decode of a decoded vertex buffer (stride 4 or 8).
+pub fn decodeFilterColor(buf: []u8, count: usize, stride: usize) Error!void {
+    if (!have_codec) return error.CodecUnavailable;
+    if (buf.len != count * stride) return error.CodecFailed;
+    if (stride != 4 and stride != 8) return error.CodecFailed;
+    mo.meshopt_decodeFilterColor(buf.ptr, count, stride);
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -321,6 +346,69 @@ test "indices: triangle list round-trip" {
             seen[v - t] = true;
         }
         try testing.expect(seen[0] and seen[1] and seen[2]);
+    }
+}
+
+test "quaternion filter round-trip" {
+    try skipIfNoCodec();
+    const a = testing.allocator;
+    const count = 32;
+    var quats = try a.alloc(f32, count * 4);
+    defer a.free(quats);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, count) * std.math.pi * 2.0;
+        const half = t * 0.5;
+        const s = @sin(half);
+        quats[i * 4 + 0] = 0;
+        quats[i * 4 + 1] = 0;
+        quats[i * 4 + 2] = s;
+        quats[i * 4 + 3] = @cos(half);
+    }
+    const enc = try a.alloc(u8, count * 8);
+    defer a.free(enc);
+    mo.meshopt_encodeFilterQuat(enc.ptr, count, 8, 12, quats.ptr);
+    try decodeFilterQuat(enc, count, 8);
+    // Decoded quats are back on the unit sphere (component precision ~12-bit).
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        var len: f32 = 0;
+        for (0..4) |c| {
+            const v = std.mem.readInt(i16, enc[k * 8 + c * 2 ..][0..2], .little);
+            const f: f32 = @as(f32, @floatFromInt(v)) / 32767.0;
+            len += f * f;
+        }
+        try testing.expectApproxEqAbs(1.0, @sqrt(len), 0.01);
+    }
+}
+
+test "exponential filter round-trip (rock-style positions)" {
+    try skipIfNoCodec();
+    const a = testing.allocator;
+    const count = 64;
+    const stride = 12; // VEC3 f32, like decoded position data
+    const enc = try a.alloc(u8, count * stride);
+    defer a.free(enc);
+    // NOTE: the filter encoder reads a TIGHT vec3 array (count * stride/4
+    // floats) — no per-vertex padding, unlike the padded GLB layout.
+    var src = try a.alloc(f32, count * 3);
+    defer a.free(src);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const t: f32 = @as(f32, @floatFromInt(i)) * 0.11;
+        src[i * 3 + 0] = @sin(t) * 100.0;
+        src[i * 3 + 1] = @cos(t * 1.3) * 100.0;
+        src[i * 3 + 2] = t * 10.0;
+    }
+    // meshopt_EncodeExpSeparate = 0 (decode is mode-agnostic).
+    mo.meshopt_encodeFilterExp(enc.ptr, count, stride, 24, src.ptr, 0);
+    try decodeFilterExp(enc, count, stride);
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        for (0..3) |c| {
+            const got: f32 = @bitCast(std.mem.readInt(u32, enc[k * stride + c * 4 ..][0..4], .little));
+            try testing.expectApproxEqRel(src[k * 3 + c], got, 1e-6);
+        }
     }
 }
 

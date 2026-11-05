@@ -2209,34 +2209,18 @@ fn isStepName(name: []const u8) bool {
 /// JSON text itself (`{"steps":[...]}`) or a JSON string holding that text
 /// (`"{\"steps\":[...]}"`), whichever form the bridge delivers. `detail`
 /// receives the offending step name for `UnknownStep`/`BadParam`.
+///
+/// Shared with the CLI: the parse lives in `core.spec_json`, this is a thin
+/// error-set alias so the call sites below keep their `SpecError` type.
+/// TODO(cleanup): retire the dead parser helpers left below
+/// (`presetFromSpecValue`, `stepFromSpec`, `SpecParams`,
+/// `parseTextureOverrides`) once the app's spec tests move to core.
 fn customPresetFromSpec(
     a: std.mem.Allocator,
     spec: []const u8,
     detail: *[]const u8,
 ) SpecError!core.preset.Preset {
-    const text = std.mem.trim(u8, spec, " \t\r\n");
-    if (text.len == 0) return error.NoSteps;
-
-    if (text[0] == '"') {
-        // A JSON string value: unwrap it and parse the text it contains.
-        var outer = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
-            return error.InvalidSpec;
-        defer outer.deinit();
-        const inner = switch (outer.value) {
-            .string => |s| std.mem.trim(u8, s, " \t\r\n"),
-            else => return error.InvalidSpec,
-        };
-        if (inner.len == 0) return error.NoSteps;
-        var parsed = std.json.parseFromSlice(std.json.Value, a, inner, .{}) catch
-            return error.InvalidSpec;
-        defer parsed.deinit();
-        return presetFromSpecValue(a, parsed.value, detail);
-    }
-
-    var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch
-        return error.InvalidSpec;
-    defer parsed.deinit();
-    return presetFromSpecValue(a, parsed.value, detail);
+    return core.spec_json.parseSpec(a, spec, detail);
 }
 
 fn presetFromSpecValue(
@@ -2337,6 +2321,16 @@ const SpecParams = struct {
         };
         return std.meta.stringToEnum(core.preset.TextureFormat, s) orelse .auto;
     }
+
+    /// `"none"`/`"zstd"`; anything unrecognised falls back to `.none` (the
+    /// byte-compat default).
+    fn supercompressionField(self: *SpecParams, name: []const u8) SpecError!?core.encode_ktx.Supercompression {
+        const s = switch (self.get(name) orelse return null) {
+            .string => |s| s,
+            else => return self.bad(),
+        };
+        return std.meta.stringToEnum(core.encode_ktx.Supercompression, s) orelse .none;
+    }
 };
 
 /// Parse the textures step's `overrides` array (see the pipeline contract).
@@ -2382,6 +2376,11 @@ fn parseTextureOverrides(a: std.mem.Allocator, v: ?std.json.Value) SpecError![]c
         }
         if (fields.get("normal_map")) |nmv| {
             if (nmv == .bool) o.normal_map = nmv.bool;
+        }
+        if (fields.get("supercompression")) |scv| {
+            if (scv == .string) {
+                if (std.meta.stringToEnum(core.encode_ktx.Supercompression, scv.string)) |s| o.supercompression = s;
+            }
         }
         try out.append(a, o);
     }
@@ -2439,6 +2438,7 @@ fn stepFromSpec(
                 .normal_maps_renormalize = (try r.boolField("normal_maps_renormalize")) orelse d.normal_maps_renormalize,
                 .generate_mips = (try r.boolField("generate_mips")) orelse d.generate_mips,
                 .max_size = (try r.intField(u32, "max_size")) orelse d.max_size,
+                .supercompression = (try r.supercompressionField("supercompression")) orelse d.supercompression,
                 .overrides = try parseTextureOverrides(a, r.get("overrides")),
             } };
         },
@@ -3349,6 +3349,43 @@ test "custom spec maps textures overrides" {
     var detail2: []const u8 = "";
     const p2 = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{\"overrides\":[{\"image\":0}]}}]}", &detail2);
     try testing.expect(p2.steps[0].prune.unused_nodes);
+}
+
+test "custom spec maps textures supercompression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Step-level opt-in plus a per-image opt-out.
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"textures\":{\"format\":\"uastc\",\"supercompression\":\"zstd\",\"overrides\":[{\"image\":1,\"supercompression\":\"none\"}]}}]}",
+        &detail,
+    );
+    const tex = p.steps[0].textures;
+    try testing.expectEqual(core.encode_ktx.Supercompression.zstd, tex.supercompression);
+    try testing.expectEqual(@as(usize, 1), tex.overrides.len);
+    try testing.expectEqual(@as(?core.encode_ktx.Supercompression, .none), tex.overrides[0].supercompression);
+
+    // Omitted → none; unknown string → none (byte-compat default, not error).
+    for ([_][]const u8{
+        "{\"steps\":[{\"textures\":{}}]}",
+        "{\"steps\":[{\"textures\":{\"supercompression\":\"bogus\"}}]}",
+    }) |s| {
+        var d: []const u8 = "";
+        const q = try customPresetFromSpec(a, s, &d);
+        try testing.expectEqual(core.encode_ktx.Supercompression.none, q.steps[0].textures.supercompression);
+    }
+
+    // Unknown string inside an override leaves it unset.
+    var d3: []const u8 = "";
+    const r = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"textures\":{\"overrides\":[{\"name\":\"n\",\"supercompression\":\"bogus\"}]}}]}",
+        &d3,
+    );
+    try testing.expectEqual(@as(?core.encode_ktx.Supercompression, null), r.steps[0].textures.overrides[0].supercompression);
 }
 
 test "custom spec ignores malformed override items gracefully" {

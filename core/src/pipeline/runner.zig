@@ -306,6 +306,7 @@ pub const EffectiveTex = struct {
     max_size: u32,
     generate_mips: bool,
     normal_map: ?bool = null,
+    supercompression: preset.Supercompression,
 };
 
 /// Resolve the effective params for image `index` with optional cgltf
@@ -318,6 +319,7 @@ pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]cons
         .quality = p.quality,
         .max_size = p.max_size,
         .generate_mips = p.generate_mips,
+        .supercompression = p.supercompression,
     };
     for (p.overrides) |o| {
         if (!overrideMatches(o, index, name, uri)) continue;
@@ -327,6 +329,7 @@ pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]cons
         if (o.max_size) |m| eff.max_size = m;
         if (o.generate_mips) |g| eff.generate_mips = g;
         if (o.normal_map) |n| eff.normal_map = n;
+        if (o.supercompression) |s| eff.supercompression = s;
     }
     return eff;
 }
@@ -467,6 +470,7 @@ const ImageJob = struct {
     /// Effective normal flag, for the buffer-view bookkeeping.
     normal: bool,
     rdo_lambda: f32,
+    supercompression: encode_ktx.Supercompression,
 };
 
 const EncOutcome = struct {
@@ -522,6 +526,7 @@ fn encodeOneJob(scratch: std.mem.Allocator, job: ImageJob) EncOutcome {
         .generate_mips = job.generate_mips,
         .max_size = 0, // already downscaled
         .srgb = job.srgb,
+        .supercompression = job.supercompression,
     }) catch |err| return .{ .err = err };
 
     const owned = std.heap.c_allocator.dupe(u8, out.ktx2) catch return .{ .err = error.OutOfMemory };
@@ -716,6 +721,7 @@ fn encodeImagesSequential(
             .generate_mips = eff.generate_mips,
             .max_size = 0, // already downscaled
             .srgb = !eff_normal,
+            .supercompression = eff.supercompression,
         }) catch {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
@@ -777,6 +783,7 @@ fn encodeImagesParallel(
             .srgb = !eff_normal,
             .normal = eff_normal,
             .rdo_lambda = p.rdo_lambda,
+            .supercompression = eff.supercompression,
         });
     }
     if (jobs.items.len == 0) {
@@ -1237,6 +1244,16 @@ test "textures overrides: resolve order and matching" {
     const es = resolveTextureOverride(ps, 0, null, null);
     try testing.expect(!es.skip);
     try testing.expectEqual(@as(u32, 64), es.max_size);
+
+    // supercompression: base none, override last-wins.
+    try testing.expectEqual(preset.Supercompression.none, e1.supercompression);
+    const zovs = [_]preset.TextureOverride{
+        .{ .image = 1, .supercompression = .zstd },
+        .{ .name = "tex1", .supercompression = .none },
+    };
+    const zp: preset.TextureParams = .{ .supercompression = .zstd, .overrides = &zovs };
+    try testing.expectEqual(preset.Supercompression.none, resolveTextureOverride(zp, 1, "tex1", null).supercompression);
+    try testing.expectEqual(preset.Supercompression.zstd, resolveTextureOverride(zp, 2, "other", null).supercompression);
 }
 
 test "textures overrides: skip keeps source bytes, name override changes format" {
@@ -1388,5 +1405,128 @@ test "textures: 4 images encode in parallel, image order preserved" {
 
         const ref_view: *const c.cgltf_buffer_view = @ptrCast(ref.buffer_view.?);
         try testing.expectEqualSlices(u8, geom.viewData(ref_view).?, geom.viewData(view).?);
+    }
+}
+
+test "textures: zstd supercompression sequential vs parallel identical" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dim: u32 = 256;
+    const pngs = try a.alloc([]const u8, 2);
+    for (pngs, 0..) |*png, i| {
+        const px = try testGradient(a, dim, dim, @intCast(17 * (i + 1)));
+        png.* = try decode.encodePngRgba(a, px, dim, dim);
+    }
+    const in_path = ".zig-cache/pipeline_runner_texzstd.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = in_path, .data = try testGlbWithImages(a, pngs) });
+    defer std.Io.Dir.cwd().deleteFile(io, in_path) catch {};
+
+    // One override flips image 1 back to none: exercises the per-image path.
+    const ovs = [_]preset.TextureOverride{.{ .image = 1, .supercompression = .none }};
+    const tex_params: preset.TextureParams = .{
+        .format = .uastc,
+        .quality = 128,
+        .generate_mips = false,
+        .supercompression = .zstd,
+        .overrides = &ovs,
+    };
+
+    var seq_loaded = try parse.loadFile(io, a, in_path);
+    defer seq_loaded.deinit();
+    const seq = try encodeTexturesWith(a, seq_loaded, tex_params, .desktop, 1, null);
+    try testing.expectEqual(@as(u32, 2), seq.encoded);
+
+    var par_loaded = try parse.loadFile(io, a, in_path);
+    defer par_loaded.deinit();
+    // Exercise the parallel path even for 2 images.
+    const par = try encodeTexturesWith(a, par_loaded, tex_params, .desktop, 4, null);
+    try testing.expectEqual(seq.encoded, par.encoded);
+    try testing.expectEqual(seq.skipped, par.skipped);
+    try testing.expectEqual(seq.ktx_bytes, par.ktx_bytes);
+
+    const seq_images = geom.sl(c.cgltf_image, seq_loaded.cdata.images, seq_loaded.cdata.images_count);
+    const par_images = geom.sl(c.cgltf_image, par_loaded.cdata.images, par_loaded.cdata.images_count);
+    for (seq_images, par_images, 0..) |*s, *q, i| {
+        const sv: *const c.cgltf_buffer_view = @ptrCast(s.buffer_view.?);
+        const qv: *const c.cgltf_buffer_view = @ptrCast(q.buffer_view.?);
+        const sb = geom.viewData(sv).?;
+        try testing.expectEqualSlices(u8, sb, geom.viewData(qv).?);
+        const hdr = formats.parseHeader(sb) orelse return error.TestUnexpectedResult;
+        // Image 0 inherits zstd, image 1's override disables it.
+        try testing.expectEqual(if (i == 0) @as(u32, 2) else @as(u32, 0), hdr.supercompression);
+    }
+}
+
+test "textures e2e: DamagedHelmet uastc plain vs zstd" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const path = "test/fixtures/real/DamagedHelmet.glb";
+    const base_params: preset.TextureParams = .{
+        .format = .uastc,
+        .quality = 128,
+        .generate_mips = true,
+    };
+    const zstd_params: preset.TextureParams = .{
+        .format = .uastc,
+        .quality = 128,
+        .generate_mips = true,
+        .supercompression = .zstd,
+    };
+
+    var plain_loaded = try parse.loadFile(io, a, path);
+    defer plain_loaded.deinit();
+    const plain = try encodeTexturesWith(a, plain_loaded, base_params, .desktop, 4, null);
+    try testing.expect(plain.encoded > 0);
+
+    var z_loaded = try parse.loadFile(io, a, path);
+    defer z_loaded.deinit();
+    const z = try encodeTexturesWith(a, z_loaded, zstd_params, .desktop, 4, null);
+    try testing.expectEqual(plain.encoded, z.encoded);
+
+    // Header schemes: 0 without, 2 (zstd) with — on every encoded image.
+    const plain_images = geom.sl(c.cgltf_image, plain_loaded.cdata.images, plain_loaded.cdata.images_count);
+    const z_images = geom.sl(c.cgltf_image, z_loaded.cdata.images, z_loaded.cdata.images_count);
+    for (plain_images, z_images) |*pi, *zi| {
+        const pv: *const c.cgltf_buffer_view = @ptrCast(pi.buffer_view orelse continue);
+        const zv: *const c.cgltf_buffer_view = @ptrCast(zi.buffer_view orelse continue);
+        const pb = geom.viewData(pv) orelse continue;
+        const zb = geom.viewData(zv) orelse continue;
+        if (!std.mem.eql(u8, pb[0..12], &formats.magic)) continue; // skipped (non-embedded) image
+        const ph = formats.parseHeader(pb) orelse continue;
+        const zh = formats.parseHeader(zb) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(u32, 0), ph.supercompression);
+        try testing.expectEqual(@as(u32, 2), zh.supercompression);
+        std.debug.print("helmet uastc {d}x{d}: plain {d} B -> zstd {d} B\n", .{ zh.width, zh.height, pb.len, zb.len });
+    }
+    std.debug.print("helmet uastc total: plain {d} B -> zstd {d} B\n", .{ plain.ktx_bytes, z.ktx_bytes });
+    try testing.expect(z.ktx_bytes < plain.ktx_bytes);
+
+    // ETC1S ignores the flag: same bytes as the no-flag encode (ETC1S KTX2
+    // always carries BASISLZ, not NONE — the flag must change nothing).
+    const e_base: preset.TextureParams = .{ .format = .etc1s, .quality = 128, .generate_mips = true };
+    var e_loaded = try parse.loadFile(io, a, path);
+    defer e_loaded.deinit();
+    const e_plain = try encodeTexturesWith(a, e_loaded, e_base, .web, 4, null);
+    var ez_loaded = try parse.loadFile(io, a, path);
+    defer ez_loaded.deinit();
+    const e_base_z: preset.TextureParams = .{ .format = .etc1s, .quality = 128, .generate_mips = true, .supercompression = .zstd };
+    const e_z = try encodeTexturesWith(a, ez_loaded, e_base_z, .web, 4, null);
+    try testing.expectEqual(e_plain.encoded, e_z.encoded);
+    try testing.expectEqual(e_plain.ktx_bytes, e_z.ktx_bytes);
+    const e_images = geom.sl(c.cgltf_image, e_loaded.cdata.images, e_loaded.cdata.images_count);
+    const ez_images = geom.sl(c.cgltf_image, ez_loaded.cdata.images, ez_loaded.cdata.images_count);
+    for (e_images, ez_images) |*im, *jm| {
+        const v: *const c.cgltf_buffer_view = @ptrCast(im.buffer_view orelse continue);
+        const w: *const c.cgltf_buffer_view = @ptrCast(jm.buffer_view orelse continue);
+        const b = geom.viewData(v) orelse continue;
+        const bz = geom.viewData(w) orelse continue;
+        if (!std.mem.eql(u8, b[0..12], &formats.magic)) continue;
+        try testing.expectEqualSlices(u8, b, bz);
     }
 }

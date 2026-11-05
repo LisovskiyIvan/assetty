@@ -112,7 +112,14 @@ extern "C" int basset_basisu_encode(const uint8_t* rgba, int32_t w, int32_t h,
 
     cp.m_create_ktx2_file = true;
     cp.m_ktx2_srgb_transfer_func = srgb && !normal_map;
-    cp.m_ktx2_uastc_supercompression = basist::KTX2_SS_NONE;
+    // zstd supercompression applies to the UASTC payload only; the encoder
+    // ignores it for ETC1S (can_use_zstd is false there), but gate here too
+    // so the intent is explicit. BASISD_SUPPORT_KTX2_ZSTD defaults to 1 in
+    // the vendored transcoder/encoder, and zstd.c is compiled into the
+    // build — no extra define needed.
+    const bool zstd = params && params->supercompression != 0;
+    cp.m_ktx2_uastc_supercompression =
+        (zstd && uastc) ? basist::KTX2_SS_ZSTANDARD : basist::KTX2_SS_NONE;
 
     basisu::image src(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     std::memcpy(src.get_ptr(), rgba, static_cast<size_t>(w) * static_cast<size_t>(h) * 4);

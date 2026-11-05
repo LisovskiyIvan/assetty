@@ -138,6 +138,7 @@ const en: Dict = {
   "opt.hint.weld": "merge duplicate vertices",
   "opt.hint.join": "merge primitives sharing a material",
   "opt.hint.textures": "KTX2 / basis encode",
+  "opt.zstdUastcOnly": "zstd supercompression applies to UASTC only",
   "opt.hint.quantize": "attribute bit packing",
   "opt.hint.simplify": "decimate triangles",
   "opt.autoLabel": "auto:",
@@ -329,6 +330,9 @@ const en: Dict = {
   "tex.devMips": "mips",
   "tex.devNoMips": "no-mips",
   "tex.devNormal": "normal",
+  "tex.devZstd": "zstd",
+  "tex.devNoZstd": "no-zstd",
+  "tex.zstdHint": "supercompression: zstd-compress the UASTC payload (smaller file, same VRAM)",
   "tex.kvFormat": "format",
   "tex.kvStored": "stored",
   "tex.kvSize": "size",
@@ -480,6 +484,8 @@ const en: Dict = {
     "Generates the mip chain for minified sampling. Sharper, shimmer-free minification at ~33% more VRAM; almost always keep on.",
   "help.textures.normal_map":
     "Encodes with normal-map settings (renormalization, no sRGB). Required for correct lighting on normal maps; using it on color textures washes them out.",
+  "help.textures.supercompression":
+    "Zstd-compresses the UASTC KTX2 payload (supercompressionScheme=2). 20–40% smaller files at the same pixels — no VRAM change — but the loader must support KTX2 zstd supercompression (Babylon.js does). UASTC only; ignored for ETC1S.",
   "help.quantize.position_bits":
     "Quantizes vertex positions to this many bits (14 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
   "help.quantize.uv_bits":
@@ -599,6 +605,7 @@ const ru: Dict = {
   "opt.hint.weld": "склейка совпадающих вершин",
   "opt.hint.join": "склейка примитивов с общим материалом",
   "opt.hint.textures": "кодирование KTX2 / basis",
+  "opt.zstdUastcOnly": "zstd-суперкомпрессия применяется только к UASTC",
   "opt.hint.quantize": "упаковка атрибутов в биты",
   "opt.hint.simplify": "прореживание треугольников",
   "opt.autoLabel": "авто:",
@@ -790,6 +797,9 @@ const ru: Dict = {
   "tex.devMips": "мипы",
   "tex.devNoMips": "без мипов",
   "tex.devNormal": "нормал",
+  "tex.devZstd": "zstd",
+  "tex.devNoZstd": "без-zstd",
+  "tex.zstdHint": "суперкомпрессия: zstd-сжатие UASTC (меньше файл, тот же VRAM)",
   "tex.kvFormat": "формат",
   "tex.kvStored": "хранение",
   "tex.kvSize": "размер",
@@ -930,6 +940,8 @@ const ru: Dict = {
     "Ужимает длинную сторону до этого числа пикселей (0 = оригинал). Уполовинивание каждой стороны четвертует VRAM и диск ценой потери резкости текстур.",
   "help.textures.generate_mips":
     "Генерирует цепочку мипов для минификации. Резкая минификация без мерцания ценой ~33% VRAM; почти всегда оставляйте включённым.",
+  "help.textures.supercompression":
+    "Zstd-сжимает UASTC-полезную нагрузку KTX2 (supercompressionScheme=2). Файлы на 20–40% меньше при тех же пикселях — VRAM не меняется — но загрузчик должен поддерживать zstd-суперкомпрессию KTX2 (Babylon.js умеет). Только UASTC; для ETC1S игнорируется.",
   "help.textures.normal_map":
     "Кодирует как карту нормалей (ренормализация, без sRGB). Нужно для корректного света на normal maps; на цветных текстурах выцветает картинка.",
   "help.quantize.position_bits":

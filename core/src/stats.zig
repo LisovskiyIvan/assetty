@@ -197,7 +197,7 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     var uncompressed: std.ArrayList(u32) = .empty;
     for (asset.images, 0..) |img, i| {
         switch (img.mime) {
-            .png, .jpeg => {
+            .png, .jpeg, .webp => {
                 try no_mips.append(a, @intCast(i));
                 if (asset.is_glb and img.data != null) try uncompressed.append(a, @intCast(i));
             },

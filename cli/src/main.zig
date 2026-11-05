@@ -11,8 +11,16 @@ const usage =
     \\  assetty info <file.glb> [--json]
     \\  assetty textures <file.glb> [--encode N] [--json]
     \\  assetty presets
-    \\  assetty optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>] [--strip-animations]
-    \\  assetty --version          — print the build version
+    \\  assetty optimize <file.glb> --preset <name|path.zon|path.json> [-o <out.glb>] [--report <r.json>] [--strip-animations]
+    \\  assetty optimize <a.glb> <b.glb> ... --preset <name|path.zon|path.json> [--out-dir <dir>] [--report <r.json>] [--strip-animations]
+    \\
+    \\Batch: multiple inputs are processed one by one from their sources into
+    \\--out-dir (default: each input's own directory) as <stem>_opt.glb; an
+    \\output equal to its input is refused. -o/--out is single-input only.
+    \\--report with one input writes that file's report object; with several it
+    \\writes {"count","succeeded","failed","total_secs","files":[...]} where each
+    \\entry is a report object or {"input","error"}. Failures never stop the
+    \\batch; the exit code is 0 only when every file succeeds.
     \\
     \\Exit codes: 0 ok, 2 error
 ;
@@ -545,16 +553,29 @@ fn cmdPresets() !u8 {
 
 /// Resolve a `--preset` argument to a preset value.
 ///
-/// * a path (contains `/` or ends with `.zon`) is loaded as-is;
-/// * a bare name tries `presets/<name>.zon`, then `test/<name>.zon` (the test
-///   presets live there), and finally falls back to the built-in platform
-///   defaults when the name is `.mobile` / `.desktop` / `.web`.
-fn resolvePreset(io: std.Io, a: std.mem.Allocator, spec: []const u8) !core.preset.Preset {
+/// * a path ending in `.json` is parsed as a JSON step spec (see
+///   `core.spec_json`; `detail` names the offending step/field on failure);
+/// * a path (contains `/`) or ending in `.zon` is loaded as-is;
+/// * a bare name tries `presets/<name>.json`, then `presets/<name>.zon`, then
+///   `test/<name>.zon` (the test presets live there), and finally falls back
+///   to the built-in platform defaults when the name is
+///   `mobile` / `desktop` / `web`.
+fn resolvePreset(io: std.Io, a: std.mem.Allocator, spec: []const u8, detail: *[]const u8) !core.preset.Preset {
+    if (std.mem.endsWith(u8, spec, ".json")) {
+        return core.spec_json.parseSpecFile(io, a, spec, detail);
+    }
     if (std.mem.indexOfScalar(u8, spec, '/') != null or std.mem.endsWith(u8, spec, ".zon")) {
         return core.preset.loadFile(io, a, spec);
     }
 
     var buf: [256]u8 = undefined;
+    const jpath = std.fmt.bufPrint(&buf, "presets/{s}.json", .{spec}) catch "";
+    if (jpath.len > 0) {
+        if (core.spec_json.parseSpecFile(io, a, jpath, detail)) |p| {
+            return p;
+        } else |_| {}
+    }
+
     const path = core.preset.defaultPath(spec, &buf);
     if (path.len > 0) {
         if (core.preset.loadFile(io, a, path)) |p| {
@@ -655,6 +676,11 @@ fn deltaJson(w: anytype, before: u64, after: u64) !void {
     try w.writeByte('}');
 }
 
+/// Same shape as the app's `writeOptimize` (see app/src/json.zig), so one
+/// consumer parses both: per-step `"secs"`, the `"animations"` delta, the
+/// `"before"`/`"after"` snapshots and top-level `"total_secs"`. The only
+/// deliberate delta is `"texture_images"`, which is always present here (empty
+/// when the preset has no overrides) instead of omitted.
 fn printOptimizeJson(
     w: anytype,
     file_path: []const u8,
@@ -677,6 +703,21 @@ fn printOptimizeJson(
         try jsonStr(w, st.kind);
         try w.print(", \"applied\": {s}, \"note\": ", .{if (st.applied) "true" else "false"});
         try jsonStr(w, st.note);
+        try w.print(", \"secs\": {d:.4}", .{st.secs});
+        // The textures step also carries the per-image rows (same data as the
+        // root `texture_images`, placed on the step where the page looks).
+        if (std.mem.eql(u8, st.kind, "textures") and rep.texture_images.len > 0) {
+            try w.writeAll(", \"images\": [");
+            for (rep.texture_images, 0..) |im, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.print("{{\"index\":{d},\"name\":", .{im.index});
+                try jsonStrOpt(w, im.name);
+                try w.writeAll(",\"format\":");
+                try jsonStr(w, im.format);
+                try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
+            }
+            try w.writeByte(']');
+        }
         try w.writeByte('}');
     }
     try w.writeAll("\n  ],\n  \"deltas\": {");
@@ -691,29 +732,87 @@ fn printOptimizeJson(
     try deltaJson(w, rep.before.vram_total, rep.after.vram_total);
     try w.writeAll(",\n    \"disk_bytes\": ");
     try deltaJson(w, rep.before.disk_total, rep.after.disk_total);
-    try w.writeAll("\n  }");
-    if (rep.texture_images.len > 0) {
-        try w.writeAll(",\n  \"texture_images\": [");
-        for (rep.texture_images, 0..) |im, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
-            try jsonStrOpt(w, im.name);
-            try w.writeAll(",\"format\":");
-            try jsonStr(w, im.format);
-            try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
-        }
-        try w.writeAll("\n  ]");
+    try w.writeAll(",\n    \"animations\": ");
+    try deltaJson(w, rep.before.animations, rep.after.animations);
+    try w.writeAll("\n  },\n  \"before\": {\"triangles\":");
+    try w.print("{d},\"vertices\":{d},\"draw_calls\":{d},\"vram\":{d},\"disk\":{d}", .{
+        rep.before.triangles,
+        rep.before.vertices,
+        rep.before.draw_calls,
+        rep.before.vram_total,
+        rep.before.disk_total,
+    });
+    try w.writeAll("},\n  \"after\": {\"triangles\":");
+    try w.print("{d},\"vertices\":{d},\"draw_calls\":{d},\"vram\":{d},\"disk\":{d}", .{
+        rep.after.triangles,
+        rep.after.vertices,
+        rep.after.draw_calls,
+        rep.after.vram_total,
+        rep.after.disk_total,
+    });
+    try w.writeAll("},\n  \"texture_images\": [");
+    for (rep.texture_images, 0..) |im, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
+        try jsonStrOpt(w, im.name);
+        try w.writeAll(",\"format\":");
+        try jsonStr(w, im.format);
+        try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
     }
-    try w.writeAll("\n}\n");
+    try w.writeAll(if (rep.texture_images.len > 0) "\n  ]" else "]");
+    try w.print(", \n  \"total_secs\": {d:.3}\n}}\n", .{rep.total_secs});
+}
+
+/// Render one file's report object (see `printOptimizeJson`).
+fn renderSingleReport(
+    a: std.mem.Allocator,
+    file_path: []const u8,
+    out_path: []const u8,
+    p: core.preset.Preset,
+    rep: core.runner.Report,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    try printOptimizeJson(&aw.writer, file_path, out_path, p, rep);
+    return aw.toOwnedSlice();
+}
+
+/// Render `{"input","error"}` for a file the batch could not process.
+fn renderErrorEntry(a: std.mem.Allocator, file_path: []const u8, err_name: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"input\": ");
+    try jsonStr(w, file_path);
+    try w.writeAll(", \"error\": ");
+    try jsonStr(w, err_name);
+    try w.writeByte('}');
+    return aw.toOwnedSlice();
+}
+
+/// `<stem>_opt.glb` inside `out_dir` (or the input's own directory when null).
+fn batchOutPath(a: std.mem.Allocator, input: []const u8, out_dir: ?[]const u8) ![]u8 {
+    const base = std.fs.path.basename(input);
+    const stem = std.fs.path.stem(base);
+    // Dotfiles (".glb") have no real stem — fall back like an empty one.
+    const clean: []const u8 = if (stem.len == 0 or (base.len > 0 and base[0] == '.' and std.mem.eql(u8, stem, base)))
+        "model"
+    else
+        stem;
+    if (out_dir) |d| return std.fmt.allocPrint(a, "{s}/{s}_opt.glb", .{ d, clean });
+    const dir = std.fs.path.dirname(input);
+    if (dir == null or dir.?.len == 0) return std.fmt.allocPrint(a, "{s}_opt.glb", .{clean});
+    return std.fmt.allocPrint(a, "{s}/{s}_opt.glb", .{ dir.?, clean });
 }
 
 fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    var input: ?[]const u8 = null;
+    var inputs: std.ArrayList([]const u8) = .empty;
     var preset_spec: ?[]const u8 = null;
     var out_arg: ?[]const u8 = null;
+    var out_dir_arg: ?[]const u8 = null;
     var report_arg: ?[]const u8 = null;
     var strip_animations = false;
 
@@ -738,6 +837,15 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
             out_arg = args[i];
         } else if (std.mem.startsWith(u8, a, "--out=")) {
             out_arg = a["--out=".len..];
+        } else if (std.mem.eql(u8, a, "--out-dir")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("optimize: --out-dir needs a directory\n", .{});
+                return 2;
+            }
+            out_dir_arg = args[i];
+        } else if (std.mem.startsWith(u8, a, "--out-dir=")) {
+            out_dir_arg = a["--out-dir=".len..];
         } else if (std.mem.eql(u8, a, "--report")) {
             i += 1;
             if (i >= args.len) {
@@ -750,16 +858,20 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
         } else if (std.mem.eql(u8, a, "--strip-animations")) {
             strip_animations = true;
         } else if (!std.mem.startsWith(u8, a, "-")) {
-            if (input == null) input = a;
+            try inputs.append(gpa, a);
         }
     }
 
-    const file_path = input orelse {
+    if (inputs.items.len == 0) {
         std.debug.print("optimize: missing <file.glb>\n", .{});
         return 2;
-    };
+    }
+    if (inputs.items.len > 1 and out_arg != null) {
+        std.debug.print("optimize: -o/--out takes a single input; use --out-dir for batch\n", .{});
+        return 2;
+    }
     const spec = preset_spec orelse {
-        std.debug.print("optimize: missing --preset <name|path.zon>\n", .{});
+        std.debug.print("optimize: missing --preset <name|path.zon|path.json>\n", .{});
         return 2;
     };
 
@@ -767,14 +879,19 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var p = resolvePreset(io, a, spec) catch |err| switch (err) {
+    var detail: []const u8 = "";
+    var p = resolvePreset(io, a, spec, &detail) catch |err| switch (err) {
         error.UnknownPreset => {
-            std.debug.print("optimize: unknown preset '{s}' (expected mobile/desktop/web or a .zon file)\n", .{spec});
+            std.debug.print("optimize: unknown preset '{s}' (expected mobile/desktop/web, a .zon file or a .json spec)\n", .{spec});
             return 2;
         },
         error.OutOfMemory => return err,
         else => |e| {
-            std.debug.print("optimize: preset '{s}': {s}\n", .{ spec, @errorName(e) });
+            if (detail.len > 0) {
+                std.debug.print("optimize: preset '{s}': {s} ('{s}')\n", .{ spec, @errorName(e), detail });
+            } else {
+                std.debug.print("optimize: preset '{s}': {s}\n", .{ spec, @errorName(e) });
+            }
             return 2;
         },
     };
@@ -790,12 +907,33 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
         p.steps = steps;
     }
 
-    const out_path = out_arg orelse blk: {
+    if (inputs.items.len == 1) {
+        return runSingle(init, a, inputs.items[0], out_arg, report_arg, p);
+    }
+    return runBatch(init, a, inputs.items, out_dir_arg, report_arg, p);
+}
+
+/// One file: the historical behavior. `out_override` is `-o/--out`, else
+/// `<stem>.opt.glb` in the working directory.
+fn runSingle(
+    init: std.process.Init,
+    a: std.mem.Allocator,
+    file_path: []const u8,
+    out_override: ?[]const u8,
+    report_arg: ?[]const u8,
+    p: core.preset.Preset,
+) !u8 {
+    const io = init.io;
+    const out_path = out_override orelse blk: {
         const base = std.fs.path.basename(file_path);
         const ext = std.fs.path.extension(base);
         const stem = if (ext.len > 0) base[0 .. base.len - ext.len] else base;
         break :blk try std.fmt.allocPrint(a, "{s}.opt.glb", .{stem});
     };
+    if (std.mem.eql(u8, out_path, file_path)) {
+        std.debug.print("optimize: refusing to overwrite input {s}\n", .{file_path});
+        return 2;
+    }
 
     const rep = core.runner.run(io, a, file_path, .{
         .preset = p,
@@ -812,17 +950,183 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     try w.flush();
 
     if (report_arg) |rp| {
-        var json_buf: [16 * 1024]u8 = undefined;
-        var jw = std.Io.Writer.fixed(&json_buf);
-        printOptimizeJson(&jw, file_path, out_path, p, rep) catch |err| {
-            std.debug.print("optimize: report {s}: {s}\n", .{ rp, @errorName(err) });
-            return 2;
-        };
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rp, .data = jw.buffered() }) catch |err| {
+        const doc = try renderSingleReport(a, file_path, out_path, p, rep);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rp, .data = doc }) catch |err| {
             std.debug.print("optimize: report {s}: {s}\n", .{ rp, @errorName(err) });
             return 2;
         };
     }
 
     return 0;
+}
+
+/// Many files: each runs from its own source into `--out-dir` (or the input's
+/// directory) as `<stem>_opt.glb`. Failures are collected and reported, the
+/// rest of the batch still runs; the exit code is 0 only when all succeed.
+fn runBatch(
+    init: std.process.Init,
+    a: std.mem.Allocator,
+    inputs: []const []const u8,
+    out_dir_arg: ?[]const u8,
+    report_arg: ?[]const u8,
+    p: core.preset.Preset,
+) !u8 {
+    const io = init.io;
+    if (out_dir_arg) |d| {
+        std.Io.Dir.cwd().createDirPath(io, d) catch |err| {
+            std.debug.print("optimize: out dir {s}: {s}\n", .{ d, @errorName(err) });
+            return 2;
+        };
+    }
+
+    var entries: std.ArrayList([]const u8) = .empty;
+    var succeeded: usize = 0;
+    var failed: usize = 0;
+    var total_secs: f64 = 0;
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var wtr = std.Io.File.stdout().writer(io, &stdout_buf);
+    const w = &wtr.interface;
+
+    for (inputs) |file_path| {
+        const out_path = batchOutPath(a, file_path, out_dir_arg) catch |err| {
+            std.debug.print("optimize: {s}: {s}\n", .{ file_path, @errorName(err) });
+            try entries.append(a, try renderErrorEntry(a, file_path, @errorName(err)));
+            failed += 1;
+            continue;
+        };
+        if (std.mem.eql(u8, out_path, file_path)) {
+            std.debug.print("optimize: {s}: refusing to overwrite input\n", .{file_path});
+            try entries.append(a, try renderErrorEntry(a, file_path, "OutputIsInput"));
+            failed += 1;
+            continue;
+        }
+        const rep = core.runner.run(io, a, file_path, .{
+            .preset = p,
+            .out_path = out_path,
+        }) catch |err| {
+            std.debug.print("optimize: {s}: {s}\n", .{ file_path, @errorName(err) });
+            try entries.append(a, try renderErrorEntry(a, file_path, @errorName(err)));
+            failed += 1;
+            continue;
+        };
+        try printOptimizeHuman(w, file_path, out_path, p, rep);
+        try entries.append(a, try renderSingleReport(a, file_path, out_path, p, rep));
+        succeeded += 1;
+        total_secs += rep.total_secs;
+    }
+    try w.print("{d} ok, {d} failed\n", .{ succeeded, failed });
+    try w.flush();
+
+    if (report_arg) |rp| {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        errdefer aw.deinit();
+        const jw = &aw.writer;
+        try jw.print("{{\n  \"count\": {d},\n  \"succeeded\": {d},\n  \"failed\": {d},\n  \"total_secs\": {d:.3},\n  \"files\": [", .{
+            inputs.len, succeeded, failed, total_secs,
+        });
+        for (entries.items, 0..) |doc, idx| {
+            if (idx > 0) try jw.writeByte(',');
+            try jw.writeByte('\n');
+            try jw.writeAll("    ");
+            for (doc) |ch| {
+                try jw.writeByte(ch);
+                if (ch == '\n') try jw.writeAll("    ");
+            }
+        }
+        try jw.writeAll("\n  ]\n}\n");
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rp, .data = aw.written() }) catch |err| {
+            std.debug.print("optimize: report {s}: {s}\n", .{ rp, @errorName(err) });
+            return 2;
+        };
+    }
+
+    return if (failed == 0) 0 else 2;
+}
+
+// ---------------------------------------------------------------------------
+// Tests (pure helpers + report shapes; end-to-end runs go through the binary)
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "batch out path uses the input dir and the _opt stem" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("models/box_opt.glb", try batchOutPath(a, "models/box.glb", null));
+    try testing.expectEqualStrings("box_opt.glb", try batchOutPath(a, "box.glb", null));
+    try testing.expectEqualStrings("/tmp/batch/box_opt.glb", try batchOutPath(a, "models/box.glb", "/tmp/batch"));
+    try testing.expectEqualStrings("model_opt.glb", try batchOutPath(a, ".glb", null));
+}
+
+test "single report carries secs, total_secs and always texture_images" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const steps = [_]core.runner.StepStatus{
+        .{ .kind = "prune", .applied = true, .note = "removed 1 node(s)", .secs = 0.5 },
+        .{ .kind = "textures", .applied = true, .note = "encoded 1 image(s)", .secs = 1.25 },
+    };
+    const images = [_]core.runner.TextureImageOutcome{
+        .{ .index = 0, .name = "base", .skipped = false, .format = "uastc" },
+    };
+    const rep: core.runner.Report = .{
+        .steps = &steps,
+        .before = .{ .triangles = 100, .vertices = 50, .animations = 2 },
+        .after = .{ .triangles = 50, .vertices = 25, .animations = 0 },
+        .texture_images = &images,
+        .total_secs = 1.75,
+    };
+    const p = core.preset.platformDefaults(.mobile);
+    const doc = try renderSingleReport(a, "in.glb", "out.glb", p, rep);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, doc, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectApproxEqAbs(@as(f64, 1.75), o.get("total_secs").?.float, 1e-3);
+    try testing.expectEqual(@as(usize, 1), o.get("texture_images").?.array.items.len);
+    const st = o.get("steps").?.array.items;
+    try testing.expect(st[0].object.get("secs") != null);
+    try testing.expect(st[1].object.get("images") != null);
+    try testing.expect(o.get("deltas").?.object.get("animations") != null);
+    try testing.expect(o.get("before") != null);
+    try testing.expect(o.get("after") != null);
+}
+
+test "single report without overrides still lists empty texture_images" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const steps = [_]core.runner.StepStatus{
+        .{ .kind = "prune", .applied = true, .note = "ok", .secs = 0.1 },
+    };
+    const rep: core.runner.Report = .{
+        .steps = &steps,
+        .before = .{},
+        .after = .{},
+        .total_secs = 0.1,
+    };
+    const p = core.preset.platformDefaults(.desktop);
+    const doc = try renderSingleReport(a, "in.glb", "out.glb", p, rep);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, doc, .{});
+    defer parsed.deinit();
+    const imgs = parsed.value.object.get("texture_images").?.array.items;
+    try testing.expectEqual(@as(usize, 0), imgs.len);
+}
+
+test "batch error entry is a parseable input/error object" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try renderErrorEntry(a, "missing.glb", "FileNotFound");
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, doc, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("missing.glb", parsed.value.object.get("input").?.string);
+    try testing.expectEqualStrings("FileNotFound", parsed.value.object.get("error").?.string);
 }

@@ -175,6 +175,7 @@ pub const Mime = enum {
     png,
     jpeg,
     ktx2,
+    webp,
     other,
 
     pub fn label(self: Mime) []const u8 {
@@ -182,6 +183,7 @@ pub const Mime = enum {
             .png => "png",
             .jpeg => "jpeg",
             .ktx2 => "ktx2",
+            .webp => "webp",
             .other => "other",
         };
     }

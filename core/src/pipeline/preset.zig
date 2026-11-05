@@ -131,6 +131,12 @@ pub const SimplifyParams = struct {
     weight_uv: f32 = 1.0,
 };
 
+/// KTX2 payload supercompression for the textures step. `zstd` compresses the
+/// UASTC payload (supercompressionScheme=2, −20–40% file size, no VRAM change;
+/// needs a KTX2 zstd-capable loader). Ignored for ETC1S. Default none keeps
+/// existing presets byte-identical.
+pub const Supercompression = @import("../tex/encode_ktx.zig").Supercompression;
+
 pub const TextureParams = struct {
     /// `auto` = ASTC (mobile), BC7 (desktop), ETC1S (web).
     format: TextureFormat = .auto,
@@ -143,6 +149,8 @@ pub const TextureParams = struct {
     generate_mips: bool = true,
     /// Downscale textures larger than this. 0 = no limit.
     max_size: u32 = 0,
+    /// zstd supercompression of the UASTC KTX2 payload.
+    supercompression: Supercompression = .none,
     /// Per-image overrides, applied in array order (last match wins).
     overrides: []const TextureOverride = &.{},
 };
@@ -162,6 +170,7 @@ pub const TextureOverride = struct {
     max_size: ?u32 = null,
     generate_mips: ?bool = null,
     normal_map: ?bool = null,
+    supercompression: ?Supercompression = null,
 };
 
 /// One pipeline step. The active field selects the operation.
@@ -339,13 +348,14 @@ pub fn describe(p: Preset, w: anytype) !void {
             ),
             .textures => |v| {
                 try w.print(
-                    "textures  format={s} quality={d} rdo_lambda={d} mips={} max_size={d}",
+                    "textures  format={s} quality={d} rdo_lambda={d} mips={} max_size={d} supercompression={s}",
                     .{
                         @tagName(v.format),
                         v.quality,
                         v.rdo_lambda,
                         v.generate_mips,
                         v.max_size,
+                        @tagName(v.supercompression),
                     },
                 );
                 if (v.overrides.len > 0) try w.print(" overrides={d}", .{v.overrides.len});
@@ -517,6 +527,42 @@ test "parse prune animations flag defaults true" {
     var w = std.Io.Writer.fixed(&buf);
     try describe(s, &w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "strip_animations") != null);
+}
+
+test "parse textures supercompression zon round-trip" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // Default: none (byte-compat for existing presets).
+    const d = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .textures = .{} } } }");
+    try testing.expectEqual(Supercompression.none, d.steps[0].textures.supercompression);
+
+    const src =
+        \\.{
+        \\    .name = "zc",
+        \\    .target = .desktop,
+        \\    .steps = .{
+        \\        .{ .textures = .{
+        \\            .format = .uastc,
+        \\            .supercompression = .zstd,
+        \\            .overrides = .{
+        \\                .{ .name = "normal", .supercompression = .none },
+        \\            },
+        \\        } },
+        \\    },
+        \\}
+    ;
+    const p = try parse(arena.allocator(), src);
+    const tex = p.steps[0].textures;
+    try testing.expectEqual(Supercompression.zstd, tex.supercompression);
+    try testing.expectEqual(@as(usize, 1), tex.overrides.len);
+    try testing.expectEqual(@as(?Supercompression, .none), tex.overrides[0].supercompression);
+
+    // describe reports it.
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(p, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "supercompression=zstd") != null);
 }
 
 test "parse rejects garbage" {

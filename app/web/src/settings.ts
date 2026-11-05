@@ -18,7 +18,8 @@
  *       "weld":     { "enabled": true, "tolerance": 0 },
  *       "join":     { "enabled": true },
  *       "textures": { "enabled": true, "format": "auto" | "etc1s" | "uastc",
- *                     "quality": 128, "max_size": 0, "generate_mips": true },
+ *                     "quality": 128, "max_size": 0, "generate_mips": true,
+ *                     "supercompression": "none" | "zstd" },
  *       "quantize": { "enabled": true, "position_bits": 14, "uv_bits": 12, "normal_oct": true },
  *       "simplify": { "enabled": false, "target_ratio": 0.5, "error_tolerance": 0.001,
  *                     "aggressive": false, "lock_borders": true,
@@ -27,7 +28,8 @@
  *     "per_model": {
  *       "<sourcePath>": { "textures": { "overrides": [
  *         { "image": 2, "format": "uastc", "quality": 200, "max_size": 512,
- *           "generate_mips": true, "skip": false, "normal_map": true },
+ *           "generate_mips": true, "skip": false, "normal_map": true,
+ *           "supercompression": "none" | "zstd" },
  *         { "name": "basecolor", "max_size": 1024 },
  *         { "image": 5, "skip": true }
  *       ] } }
@@ -65,6 +67,7 @@ export type {
   Settings,
   SettingsStatus,
   SimplifySettings,
+  Supercompression,
   TextureFormat,
   TextureOverride,
   TextureSettings,
