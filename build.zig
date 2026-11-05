@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
     // dev defaults. Consumed by `assetty --version` and the app's
     // updater bindings (appInfo/updateCheck/updateApply), which expect release
     // assets named per `app/src/update.zig`.
-    const version = b.option([]const u8, "version", "Semver of this build (no leading v)") orelse "0.1.0-dev";
+    const version = b.option([]const u8, "version", "Semver of this build (no leading v)") orelse "0.1.0";
     const repo = b.option([]const u8, "repo", "GitHub repo as owner/name (release feed)") orelse "LisovskiyIvan/assetty";
 
     // `config.has_app` is comptime-known, so a `-Dapp=false` CLI-only build
