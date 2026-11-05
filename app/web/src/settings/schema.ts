@@ -32,6 +32,18 @@ export interface JoinSettings {
   enabled: boolean;
 }
 
+export interface CompressSettings {
+  enabled: boolean;
+}
+
+export interface AnimopsSettings {
+  enabled: boolean;
+  /** Drop constant animation tracks (and snap static nodes). */
+  remove_constant_tracks: boolean;
+  /** Per-component equality tolerance for the constant check. */
+  epsilon: number;
+}
+
 export interface TextureSettings {
   enabled: boolean;
   format: TextureFormat;
@@ -65,6 +77,8 @@ export type TextureSlot = "base_color" | "normal" | "arm" | "occlusion" | "emiss
 export interface TextureRule {
   slot?: TextureSlot;
   name?: string;
+  /** Resolution priority: among matching rules the highest wins (ties → order). */
+  priority?: number;
   format?: TextureFormat;
   quality?: number;
   rdo_lambda?: number;
@@ -85,15 +99,17 @@ export interface TextureRule {
  * emissive, single-channel fallbacks, base-color fallbacks.
  */
 export const DEFAULT_TEXTURE_RULES: TextureRule[] = [
-  { max_side: 255, skip: true },
-  { name: "height", skip: true },
-  { name: "bump", skip: true },
-  { name: "disp", skip: true },
-  { name: "lut", skip: true },
-  { name: "data", skip: true },
-  { name: "shaderarray", skip: true },
-  { slot: "base_color", cutout: true, format: "uastc", srgb: true },
+  // Skips: strictest (project: shaderArray > data > lut > height > ...).
+  { priority: 90, max_side: 255, skip: true },
+  { priority: 90, name: "height", skip: true },
+  { priority: 90, name: "bump", skip: true },
+  { priority: 90, name: "disp", skip: true },
+  { priority: 90, name: "lut", skip: true },
+  { priority: 90, name: "data", skip: true },
+  { priority: 90, name: "shaderarray", skip: true },
+  // normal — strictest data class (beats baseColor slot rules).
   {
+    priority: 80,
     slot: "normal",
     format: "uastc",
     rdo_lambda: 0.5,
@@ -101,25 +117,69 @@ export const DEFAULT_TEXTURE_RULES: TextureRule[] = [
     srgb: false,
     normal_map: true,
   },
-  { slot: "arm", format: "uastc", rdo_lambda: 1.0, supercompression: "zstd", srgb: false },
-  { slot: "occlusion", format: "uastc", rdo_lambda: 1.0, supercompression: "zstd", srgb: false },
-  { slot: "emissive", format: "etc1s", srgb: true },
-  { name: "_orm", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_arm", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_rm", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "occlusionroughnessmetallic", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_roughness", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_metallic", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_occlusion", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_opacity", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_mask", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_ao", format: "uastc", supercompression: "zstd", srgb: false },
-  { name: "_basecolor", format: "etc1s", srgb: true },
-  { name: "_albedo", format: "etc1s", srgb: true },
-  { name: "_diffuse", format: "etc1s", srgb: true },
-  { name: "_bc", format: "etc1s", srgb: true },
-  { name: "_color", format: "etc1s", srgb: true },
-  { name: "_d", format: "etc1s", srgb: true },
+  {
+    priority: 80,
+    name: "_directx",
+    format: "uastc",
+    rdo_lambda: 0.5,
+    supercompression: "zstd",
+    srgb: false,
+    normal_map: true,
+  },
+  {
+    priority: 80,
+    name: "_n",
+    format: "uastc",
+    rdo_lambda: 0.5,
+    supercompression: "zstd",
+    srgb: false,
+    normal_map: true,
+  },
+  {
+    priority: 80,
+    name: "_base_n",
+    format: "uastc",
+    rdo_lambda: 0.5,
+    supercompression: "zstd",
+    srgb: false,
+    normal_map: true,
+  },
+  // arm (metallicRoughness + occlusion slot are the same "arm" class).
+  { priority: 70, slot: "arm", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 70, slot: "occlusion", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 70, name: "_orm", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 70, name: "_arm", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 70, name: "_rm", format: "uastc", supercompression: "zstd", srgb: false },
+  {
+    priority: 70,
+    name: "occlusionroughnessmetallic",
+    format: "uastc",
+    supercompression: "zstd",
+    srgb: false,
+  },
+  // single channel (Occlusion/Roughness/Metallic/Opacity/Mask/AO/M/R suffixes).
+  { priority: 65, name: "_roughness", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_metallic", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_occlusion", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_opacity", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_mask", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_ao", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_m", format: "uastc", supercompression: "zstd", srgb: false },
+  { priority: 65, name: "_r", format: "uastc", supercompression: "zstd", srgb: false },
+  // cutout / alpha baseColor (MASK/BLEND material): UASTC keeps alpha.
+  { priority: 60, slot: "base_color", cutout: true, format: "uastc", srgb: true },
+  // emissive.
+  { priority: 55, slot: "emissive", format: "etc1s", quality: 200, srgb: true },
+  { priority: 55, name: "_emissive", format: "etc1s", quality: 200, srgb: true },
+  { priority: 55, name: "_em", format: "etc1s", quality: 200, srgb: true },
+  // baseColor: project textureTool uses qlevel 200 for color.
+  { priority: 50, slot: "base_color", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_basecolor", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_albedo", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_diffuse", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_bc", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_color", format: "etc1s", quality: 200, srgb: true },
+  { priority: 50, name: "_d", format: "etc1s", quality: 200, srgb: true },
 ];
 
 /**
@@ -175,6 +235,8 @@ export interface OptimizeSteps {
   textures: TextureSettings;
   quantize: QuantizeSettings;
   simplify: SimplifySettings;
+  compress: CompressSettings;
+  animops: AnimopsSettings;
 }
 
 export interface Settings {
@@ -229,6 +291,8 @@ export function defaultSettings(): Settings {
           rules: [],
         },
         quantize: { enabled: true, position_bits: 14, uv_bits: 12, normal_oct: true },
+        compress: { enabled: false },
+        animops: { enabled: false, remove_constant_tracks: true, epsilon: 0.00001 },
         simplify: {
           enabled: false,
           target_ratio: 0.5,
@@ -589,6 +653,44 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
       0,
       10,
       "optimize.steps.simplify.weight_uv",
+      strict,
+    ),
+  };
+
+  const compress = readObject(stepsRaw, "compress", "optimize.steps.compress", strict);
+  s.compress = {
+    enabled: readBool(
+      compress,
+      "enabled",
+      s.compress.enabled,
+      "optimize.steps.compress.enabled",
+      strict,
+    ),
+  };
+
+  const animops = readObject(stepsRaw, "animops", "optimize.steps.animops", strict);
+  s.animops = {
+    enabled: readBool(
+      animops,
+      "enabled",
+      s.animops.enabled,
+      "optimize.steps.animops.enabled",
+      strict,
+    ),
+    remove_constant_tracks: readBool(
+      animops,
+      "remove_constant_tracks",
+      s.animops.remove_constant_tracks,
+      "optimize.steps.animops.remove_constant_tracks",
+      strict,
+    ),
+    epsilon: readNumber(
+      animops,
+      "epsilon",
+      s.animops.epsilon,
+      1e-9,
+      1,
+      "optimize.steps.animops.epsilon",
       strict,
     ),
   };

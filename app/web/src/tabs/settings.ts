@@ -66,7 +66,10 @@ function schemaSample(): string {
       "simplify": { "enabled": false, "target_ratio": 0.5,
                     "error_tolerance": 0.001, "aggressive": false,
                     "lock_borders": true, "use_attributes": false,
-                    "weight_normal": 1, "weight_uv": 1 }
+                    "weight_normal": 1, "weight_uv": 1 },
+      "compress": { "enabled": false },
+      "animops":  { "enabled": false, "remove_constant_tracks": true,
+                    "epsilon": 0.00001 }
     },
     "per_model": {
       "<sourcePath>": { "textures": { "overrides": [
@@ -108,7 +111,7 @@ export function mountSettings(): TabHandle {
   const infoText = el("span", { text: t("set.info") });
   const infoSchema = el("span", {
     class: "mono",
-    text: "{ theme, language, recent_dirs, viewer: { inspector_open }, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
+    text: "{ theme, language, recent_dirs, viewer: { inspector_open }, optimize: { steps: { prune, dedup, weld, join, textures, quantize, simplify, compress, animops }, per_model: { <sourcePath>: { textures: { overrides } } } } }",
   });
   const info = el("div", { class: "hint settings-info" }, infoText, infoSchema);
 

@@ -140,6 +140,8 @@ const en: Dict = {
   "opt.hint.textures": "KTX2 / basis encode",
   "opt.zstdUastcOnly": "zstd supercompression applies to UASTC only",
   "opt.hint.quantize": "attribute bit packing",
+  "opt.hint.compress": "meshopt all views",
+  "opt.hint.animops": "drop constant tracks",
   "opt.hint.simplify": "decimate triangles",
   "opt.autoLabel": "auto:",
   "opt.autoMobile": "mobile",
@@ -502,6 +504,12 @@ const en: Dict = {
     "Quantizes texture coordinates to this many bits (12 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
   "help.quantize.normal_oct":
     "Packs normals with octahedral encoding (2×8/16-bit instead of 3 floats). Much smaller vertex buffers; extension support is needed — very old viewers may render it wrong.",
+  "help.compress":
+    "Meshopt-compresses every eligible vertex and index buffer view (EXT_meshopt_compression, gltfpack -cc style) — including plain float geometry the quantize step left untouched. Much smaller disk size at identical vertices; the loader must support EXT_meshopt_compression.",
+  "help.animops.remove_constant_tracks":
+    "Drops animation channels whose every keyframe is identical, baking the value into the static node transform. Smaller file and faster load; the motion is unchanged. Re-run from the source to get the tracks back.",
+  "help.animops.epsilon":
+    "Per-component tolerance for the constant-track check. Larger values drop more tracks but risk flattening subtle motion; 0.00001 keeps only truly static tracks.",
   "help.compare.mode":
     "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
   "help.textures.overrides_note":
@@ -623,6 +631,8 @@ const ru: Dict = {
   "opt.hint.textures": "кодирование KTX2 / basis",
   "opt.zstdUastcOnly": "zstd-суперкомпрессия применяется только к UASTC",
   "opt.hint.quantize": "упаковка атрибутов в биты",
+  "opt.hint.compress": "meshopt всех вью",
+  "opt.hint.animops": "убрать статичные треки",
   "opt.hint.simplify": "прореживание треугольников",
   "opt.autoLabel": "авто:",
   "opt.autoMobile": "мобильный",
@@ -976,6 +986,12 @@ const ru: Dict = {
     "Квантует текстурные координаты до этого числа бит (12 ≈ почти без потерь). Большой выигрыш VRAM и диска за крошечную потерю точности; нужна поддержка KHR_mesh_quantization.",
   "help.quantize.normal_oct":
     "Упаковывает нормали октаэдральным кодированием (2×8/16 бит вместо 3 float). Намного компактнее вершинные буферы; нужно расширение — очень старые просмотрщики могут показать неверно.",
+  "help.compress":
+    "Сжимает meshopt все пригодные вершинные и индексные вью буфера (EXT_meshopt_compression, как gltfpack -cc) — включая обычную float-геометрию, которую шаг quantize не тронул. Намного меньше файл при тех же вершинах; загрузчик должен поддерживать EXT_meshopt_compression.",
+  "help.animops.remove_constant_tracks":
+    "Убирает каналы анимации, у которых все ключевые кадры одинаковы, запекая значение в статичный трансформ узла. Файл меньше и грузится быстрее; движение не меняется. Чтобы вернуть треки, перезапустите из источника.",
+  "help.animops.epsilon":
+    "Допуск покомпонентного сравнения для поиска статичных треков. Больше значение — больше треков уберётся, но можно сплющить едва заметное движение; 0.00001 оставляет только по-настоящему статичные треки.",
   "help.compare.mode":
     "«Рядом» показывает источник и результат бок о бок; «шторка» складывает их с перетаскиваемым разделителем. Камеры связаны — вращайте, оба вида двигаются.",
   "help.textures.overrides_note":

@@ -1319,11 +1319,15 @@ const AttrUse = struct {
 };
 
 /// Fold one vertex accessor into the census. Returns true when the view is
-/// ineligible (mixed strides, unreadable offsets).
+/// ineligible. Multi-accessor views (gltfpack packs many accessors at
+/// nonzero offsets into one view) are fine: containment is checked against
+/// the accessor's own span (`offset + (count-1)*stride + elem <= raw_len`),
+/// not against the view's first element.
 fn checkAttrElem(
     at: *const c.cgltf_attribute,
     is_morph: bool,
     v: *const c.cgltf_buffer_view,
+    raw_len: usize,
     use: *AttrUse,
     a: std.mem.Allocator,
 ) !bool {
@@ -1332,14 +1336,14 @@ fn checkAttrElem(
     const e: usize = c.cgltf_calc_size(acc.type, acc.component_type);
     if (e == 0) return true;
     const off: usize = @intCast(acc.offset);
+    const count: usize = @intCast(acc.count);
     const astride: usize = if (acc.stride != 0) @intCast(acc.stride) else e;
     if (astride < e) return true;
-    if (v.stride != 0) {
-        const s: usize = @intCast(v.stride);
-        if (off + e > s) return true;
-    } else {
-        if (off % e != 0) return true;
-    }
+    if (count == 0) return false; // empty accessor: claims no bytes
+    const span = std.math.mul(usize, count - 1, astride) catch return true;
+    const need = std.math.add(usize, span, e) catch return true;
+    if (off > raw_len or need > raw_len - off) return true;
+    if (v.stride == 0 and off % e != 0) return true;
     if (use.elem != 0 and use.elem != e) use.all_elem6 = false else use.elem = e;
     if (use.found and use.astride != astride) return true;
     use.astride = astride;
@@ -1392,12 +1396,12 @@ fn compressAttributes(
         for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
-                if (try checkAttrElem(at, false, v, &use, a)) return;
+                if (try checkAttrElem(at, false, v, raw.len, &use, a)) return;
             }
             for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
                 for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
                     if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
-                    if (try checkAttrElem(at, true, v, &use, a)) return;
+                    if (try checkAttrElem(at, true, v, raw.len, &use, a)) return;
                 }
             }
         }
@@ -1410,6 +1414,17 @@ fn compressAttributes(
     if (raw.len % base_stride != 0) return;
     const count: usize = raw.len / base_stride;
     if (count == 0) return;
+
+    // Layout-changing candidates (pad to 8, octahedral re-encode) rewrite
+    // the decoded element size, so they need the whole view to be one
+    // accessor at offset 0. Shared views (many accessors at packed offsets)
+    // only get the byte-exact direct encode, which never touches accessors.
+    var layout_ok = use.accs.items.len == 1;
+    if (layout_ok) {
+        const a0: *c.cgltf_accessor = @ptrCast(use.accs.items[0]);
+        layout_ok = a0.offset == 0 and
+            @as(usize, @intCast(a0.count)) * base_stride == raw.len;
+    }
 
     var best: ?[]u8 = null;
     defer if (best) |b| a.free(b);
@@ -1424,7 +1439,7 @@ fn compressAttributes(
         }
     }
     // Candidate 2: VEC3 zero-padded to 8.
-    if (use.all_elem6 and use.elem == 6) {
+    if (layout_ok and use.all_elem6 and use.elem == 6) {
         const padded = try a.alloc(u8, count * 8);
         defer a.free(padded);
         for (0..count) |k| {
@@ -1445,7 +1460,7 @@ fn compressAttributes(
     const oct_sem = use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_normal)) or use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent));
     const oct_elem_ok = (use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_normal)) and use.elem == 6) or
         (use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent)) and use.elem == 8);
-    if (oct_sem and oct_elem_ok and use.all_elem6 and !use.has_morph and use.all_signed_norm and opts.normal_oct) {
+    if (layout_ok and oct_sem and oct_elem_ok and use.all_elem6 and !use.has_morph and use.all_signed_norm and opts.normal_oct) {
         const f4 = try a.alloc(f32, count * 4);
         defer a.free(f4);
         const is_tangent = use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent));
@@ -1498,9 +1513,11 @@ fn compressAttributes(
 }
 
 /// Compress one index view (TRIANGLES for triangle lists, else INDICES).
-/// u8 indices widen to u16; every referencing accessor must cover the whole
-/// view (rotation within a triangle keeps per-triangle sets, so sub-range
-/// accessors would read shifted values — those views stay uncompressed).
+/// u8 indices widen to u16. Referencing accessors may tile the view (gltfpack
+/// packs many index ranges at packed offsets into one view): they must tile
+/// it EXACTLY — first offset 0, contiguous, last end == view length, uniform
+/// component size — so the whole view encodes as one stream and every
+/// accessor keeps its (rescaled) range. Partial coverage stays uncompressed.
 fn compressIndices(
     a: std.mem.Allocator,
     data: *c.cgltf_data,
@@ -1527,29 +1544,51 @@ fn compressIndices(
             } else if (s_orig != s) {
                 return;
             }
-            // Whole-view coverage only (see doc comment).
-            if (acc.offset != 0) return;
-            if (@as(usize, @intCast(acc.count)) * s != raw.len) return;
+            const off: usize = @intCast(acc.offset);
+            const cnt: usize = @intCast(acc.count);
+            if (off % s != 0) return;
+            const need = std.math.mul(usize, cnt, s) catch return;
+            if (off > raw.len or need > raw.len - off) return;
             try refs.append(a, acc);
         }
     }
     if (refs.items.len == 0 or s_orig == 0) return;
     if (raw.len % s_orig != 0) return;
+    // exact tiling, in offset order (insertion sort: few accessors per view)
+    std.mem.sort(*c.cgltf_accessor, refs.items, {}, struct {
+        fn lt(_: void, x: *c.cgltf_accessor, y: *c.cgltf_accessor) bool {
+            return x.offset < y.offset;
+        }
+    }.lt);
+    var cursor: usize = 0;
+    for (refs.items) |acc| {
+        const off: usize = @intCast(acc.offset);
+        const cnt: usize = @intCast(acc.count);
+        if (off != cursor) return; // gap or overlap: not exactly tiled
+        cursor += cnt * s_orig;
+    }
+    if (cursor != raw.len) return;
     const n_idx: usize = raw.len / s_orig;
     if (n_idx == 0) return;
 
     const idx = try a.alloc(u32, n_idx);
     defer a.free(idx);
-    switch (s_orig) {
-        1 => {
-            for (raw, 0..) |b, k| idx[k] = b;
-        },
-        2 => {
-            for (0..n_idx) |k| idx[k] = std.mem.readInt(u16, raw[k * 2 ..][0..2], .little);
-        },
-        else => {
-            for (0..n_idx) |k| idx[k] = std.mem.readInt(u32, raw[k * 4 ..][0..4], .little);
-        },
+    for (refs.items) |acc| {
+        const off: usize = @intCast(acc.offset);
+        const cnt: usize = @intCast(acc.count);
+        const base = off / s_orig;
+        const src = raw[off .. off + cnt * s_orig];
+        switch (s_orig) {
+            1 => {
+                for (src, 0..) |b, k| idx[base + k] = b;
+            },
+            2 => {
+                for (0..cnt) |k| idx[base + k] = std.mem.readInt(u16, src[k * 2 ..][0..2], .little);
+            },
+            else => {
+                for (0..cnt) |k| idx[base + k] = std.mem.readInt(u32, src[k * 4 ..][0..4], .little);
+            },
+        }
     }
     var idx_max: u32 = 0;
     for (idx) |ix| idx_max = @max(idx_max, ix);
@@ -1594,6 +1633,10 @@ fn compressIndices(
     try installPayload(data, a, v, enc);
     v.size = n_idx * s_new; // decoded length (widens u8 -> u16)
     for (refs.items) |acc| {
+        // byte offsets rescale with the element size (tiling is exact, so
+        // every offset is a multiple of s_orig)
+        const off: usize = @intCast(acc.offset);
+        acc.offset = off / s_orig * s_new;
         acc.component_type = if (s_new == 2) c.cgltf_component_type_r_16u else c.cgltf_component_type_r_32u;
         acc.stride = s_new;
     }
@@ -1614,7 +1657,9 @@ fn compressIndices(
 /// Ineligible views (sparse, images, animations, skins, instancing,
 /// interleaved-mixed, tiny, incompressible) stay uncompressed; the writer
 /// only marks views with `has_meshopt_compression`.
-fn compressViews(a: std.mem.Allocator, data: *c.cgltf_data, res: *Result, opts: Options) !void {
+/// Shared with the `compress` step (ops/compress.zig), which runs the same
+/// pass standalone over decoded-but-untouched float geometry.
+pub fn compressViews(a: std.mem.Allocator, data: *c.cgltf_data, res: *Result, opts: Options) !void {
     const n_views: usize = data.buffer_views_count;
     if (n_views == 0) return;
     const usage = try a.alloc(u8, n_views);
@@ -1689,8 +1734,9 @@ fn compressViews(a: std.mem.Allocator, data: *c.cgltf_data, res: *Result, opts: 
 }
 
 /// append `name` to extensions_used (required=true) or extensions_required;
-/// strings and the grown array are cgltf-memory owned (cgltf_free frees them)
-fn ensureExtension(data: *c.cgltf_data, name: []const u8, required: bool) !void {
+/// strings and the grown array are cgltf-memory owned (cgltf_free frees them).
+/// Shared with the `compress` step (ops/compress.zig).
+pub fn ensureExtension(data: *c.cgltf_data, name: []const u8, required: bool) !void {
     const mem = data.memory;
     const count_ptr = if (required) &data.extensions_required_count else &data.extensions_used_count;
     const list_ptr = if (required) &data.extensions_required else &data.extensions_used;

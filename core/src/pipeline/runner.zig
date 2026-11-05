@@ -32,6 +32,8 @@ const dedup = @import("../ops/dedup.zig");
 const weld = @import("../ops/weld.zig");
 const join = @import("../ops/join.zig");
 const quantize = @import("../ops/quantize.zig");
+const compress = @import("../ops/compress.zig");
+const animops = @import("../ops/animops.zig");
 const simplify = @import("../ops/simplify.zig");
 const geom = @import("../ops/geom.zig");
 const encode_ktx = @import("../tex/encode_ktx.zig");
@@ -214,6 +216,36 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     ),
                 };
             },
+            .animops => |p| blk: {
+                const res = try animops.run(a, loaded.cdata, loaded.map, .{
+                    .remove_constant_tracks = p.remove_constant_tracks,
+                    .epsilon = p.epsilon,
+                });
+                break :blk .{
+                    .kind = kind,
+                    .applied = res.channels_removed > 0 or res.animations_dropped > 0,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "removed {d} channel(s), dropped {d} animation(s), snapped {d} node(s)",
+                        .{ res.channels_removed, res.animations_dropped, res.nodes_snapped },
+                    ),
+                };
+            },
+            .compress => blk: {
+                const res = try compress.run(a, loaded.cdata, loaded.map, .{});
+                break :blk .{
+                    .kind = kind,
+                    .applied = res.meshopt_views > 0,
+                    .note = try std.fmt.allocPrint(
+                        a,
+                        "{d} meshopt view(s){s}",
+                        .{
+                            res.meshopt_views,
+                            if (res.meshopt_no_codec) "; meshopt requested but codec not linked" else "",
+                        },
+                    ),
+                };
+            },
             // step 4: encode embedded png/jpeg images to KTX2 (basisu)
             .textures => |p| blk: {
                 const res = encodeTextures(a, loaded, p, opts.preset.target, .{
@@ -363,13 +395,19 @@ pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]cons
     return resolveTextureFull(p, index, name, uri, .{});
 }
 
-/// Index of the first matching rule, or null. Exported so the runner can
-/// flag rule-driven runs as mixed.
+/// Index of the best-priority matching rule (ties → array order), or null.
+/// Exported so the runner can flag rule-driven runs as mixed.
 pub fn matchRuleIndex(p: preset.TextureParams, ctx: RuleCtx, name: ?[]const u8, uri: ?[]const u8) ?usize {
+    var best: ?usize = null;
+    var best_prio: i16 = std.math.minInt(i16);
     for (p.rules, 0..) |r, i| {
-        if (ruleMatches(r, ctx, name, uri)) return i;
+        if (!ruleMatches(r, ctx, name, uri)) continue;
+        if (best == null or r.priority > best_prio) {
+            best = i;
+            best_prio = r.priority;
+        }
     }
-    return null;
+    return best;
 }
 
 fn applyRule(eff: *EffectiveTex, r: preset.TexRule) void {
@@ -1462,6 +1500,33 @@ test "textures rules: first match wins, suffix, slot, skip" {
     const off: preset.TextureParams = .{ .format = .auto, .quality = 128, .rules = &rules };
     const e8 = resolveTextureFull(off, 0, "wall_BC", null, .{ .slots = normal_bit, .min_side = 1024 });
     try testing.expectEqual(preset.TextureFormat.auto, e8.format);
+
+    // priorities mirror the project's "strictest type wins": a _NMR-named
+    // texture in the baseColor slot must take the arm rule, not baseColor.
+    const prio = [_]preset.TexRule{
+        .{ .priority = 90, .max_side = 255, .skip = true },
+        .{ .priority = 80, .slot = .normal, .format = .uastc, .srgb = false, .normal_map = true },
+        .{ .priority = 70, .slot = .arm, .format = .uastc, .supercompression = .zstd, .srgb = false },
+        .{ .priority = 70, .name = "_NMR", .format = .uastc, .supercompression = .zstd, .srgb = false },
+        .{ .priority = 50, .slot = .base_color, .format = .etc1s, .srgb = true },
+        .{ .priority = 50, .name = "_BC", .format = .etc1s, .srgb = true },
+    };
+    const pp: preset.TextureParams = .{ .format = .auto, .apply_rules = true, .rules = &prio };
+
+    // _NMR name (arm class, 70) beats the base_color slot (50).
+    const p1 = resolveTextureFull(pp, 0, "asphalt_1_NMR", null, .{ .slots = base_bit, .min_side = 512 });
+    try testing.expectEqual(preset.TextureFormat.uastc, p1.format);
+    try testing.expectEqual(preset.Supercompression.zstd, p1.supercompression);
+    try testing.expectEqual(@as(?bool, false), p1.srgb);
+
+    // _BC name (50) loses to the normal slot (80).
+    const p2 = resolveTextureFull(pp, 1, "wall_BC", null, .{ .slots = normal_bit, .min_side = 512 });
+    try testing.expectEqual(preset.TextureFormat.uastc, p2.format);
+    try testing.expectEqual(@as(?bool, true), p2.normal_map);
+
+    // equal priorities: array order decides (base_color rule before _BC name).
+    const p3 = resolveTextureFull(pp, 2, "stone_2_BC", null, .{ .slots = base_bit, .min_side = 512 });
+    try testing.expectEqual(preset.TextureFormat.etc1s, p3.format);
 
     // overrides still win over rules (last-wins after first-match)
     const ovs = [_]preset.TextureOverride{.{ .image = 0, .format = .uastc }};

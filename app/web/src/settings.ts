@@ -24,7 +24,9 @@
  *       "quantize": { "enabled": true, "position_bits": 14, "uv_bits": 12, "normal_oct": true },
  *       "simplify": { "enabled": false, "target_ratio": 0.5, "error_tolerance": 0.001,
  *                     "aggressive": false, "lock_borders": true,
- *                     "use_attributes": false, "weight_normal": 1, "weight_uv": 1 }
+ *                     "use_attributes": false, "weight_normal": 1, "weight_uv": 1 },
+ *       "compress": { "enabled": false },
+ *       "animops": { "enabled": false, "remove_constant_tracks": true, "epsilon": 0.00001 }
  *     },
  *     "per_model": {
  *       "<sourcePath>": { "textures": { "overrides": [
@@ -58,6 +60,8 @@ export {
   parseSettingsText,
 } from "./settings/schema";
 export type {
+  AnimopsSettings,
+  CompressSettings,
   DedupSettings,
   JoinSettings,
   Language,

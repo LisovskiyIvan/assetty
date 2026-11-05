@@ -18,7 +18,16 @@ import type { DualApi } from "./dual";
  * write map 1:1. Unknown future step names resolve to null (chip stays put). */
 type StageId = "load" | "geometry" | "textures" | "write" | "done";
 
-const GEOMETRY_KINDS = new Set(["prune", "dedup", "weld", "join", "simplify", "quantize"]);
+const GEOMETRY_KINDS = new Set([
+  "prune",
+  "dedup",
+  "weld",
+  "join",
+  "simplify",
+  "quantize",
+  "compress",
+  "animops",
+]);
 
 function stageForStep(raw: string): StageId | null {
   const s = raw.trim().toLowerCase();
@@ -43,7 +52,9 @@ function stageForStep(raw: string): StageId | null {
     s.includes("weld") ||
     s.includes("join") ||
     s.includes("simplif") ||
-    s.includes("quant")
+    s.includes("quant") ||
+    s.includes("compress") ||
+    s.includes("anim")
   )
     return "geometry";
   return null;
@@ -198,6 +209,15 @@ function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
       simplify["weight_uv"] = steps.simplify.weight_uv;
     }
     out.push({ simplify });
+  }
+  if (steps.compress.enabled) out.push({ compress: {} });
+  if (steps.animops.enabled) {
+    out.push({
+      animops: {
+        remove_constant_tracks: steps.animops.remove_constant_tracks,
+        epsilon: steps.animops.epsilon,
+      },
+    });
   }
   return out;
 }

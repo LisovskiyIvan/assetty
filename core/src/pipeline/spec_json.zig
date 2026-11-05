@@ -78,8 +78,10 @@ pub fn parseSpecFile(io: std.Io, a: Allocator, path: []const u8, detail: *[]cons
 }
 
 /// Canonical execution order: a spec may list its steps in any order.
+/// `animops` runs before `quantize` (cleaned tracks improve the dequant
+/// bake census); `compress` runs last, over the final geometry.
 pub const step_order = [_]preset.StepKind{
-    .prune, .dedup, .weld, .join, .textures, .quantize, .simplify,
+    .prune, .dedup, .weld, .join, .textures, .animops, .quantize, .simplify, .compress,
 };
 
 pub fn isStepName(name: []const u8) bool {
@@ -251,6 +253,9 @@ fn parseTextureRules(a: Allocator, v: ?std.json.Value) SpecError![]preset.TexRul
         }
         if (fields.get("name")) |nv| {
             if (nv == .string) r.name = try a.dupe(u8, nv.string);
+        }
+        if (fields.get("priority")) |pv| {
+            if (pv == .integer) r.priority = std.math.cast(i16, pv.integer) orelse 0;
         }
         if (fields.get("format")) |fv| {
             if (fv == .string) {
@@ -432,6 +437,14 @@ fn stepFromSpec(
                 .use_attributes = (try r.boolField("use_attributes")) orelse d.use_attributes,
                 .weight_normal = (try r.floatField("weight_normal")) orelse d.weight_normal,
                 .weight_uv = (try r.floatField("weight_uv")) orelse d.weight_uv,
+            } };
+        },
+        .compress => .{ .compress = .{} },
+        .animops => blk: {
+            const d = preset.AnimopsParams{};
+            break :blk .{ .animops = .{
+                .remove_constant_tracks = (try r.boolField("remove_constant_tracks")) orelse d.remove_constant_tracks,
+                .epsilon = (try r.floatField("epsilon")) orelse d.epsilon,
             } };
         },
     };
@@ -631,6 +644,33 @@ test "spec maps textures rules" {
     const q = try parseSpec(a, "{\"steps\":[{\"textures\":{\"rules\":[{\"slot\":\"bogus\"}]}}]}", &detail);
     try testing.expectEqual(@as(usize, 1), q.steps[0].textures.rules.len);
     try testing.expectEqual(@as(?preset.TexSlot, null), q.steps[0].textures.rules[0].slot);
+}
+
+test "spec maps compress and animops with canonical order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    // any input order -> canonical: animops before quantize, compress last
+    const p = try parseSpec(a, "{\"steps\":[{\"compress\":{}},{\"quantize\":{}},{\"animops\":{\"remove_constant_tracks\":true,\"epsilon\":0.00001}}]}", &detail);
+    try testing.expectEqual(@as(usize, 3), p.steps.len);
+    var kinds_buf: [16]preset.StepKind = undefined;
+    try testing.expectEqualSlices(preset.StepKind, &.{ .animops, .quantize, .compress }, specKinds(p, &kinds_buf));
+    try testing.expect(p.steps[0].animops.remove_constant_tracks);
+    try testing.expectApproxEqAbs(@as(f32, 1e-5), p.steps[0].animops.epsilon, 1e-9);
+
+    // defaults: animops removes with 1e-5, compress takes null like {}
+    const q = try parseSpec(a, "{\"steps\":[{\"animops\":null},{\"compress\":{}}]}", &detail);
+    try testing.expect(q.steps[0].animops.remove_constant_tracks);
+    try testing.expectApproxEqAbs(@as(f32, 1e-5), q.steps[0].animops.epsilon, 1e-9);
+
+    // mistyped epsilon names the step
+    try testing.expectError(
+        error.BadParam,
+        parseSpec(a, "{\"steps\":[{\"animops\":{\"epsilon\":\"tight\"}}]}", &detail),
+    );
+    try testing.expectEqualStrings("animops", detail);
 }
 
 test "spec rejects unknown step kinds by name" {

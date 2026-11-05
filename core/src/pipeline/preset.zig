@@ -179,6 +179,13 @@ pub const TexRule = struct {
     slot: ?TexSlot = null,
     /// Suffix matched case-insensitively, e.g. "_NRM" or "_BC".
     name: []const u8 = "",
+    /// Resolution priority: among ALL matching rules the highest priority
+    /// wins (ties → array order). Mirrors the project's "strictest type"
+    /// semantics: a `_NRM`-suffixed texture in the baseColor slot must hit
+    /// the normal rule, not the baseColor one. Defaults: skip-heuristics 90,
+    /// normal 80, arm 70, single-channel 65, cutout 60, emissive 55,
+    /// baseColor 50. Unset (0) = array order among equal priorities.
+    priority: i16 = 0,
     format: ?TextureFormat = null,
     quality: ?u8 = null,
     rdo_lambda: ?f32 = null,
@@ -279,6 +286,27 @@ pub const TextureOverride = struct {
     supercompression: ?Supercompression = null,
 };
 
+/// Meshopt-compress every eligible buffer view (new `compress` step params).
+/// No knobs for now: meshopt only, mode fixed. Runs after the geometry ops
+/// and makes the writer emit `EXT_meshopt_compression` on all eligible
+/// vertex-attribute + index views — including decoded-but-untouched float
+/// accessors that `quantize.meshopt_compression` alone would leave plain.
+/// Composes with quantize: already-compressed views are skipped, never
+/// re-encoded. Output requires an EXT_meshopt_compression-capable loader.
+pub const CompressParams = struct {};
+
+/// Constant animation-track removal (new `animops` step params). For every
+/// channel whose sampler output values are all equal within `epsilon` per
+/// component, the channel is dropped; when no other channel of the same
+/// animation targets the same node+path, the node's static TRS is snapped to
+/// the constant value. Animations left with no channels are removed.
+pub const AnimopsParams = struct {
+    /// Drop constant tracks (and snap static nodes). False = no-op step.
+    remove_constant_tracks: bool = true,
+    /// Per-component equality tolerance for the constant check.
+    epsilon: f32 = 1e-5,
+};
+
 /// One pipeline step. The active field selects the operation.
 pub const Step = union(enum) {
     prune: PruneParams,
@@ -288,6 +316,8 @@ pub const Step = union(enum) {
     quantize: QuantizeParams,
     simplify: SimplifyParams,
     textures: TextureParams,
+    compress: CompressParams,
+    animops: AnimopsParams,
 };
 
 /// Tag of `Step`, handy for tests and the CLI.
@@ -469,6 +499,11 @@ pub fn describe(p: Preset, w: anytype) !void {
                 if (v.overrides.len > 0) try w.print(" overrides={d}", .{v.overrides.len});
                 try w.writeByte('\n');
             },
+            .compress => try w.print("compress  (meshopt-compress all eligible views)\n", .{}),
+            .animops => |v| try w.print(
+                "animops   remove_constant_tracks={} epsilon={d}\n",
+                .{ v.remove_constant_tracks, v.epsilon },
+            ),
         }
     }
 }
@@ -671,6 +706,28 @@ test "parse textures supercompression zon round-trip" {
     var w = std.Io.Writer.fixed(&buf);
     try describe(p, &w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "supercompression=zstd") != null);
+}
+
+test "parse compress and animops steps" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // defaults: compress takes no params, animops removes with 1e-5
+    const d = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .compress = .{} }, .{ .animops = .{} } } }");
+    try testing.expectEqual(@as(usize, 2), d.steps.len);
+    try testing.expectEqual(StepKind.compress, std.meta.activeTag(d.steps[0]));
+    try testing.expect(d.steps[1].animops.remove_constant_tracks);
+    try testing.expectApproxEqAbs(@as(f32, 1e-5), d.steps[1].animops.epsilon, 1e-9);
+
+    const e = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .animops = .{ .remove_constant_tracks = false, .epsilon = 0.001 } } } }");
+    try testing.expect(!e.steps[0].animops.remove_constant_tracks);
+    try testing.expectApproxEqAbs(@as(f32, 0.001), e.steps[0].animops.epsilon, 1e-9);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(d, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "compress  (meshopt-compress all eligible views)") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "animops   remove_constant_tracks=true") != null);
 }
 
 test "parse rejects garbage" {

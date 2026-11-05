@@ -81,6 +81,12 @@ export const FIELD_HELP: Record<string, string> = {
     "Quantizes texture coordinates to this many bits (12 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
   "quantize.normal_oct":
     "Packs normals with octahedral encoding (2×8/16-bit instead of 3 floats). Much smaller vertex buffers; needs extension support — very old viewers may render it wrong.",
+  compress:
+    "Meshopt-compresses every eligible vertex and index buffer view (EXT_meshopt_compression, gltfpack -cc style) — including plain float geometry the quantize step left untouched. Much smaller disk size at identical vertices; the loader must support EXT_meshopt_compression.",
+  "animops.remove_constant_tracks":
+    "Drops animation channels whose every keyframe is identical, baking the value into the static node transform. Smaller file and faster load; the motion is unchanged. Re-run from the source to get the tracks back.",
+  "animops.epsilon":
+    "Per-component tolerance for the constant-track check. Larger values drop more tracks but risk flattening subtle motion; 0.00001 keeps only truly static tracks.",
   "compare.mode":
     "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
   "textures.overrides_note":
@@ -916,6 +922,52 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
       const s = opts.get().simplify;
       const pct = Math.round(s.target_ratio * 100);
       return `keep ${pct}%${s.aggressive ? " · aggressive" : ""}${s.lock_borders ? "" : " · unlocked"}`;
+    },
+  );
+
+  /* -------------------------------------------------------------- compress */
+  stepBlock("compress", "compress", t("opt.hint.compress"), () => [], "compress");
+
+  /* -------------------------------------------------------------- animops */
+  stepBlock(
+    "animops",
+    "animops",
+    t("opt.hint.animops"),
+    () => [
+      field(
+        "constant",
+        check(
+          "remove tracks",
+          () => opts.get().animops.remove_constant_tracks,
+          (value) =>
+            edit((steps) => {
+              steps.animops.remove_constant_tracks = value;
+            }),
+          "animops.remove_constant_tracks",
+        ),
+      ),
+      field(
+        "epsilon",
+        numberInput(
+          0,
+          1,
+          0.00001,
+          () => opts.get().animops.epsilon,
+          (value) =>
+            edit((steps) => {
+              steps.animops.epsilon = value;
+            }),
+        ),
+        true,
+        "animops.epsilon",
+      ),
+    ],
+    undefined,
+    () => {
+      const a = opts.get().animops;
+      return a.remove_constant_tracks
+        ? `constant tracks · eps ${a.epsilon}`
+        : t("opt.hint.animops");
     },
   );
 
