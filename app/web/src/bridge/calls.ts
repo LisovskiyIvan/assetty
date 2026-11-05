@@ -34,6 +34,7 @@ import type {
   OptimizeDoneEvent,
   OptimizeInvocation,
   PreviewInvocation,
+  PresetEntry,
   ProgressEvent,
   TextureEncodeDoneEvent,
   TexturePreviewDoneEvent,
@@ -257,25 +258,56 @@ export class Bridge {
     await this.raw("discardFile", [path]);
   }
 
-  async presets(): Promise<string[]> {
+  async presets(): Promise<PresetEntry[]> {
     if (!this.live) return this.demo.presets();
     const res = parseMaybeJson<unknown>(await this.raw("presets", []));
-    if (Array.isArray(res)) return res.map(String);
-    const obj = (res ?? {}) as Record<string, unknown>;
-    return Array.isArray(obj.presets) ? (obj.presets as unknown[]).map(String) : [];
+    const list = Array.isArray(res) ? res : ((res ?? {}) as Record<string, unknown>).presets;
+    const items = Array.isArray(list) ? list : [];
+    return items
+      .map((entry) => normalizePresetEntry(entry))
+      .filter((entry): entry is PresetEntry => entry !== null);
   }
 
+  /**
+   * Raw preset text: `.zon` for built-ins, `{"name","steps"}` JSON for user
+   * presets. Returned verbatim (never parsed): a JSON preset would parse as
+   * an object and lose its exact bytes.
+   */
   async presetLoad(name: string): Promise<string> {
     if (!this.live) return this.demo.presetLoad(name);
-    const res = parseMaybeJson<unknown>(await this.raw("presetLoad", [name]));
+    const res = await this.raw("presetLoad", [name]);
     if (typeof res === "string") return res;
-    const obj = (res ?? {}) as Record<string, unknown>;
-    return String(obj.zon ?? obj.text ?? obj.source ?? "");
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      const obj = res as Record<string, unknown>;
+      const wrapped = obj.zon ?? obj.text ?? obj.source;
+      if (typeof wrapped === "string") return wrapped;
+      return JSON.stringify(res);
+    }
+    return String(res ?? "");
   }
 
   async presetSave(name: string, zon: string): Promise<void> {
     if (!this.live) return this.demo.presetSave();
     await this.raw("presetSave", [name, zon]);
+  }
+
+  /**
+   * Validates + writes a user preset (`{"name","steps"}` JSON) on the host.
+   * Rejects with the host's message when the spec is invalid or the name is
+   * a built-in. Demo mode keeps it in memory.
+   */
+  async presetSaveJson(name: string, presetJson: string): Promise<void> {
+    if (!this.live) return this.demo.presetSaveJson(name, presetJson);
+    await this.raw("presetSaveJson", [name, presetJson]);
+  }
+
+  /**
+   * Deletes a user preset on the host. Rejects for built-ins and unknown
+   * names. Demo mode drops it from memory.
+   */
+  async presetDelete(name: string): Promise<void> {
+    if (!this.live) return this.demo.presetDelete(name);
+    await this.raw("presetDelete", [name]);
   }
 
   /**
@@ -497,6 +529,26 @@ export class Bridge {
   on(event: string, cb: (payload: unknown) => void): () => void {
     return subscribeBridge(this.native, event, cb);
   }
+}
+
+/** One `presets()` row: a bare string is a legacy built-in name. */
+function normalizePresetEntry(value: unknown): PresetEntry | null {
+  if (typeof value === "string") {
+    const name = value.trim();
+    if (!name) return null;
+    return { name, kind: "builtin", file: `${name}.zon` };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    const name = String(obj.name ?? "").trim();
+    if (!name) return null;
+    return {
+      name,
+      kind: obj.kind === "user" ? "user" : "builtin",
+      file: String(obj.file ?? `${name}.zon`),
+    };
+  }
+  return null;
 }
 
 export function b64ToBytes(b64: string): Uint8Array {

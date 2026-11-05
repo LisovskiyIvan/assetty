@@ -18,6 +18,8 @@ const METHOD_NAMES = [
   "presets",
   "presetLoad",
   "presetSave",
+  "presetSaveJson",
+  "presetDelete",
   "settingsLoad",
   "settingsSave",
   "appInfo",

@@ -7,10 +7,10 @@ import { isBusyError, notifyExportError, pickSaveTarget } from "../../guards";
 import { t } from "../../i18n";
 import { el, fmtSecs } from "../../ui";
 import { getSettings, getTextureOverrides, updateSettings } from "../../settings";
-import type { OptimizeSteps } from "../../settings";
+import type { OptimizeSteps, TextureOverride } from "../../settings";
 import { notify, onLog } from "../../notify";
 import type { ImageInfo, Info, OptimizeResult } from "../../types";
-import type { LodsItem } from "../../bridge";
+import type { LodsItem, PresetEntry } from "../../bridge";
 import type { DualApi } from "./dual";
 
 /** Pipeline stages shown as chips. Geometry merges every mesh-op step kind
@@ -208,6 +208,8 @@ export interface RunDeps {
   /** A ladder finished: render the per-ratio table. */
   onLodsFinished(items: LodsItem[]): void;
   refreshTexExtra(): void;
+  /** Re-reads settings into the step form (after programmatic edits). */
+  syncStepsForm(): void;
 }
 
 export interface RunApi {
@@ -244,6 +246,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
   // "" = hand-tuned settings (no preset pill highlighted). The named preset is
   // only used as a fallback if the host predates `optimizeCustom`.
   let activePreset = "";
+  // Last built-in chip (user presets are specs the fallback path can't name).
+  let fallbackPreset = "desktop";
 
   const sourceLabel = el("div", { class: "mono muted wrap" });
   const viewNote = el("div", { class: "amber-note" });
@@ -642,32 +646,368 @@ export function createRunFlow(deps: RunDeps): RunApi {
 
   function applyPreset(name: string): void {
     activePreset = name;
+    fallbackPreset = name;
     const prefs = PRESET_PREFS[name.toLowerCase()];
     if (prefs) edit(prefs);
-    for (const button of Array.from(presetRow.children)) {
-      button.classList.toggle("active", (button as HTMLElement).textContent === name);
-    }
+    renderPresetRow();
+    deps.syncStepsForm();
     setLog(prefs ? t("opt.presetPrefill", { name }) : t("opt.presetUnknown", { name }));
   }
 
+  /* ------------------------------------------- user presets (JSON, on disk) */
+
+  let builtinNames: string[] = ["mobile", "desktop", "web"];
+  let userNames: string[] = [];
+  let menuOpen = false;
+  /** Delete button awaiting its second click (inline confirm, never confirm()). */
+  let confirmDelete: string | null = null;
+  let saveOpen = false;
+  /** Save input, preserved across re-renders; defaults to the last saved name. */
+  let saveName = "";
+
+  /** True when user presets can be saved: live host with the binding, or demo. */
+  function canSaveUserPresets(): boolean {
+    if (!app.bridge.live) return true;
+    return app.bridge.native?.methods.includes("presetSaveJson") ?? false;
+  }
+
   async function loadPresets(): Promise<void> {
-    let names: string[] = [];
+    let entries: PresetEntry[] = [];
     try {
-      names = await app.bridge.presets();
+      entries = await app.bridge.presets();
     } catch {
-      names = [];
+      entries = [];
     }
-    if (names.length === 0) names = ["mobile", "desktop", "web"];
-    presetRow.replaceChildren(
-      ...names.map((name) =>
-        el("button", {
-          class: `small preset ${name === activePreset ? "active" : ""}`,
-          text: name,
-          title: t("opt.presetTitle", { name }),
-          onclick: () => applyPreset(name),
-        }),
-      ),
+    if (entries.length === 0) {
+      entries = ["mobile", "desktop", "web"].map((name) => ({
+        name,
+        kind: "builtin" as const,
+        file: `${name}.zon`,
+      }));
+    }
+    builtinNames = entries.filter((e) => e.kind !== "user").map((e) => e.name);
+    if (builtinNames.length === 0) builtinNames = ["mobile", "desktop", "web"];
+    userNames = entries.filter((e) => e.kind === "user").map((e) => e.name);
+    renderPresetRow();
+  }
+
+  /** Rebuilds the preset row from state: builtin chips, My presets, Save. */
+  function renderPresetRow(): void {
+    const chips = builtinNames.map((name) =>
+      el("button", {
+        class: `small preset${name === activePreset ? " active" : ""}`,
+        text: name,
+        title: t("opt.presetTitle", { name }),
+        onclick: () => applyPreset(name),
+      }),
     );
+
+    const menu = el("div", { class: "preset-menu", hidden: !menuOpen, role: "menu" });
+    if (userNames.length === 0) {
+      menu.append(el("div", { class: "preset-menu-empty", text: t("opt.myPresetsEmpty") }));
+    } else {
+      for (const name of userNames) {
+        const row = el("div", { class: "preset-menu-row", role: "menuitem" });
+        row.append(
+          el("button", {
+            class: "preset-load",
+            text: name,
+            title: t("opt.presetTitle", { name }),
+            onclick: () => {
+              menuOpen = false;
+              confirmDelete = null;
+              void loadUserPreset(name);
+            },
+          }),
+          confirmDelete === name
+            ? el("button", {
+                class: "small danger",
+                text: t("opt.presetDeleteSure"),
+                title: t("opt.presetDeleteTitle", { name }),
+                onclick: () => void deleteUserPreset(name),
+              })
+            : el("button", {
+                class: "small preset-del",
+                text: "×",
+                title: t("opt.presetDeleteTitle", { name }),
+                "aria-label": t("opt.presetDeleteTitle", { name }),
+                onclick: (ev: Event) => {
+                  ev.stopPropagation();
+                  confirmDelete = name;
+                  renderPresetRow();
+                },
+              }),
+        );
+        menu.append(row);
+      }
+    }
+    const myBtn = el("button", {
+      class: "small",
+      text: t("opt.myPresets", { n: userNames.length }),
+      title: t("opt.myPresetsTitle"),
+      "aria-expanded": menuOpen ? "true" : "false",
+      onclick: (ev: Event) => {
+        ev.stopPropagation();
+        menuOpen = !menuOpen;
+        confirmDelete = null;
+        renderPresetRow();
+      },
+    });
+    const myWrap = el("div", { class: "preset-menu-wrap" }, myBtn, menu);
+
+    const saveBtn = el("button", {
+      class: "small",
+      text: t("opt.presetSaveShow"),
+      title: canSaveUserPresets() ? t("opt.presetSaveTitle") : t("opt.presetNoSaveHost"),
+      disabled: !canSaveUserPresets(),
+      onclick: (ev: Event) => {
+        ev.stopPropagation();
+        saveOpen = !saveOpen;
+        renderPresetRow();
+        saveInput()?.focus();
+      },
+    });
+    const saveWrap = el("div", { class: "preset-save-wrap" }, saveBtn);
+    if (saveOpen) {
+      const input = el("input", {
+        class: "compact preset-name",
+        type: "text",
+        value: saveName,
+        placeholder: t("opt.presetNamePh"),
+        "aria-label": t("opt.presetNamePh"),
+        maxlength: 64,
+        oninput: (ev: Event) => {
+          saveName = (ev.target as HTMLInputElement).value;
+        },
+        onkeydown: (ev: KeyboardEvent) => {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            void saveUserPreset();
+          } else if (ev.key === "Escape") {
+            saveOpen = false;
+            renderPresetRow();
+          }
+        },
+      });
+      saveWrap.append(
+        input,
+        el("button", {
+          class: "small primary",
+          text: t("opt.presetSaveBtn"),
+          onclick: () => void saveUserPreset(),
+        }),
+      );
+    }
+    presetRow.replaceChildren(...chips, myWrap, saveWrap);
+  }
+
+  function saveInput(): HTMLInputElement | null {
+    return presetRow.querySelector("input.preset-name");
+  }
+
+  /** Clicks outside the row close the open menu (and disarm a delete). */
+  document.addEventListener("click", (ev) => {
+    if (!menuOpen && confirmDelete == null) return;
+    const target = ev.target as Node | null;
+    if (target && presetRow.contains(target)) return;
+    menuOpen = false;
+    confirmDelete = null;
+    renderPresetRow();
+  });
+
+  /** Copies one step's params from a loaded spec (tolerant: wrong types keep current). */
+  function applySpecSteps(entries: unknown[]): void {
+    const overrides: TextureOverride[] = [];
+    edit((steps) => {
+      steps.prune.enabled = false;
+      steps.dedup.enabled = false;
+      steps.weld.enabled = false;
+      steps.join.enabled = false;
+      steps.textures.enabled = false;
+      steps.quantize.enabled = false;
+      steps.simplify.enabled = false;
+      const flag = (v: unknown, fallback: boolean): boolean =>
+        typeof v === "boolean" ? v : fallback;
+      const num = (v: unknown, fallback: number, min: number, max: number): number =>
+        typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback;
+      for (const entry of entries) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const keys = Object.keys(entry);
+        if (keys.length === 0) continue;
+        const kind = keys[0];
+        const raw = (entry as Record<string, unknown>)[kind];
+        const p = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<
+          string,
+          unknown
+        >;
+        switch (kind) {
+          case "prune":
+            steps.prune.enabled = true;
+            steps.prune.unused_nodes = flag(p.unused_nodes, true);
+            steps.prune.unused_materials = flag(p.unused_materials, true);
+            steps.prune.unused_textures = flag(p.unused_textures, true);
+            steps.prune.animations = flag(p.animations, true);
+            break;
+          case "dedup":
+            steps.dedup.enabled = true;
+            steps.dedup.accessors = flag(p.accessors, true);
+            steps.dedup.meshes = flag(p.meshes, true);
+            steps.dedup.materials = flag(p.materials, true);
+            break;
+          case "weld":
+            steps.weld.enabled = true;
+            steps.weld.tolerance = num(p.tolerance, 0, 0, 1);
+            break;
+          case "join":
+            steps.join.enabled = true;
+            break;
+          case "textures": {
+            steps.textures.enabled = true;
+            const format = p.format;
+            if (format === "auto" || format === "etc1s" || format === "uastc") {
+              steps.textures.format = format;
+            }
+            steps.textures.quality = Math.round(num(p.quality, 128, 1, 255));
+            steps.textures.max_size = Math.round(num(p.max_size, 0, 0, 8192));
+            steps.textures.generate_mips = flag(p.generate_mips, true);
+            const list = p.overrides;
+            if (Array.isArray(list)) {
+              for (const item of list) {
+                if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+                const fields = item as Record<string, unknown>;
+                const ov: TextureOverride = {};
+                if (
+                  typeof fields.image === "number" &&
+                  Number.isFinite(fields.image) &&
+                  Math.round(fields.image) >= 0
+                ) {
+                  ov.image = Math.round(fields.image);
+                }
+                if (typeof fields.name === "string" && fields.name.trim()) {
+                  ov.name = fields.name;
+                }
+                if (
+                  fields.format === "auto" ||
+                  fields.format === "etc1s" ||
+                  fields.format === "uastc"
+                ) {
+                  ov.format = fields.format;
+                }
+                if (typeof fields.quality === "number" && Number.isFinite(fields.quality)) {
+                  ov.quality = Math.round(Math.min(255, Math.max(1, fields.quality)));
+                }
+                if (typeof fields.max_size === "number" && Number.isFinite(fields.max_size)) {
+                  ov.max_size = Math.round(Math.min(8192, Math.max(0, fields.max_size)));
+                }
+                for (const key of ["generate_mips", "skip", "normal_map"] as const) {
+                  if (typeof fields[key] === "boolean") ov[key] = fields[key] as boolean;
+                }
+                if (Object.keys(ov).length > 0) overrides.push(ov);
+              }
+            }
+            break;
+          }
+          case "quantize":
+            steps.quantize.enabled = true;
+            steps.quantize.position_bits = Math.round(num(p.position_bits, 14, 8, 16));
+            steps.quantize.uv_bits = Math.round(num(p.uv_bits, 12, 8, 16));
+            steps.quantize.normal_oct = flag(p.normal_oct, true);
+            break;
+          case "simplify":
+            steps.simplify.enabled = true;
+            steps.simplify.target_ratio = num(p.target_ratio, 0.5, 0.1, 1);
+            steps.simplify.error_tolerance = num(p.error_tolerance, 0.001, 0.0001, 0.05);
+            steps.simplify.aggressive = flag(p.aggressive, false);
+            steps.simplify.lock_borders = flag(p.lock_borders, true);
+            steps.simplify.use_attributes = flag(p.use_attributes, false);
+            steps.simplify.weight_normal = num(p.weight_normal, 1, 0, 10);
+            steps.simplify.weight_uv = num(p.weight_uv, 1, 0, 10);
+            break;
+          default:
+            break; // unknown future kinds: ignore (forward-compat)
+        }
+      }
+    });
+    // Overrides ride in the spec (buildSpec merges them); put them back on
+    // this source when the preset carries some, leave this model's own alone
+    // otherwise.
+    if (overrides.length > 0 && app.sourcePath) {
+      const src = app.sourcePath;
+      updateSettings((settings) => {
+        settings.optimize.per_model[src] = { textures: { overrides } };
+      });
+    }
+    deps.syncStepsForm();
+  }
+
+  /** Loads a user preset into the step form (the form stays the editor). */
+  async function loadUserPreset(name: string): Promise<void> {
+    let text: string;
+    try {
+      text = await app.bridge.presetLoad(name);
+    } catch (err) {
+      notify(t("opt.presetLoadFail", { message: (err as Error).message }), "error");
+      return;
+    }
+    let spec: unknown;
+    try {
+      spec = JSON.parse(text);
+    } catch {
+      notify(t("opt.presetInvalid"), "error");
+      return;
+    }
+    const entries = (spec as { steps?: unknown })?.steps;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      notify(t("opt.presetInvalid"), "error");
+      return;
+    }
+    activePreset = name;
+    saveName = name;
+    applySpecSteps(entries);
+    renderPresetRow();
+    setLog(t("opt.presetLoaded", { name }));
+    notify(t("opt.presetLoaded", { name }), "ok");
+  }
+
+  /** Saves the CURRENT form state as `{"name","steps"}` (the optimize spec). */
+  async function saveUserPreset(): Promise<void> {
+    const name = saveName.trim();
+    if (!name) {
+      notify(t("opt.presetNameEmpty"), "error");
+      return;
+    }
+    const specSteps = buildSpec(steps());
+    if (specSteps.length === 0) {
+      notify(t("opt.pickStep"), "error");
+      return;
+    }
+    try {
+      await app.bridge.presetSaveJson(name, JSON.stringify({ name, steps: specSteps }));
+    } catch (err) {
+      notify(t("opt.presetSaveFail", { message: (err as Error).message }), "error");
+      return;
+    }
+    activePreset = name;
+    saveOpen = false;
+    notify(t("opt.presetSaved", { name }), "ok");
+    setLog(t("opt.presetSaved", { name }));
+    await loadPresets();
+  }
+
+  /** Deletes a user preset (builtin names never reach here: no button). */
+  async function deleteUserPreset(name: string): Promise<void> {
+    confirmDelete = null;
+    try {
+      await app.bridge.presetDelete(name);
+    } catch (err) {
+      notify(t("opt.presetDeleteFail", { message: (err as Error).message }), "error");
+      await loadPresets();
+      return;
+    }
+    if (activePreset === name) activePreset = "";
+    if (saveName === name) saveName = "";
+    notify(t("opt.presetDeleted", { name }), "ok");
+    await loadPresets();
   }
 
   async function loadSource(path: string): Promise<void> {
@@ -782,14 +1122,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
     renderChips();
     setProgress(t("opt.starting"), 0);
     try {
-      const call = await app.bridge.optimizeCustom(
-        path,
-        specJson,
-        activePreset || "desktop",
-        (p) => {
-          if (running) setProgress(p.step || t("opt.runningShort"), p.pct, forwardSub(p));
-        },
-      );
+      const call = await app.bridge.optimizeCustom(path, specJson, fallbackPreset, (p) => {
+        if (running) setProgress(p.step || t("opt.runningShort"), p.pct, forwardSub(p));
+      });
       if (call.started) {
         // Background job: Run stays disabled until optimizeDone arrives.
         stopProgress = call.stopProgress;
@@ -938,6 +1273,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     syncTexts: () => {
       optSectionHead.textContent = t("opt.section");
       syncSourceHead();
+      renderPresetRow();
       runBtn.textContent = running ? t("opt.running") : t("opt.run");
       lodBtn.textContent = running ? t("opt.lodsRunning") : t("opt.lods");
       lodBtn.title = t("opt.lodsTitle");

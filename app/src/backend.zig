@@ -96,6 +96,8 @@ pub const Backend = struct {
         .discardFile = .{"path"},
         .presetLoad = .{"name"},
         .presetSave = .{ "name", "zon" },
+        .presetSaveJson = .{ "name", "json" },
+        .presetDelete = .{"name"},
         .settingsLoad = .{},
         .settingsSave = .{"text"},
         .appInfo = .{},
@@ -286,12 +288,18 @@ pub const Backend = struct {
 
     // ---- presets ----------------------------------------------------------
 
-    /// Preset names found in `presets/*.zon`, sorted.
-    pub fn presets(self: *Backend, call: *Call) ![]const []const u8 {
+    /// Every preset on disk, sorted by name: built-ins (`presets/*.zon`) and
+    /// user presets (`presets/*.json`):
+    /// `[{"name":"desktop","kind":"builtin","file":"desktop.zon"}, ...]`.
+    /// A hand-placed `.json` beside a `.zon` shadows it (the UI can never
+    /// create this: saving refuses built-in names); the loader prefers the
+    /// `.json` text too, so the two stay consistent.
+    pub fn presets(self: *Backend, call: *Call) !json.Raw {
         return self.presetsImpl(call.arena);
     }
 
-    /// The `.zon` text of `presets/<name>.zon`.
+    /// The raw text of `presets/<name>.json` (user preset) or
+    /// `presets/<name>.zon` (built-in): JSON wins when both exist.
     pub fn presetLoad(self: *Backend, call: *Call, name: []const u8) ![]const u8 {
         return self.presetLoadImpl(call.arena, name);
     }
@@ -299,6 +307,21 @@ pub const Backend = struct {
     /// Writes `presets/<name>.zon`; true on success.
     pub fn presetSave(self: *Backend, call: *Call, name: []const u8, zon: []const u8) !bool {
         return self.presetSaveImpl(call.arena, name, zon);
+    }
+
+    /// Validates `preset_json` as a `{"name","steps"}` preset (the same spec
+    /// validator `optimizeCustom` uses) and writes it atomically to
+    /// `presets/<name>.json`: `{"ok":true}` or `{"error":".."}`.
+    /// Overwriting your own preset is fine; built-in names (anything with a
+    /// `.zon` beside it) are refused.
+    pub fn presetSaveJson(self: *Backend, call: *Call, name: []const u8, preset_json: []const u8) !json.Raw {
+        return self.presetSaveJsonImpl(call.arena, name, preset_json);
+    }
+
+    /// Deletes `presets/<name>.json`: `{"ok":true}` or `{"error":".."}`.
+    /// Built-ins (`.zon`) are refused — and so are names with nothing on disk.
+    pub fn presetDelete(self: *Backend, call: *Call, name: []const u8) !json.Raw {
+        return self.presetDeleteImpl(call.arena, name);
     }
 
     /// Settings blob (`assetty.settings.json` in the cwd) as raw JSON; `{}`
@@ -621,31 +644,87 @@ pub const Backend = struct {
         return json.raw(try aw.toOwnedSlice());
     }
 
-    fn presetsImpl(self: *Backend, a: std.mem.Allocator) ![]const []const u8 {
-        var names: std.ArrayList([]const u8) = .empty;
-        var dir = std.Io.Dir.cwd().openDir(self.io, "presets", .{ .iterate = true }) catch return &.{};
-        defer dir.close(self.io);
-        var it = dir.iterate();
+    fn presetsImpl(self: *Backend, a: std.mem.Allocator) !json.Raw {
+        return self.presetsIn(a, "presets");
+    }
+
+    /// Lists the presets found in `dir`: one `{"name","kind","file"}` row per
+    /// stem, sorted by name. `dir` is `"presets"` live; tests inject a scratch
+    /// dir with the same layout.
+    fn presetsIn(self: *Backend, a: std.mem.Allocator, dir: []const u8) !json.Raw {
+        const Entry = struct { name: []const u8, kind: []const u8, file: []const u8 };
+        var list: std.ArrayList(Entry) = .empty;
+        var d = std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true }) catch return json.raw("[]");
+        defer d.close(self.io);
+        var it = d.iterate();
         while (it.next(self.io) catch null) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
-            if (!std.mem.endsWith(u8, e.name, ".zon")) continue;
-            const stem = e.name[0 .. e.name.len - ".zon".len];
-            if (!validPresetName(stem)) continue;
-            try names.append(a, try a.dupe(u8, stem));
+            var stem: ?[]const u8 = null;
+            var kind: ?[]const u8 = null;
+            if (std.mem.endsWith(u8, e.name, ".zon")) {
+                stem = e.name[0 .. e.name.len - ".zon".len];
+                kind = "builtin";
+            } else if (std.mem.endsWith(u8, e.name, ".json")) {
+                stem = e.name[0 .. e.name.len - ".json".len];
+                kind = "user";
+            } else continue;
+            if (!validPresetName(stem.?)) continue;
+            try list.append(a, .{
+                .name = try a.dupe(u8, stem.?),
+                .kind = kind.?,
+                .file = try a.dupe(u8, e.name),
+            });
         }
-        std.mem.sort([]const u8, names.items, {}, struct {
-            fn lt(_: void, x: []const u8, y: []const u8) bool {
-                return std.mem.lessThan(u8, x, y);
+        std.mem.sort(Entry, list.items, {}, struct {
+            fn lt(_: void, x: Entry, y: Entry) bool {
+                if (!std.mem.eql(u8, x.name, y.name)) return std.mem.lessThan(u8, x.name, y.name);
+                // "builtin" < "user": the last row of a stem run wins below,
+                // so a hand-placed `.json` shadows a same-stem `.zon`.
+                return std.mem.lessThan(u8, x.kind, y.kind);
             }
         }.lt);
-        return names.items;
+
+        var aw: std.Io.Writer.Allocating = .init(a);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+        try w.writeByte('[');
+        var first = true;
+        var i: usize = 0;
+        while (i < list.items.len) {
+            var j = i;
+            while (j + 1 < list.items.len and std.mem.eql(u8, list.items[j + 1].name, list.items[i].name)) j += 1;
+            const e = list.items[j];
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("{\"name\":");
+            try json.jsonStr(w, e.name);
+            try w.writeAll(",\"kind\":");
+            try json.jsonStr(w, e.kind);
+            try w.writeAll(",\"file\":");
+            try json.jsonStr(w, e.file);
+            try w.writeByte('}');
+            i = j + 1;
+        }
+        try w.writeByte(']');
+        return json.raw(try aw.toOwnedSlice());
     }
 
     fn presetLoadImpl(self: *Backend, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        return self.presetLoadFrom(a, "presets", name);
+    }
+
+    /// Raw text of `<dir>/<name>.json`, falling back to `<dir>/<name>.zon`.
+    /// `dir` is `"presets"` live; tests inject a scratch dir.
+    fn presetLoadFrom(self: *Backend, a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
         if (!validPresetName(name)) return error.InvalidPresetName;
-        var buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&buf, "presets/{s}.zon", .{name});
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_text_bytes)) catch |err| switch (err) {
+        const jpath = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, name });
+        if (std.Io.Dir.cwd().readFileAlloc(self.io, jpath, a, .limited(max_text_bytes))) |text| {
+            return text;
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+        }
+        const zpath = try std.fmt.allocPrint(a, "{s}/{s}.zon", .{ dir, name });
+        return std.Io.Dir.cwd().readFileAlloc(self.io, zpath, a, .limited(max_text_bytes)) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.PresetNotFound,
         };
@@ -658,6 +737,61 @@ pub const Backend = struct {
         const path = try std.fmt.bufPrint(&buf, "presets/{s}.zon", .{name});
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = zon }) catch return false;
         return true;
+    }
+
+    fn presetSaveJsonImpl(self: *Backend, a: std.mem.Allocator, name: []const u8, preset_json: []const u8) !json.Raw {
+        return self.presetSaveJsonTo(a, "presets", name, preset_json);
+    }
+
+    /// Validates `preset_json` and writes it atomically to
+    /// `<dir>/<name>.json`. `dir` is `"presets"` live; tests inject a scratch
+    /// dir (created up front — the atomic rename needs its parent to exist).
+    fn presetSaveJsonTo(self: *Backend, a: std.mem.Allocator, dir: []const u8, name: []const u8, preset_json: []const u8) !json.Raw {
+        if (!validPresetName(name)) return error.InvalidPresetName;
+        const zpath = try std.fmt.allocPrint(a, "{s}/{s}.zon", .{ dir, name });
+        if (std.Io.Dir.cwd().statFile(self.io, zpath, .{})) |_| {
+            return json.errorRaw(a, "cannot overwrite builtin preset \"{s}\"", .{name});
+        } else |_| {}
+        if (preset_json.len > max_text_bytes) return json.errorRaw(a, "preset too large", .{});
+        switch (specPresetOrMessage(a, preset_json)) {
+            .preset => {},
+            .err => |msg| return json.errorRaw(a, "{s}", .{msg}),
+        }
+        const jpath = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, name });
+        var atomic = std.Io.Dir.cwd().createFileAtomic(self.io, jpath, .{ .replace = true }) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
+        defer atomic.deinit(self.io);
+
+        var buf: [8192]u8 = undefined;
+        var fw = atomic.file.writer(self.io, &buf);
+        fw.interface.writeAll(preset_json) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
+        fw.flush() catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
+        atomic.replace(self.io) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
+        return json.raw("{\"ok\":true}");
+    }
+
+    fn presetDeleteImpl(self: *Backend, a: std.mem.Allocator, name: []const u8) !json.Raw {
+        return self.presetDeleteFrom(a, "presets", name);
+    }
+
+    /// Deletes `<dir>/<name>.json`. `dir` is `"presets"` live; tests inject a
+    /// scratch dir with the same layout.
+    fn presetDeleteFrom(self: *Backend, a: std.mem.Allocator, dir: []const u8, name: []const u8) !json.Raw {
+        if (!validPresetName(name)) return error.InvalidPresetName;
+        const zpath = try std.fmt.allocPrint(a, "{s}/{s}.zon", .{ dir, name });
+        if (std.Io.Dir.cwd().statFile(self.io, zpath, .{})) |_| {
+            return json.errorRaw(a, "cannot delete builtin preset \"{s}\"", .{name});
+        } else |_| {}
+        const jpath = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, name });
+        std.Io.Dir.cwd().deleteFile(self.io, jpath) catch |err| {
+            if (err == error.FileNotFound)
+                return json.errorRaw(a, "preset \"{s}\" not found", .{name});
+            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
+        };
+        return json.raw("{\"ok\":true}");
     }
 
     /// Read settings from an arbitrary path (the bound method binds
@@ -2462,13 +2596,23 @@ test "listDir impl lists and sorts entries" {
     try testing.expect(std.mem.indexOf(u8, r.text, "\"dir\":false") != null);
 }
 
-test "presets impl returns preset names" {
+test "presets impl lists builtins with kind and file" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var b = testBackend();
-    const names = try b.presetsImpl(arena.allocator());
-    try testing.expect(names.len >= 3);
-    try testing.expectEqualStrings("desktop", names[0]);
+    const r = try b.presetsImpl(arena.allocator());
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), r.text, .{});
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |arr| arr.items,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(items.len >= 3);
+    // Sorted by name: desktop first, with its kind and file.
+    const first = items[0].object;
+    try testing.expectEqualStrings("desktop", first.get("name").?.string);
+    try testing.expectEqualStrings("builtin", first.get("kind").?.string);
+    try testing.expectEqualStrings("desktop.zon", first.get("file").?.string);
 }
 
 test "presetLoad impl rejects traversal" {
@@ -2476,6 +2620,98 @@ test "presetLoad impl rejects traversal" {
     defer arena.deinit();
     var b = testBackend();
     try testing.expectError(error.InvalidPresetName, b.presetLoadImpl(arena.allocator(), "../build"));
+}
+
+/// Scratch preset dir with the live layout: one built-in `.zon`, room for
+/// user `.json` files. The atomic rename needs the dir to exist up front.
+fn seedPresetDir(a: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]const u8 {
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/presets", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = try std.fmt.allocPrint(a, "{s}/base.zon", .{dir}),
+        .data = ".{ .name = \"base\" }",
+    });
+    return dir;
+}
+
+const user_preset_json =
+    \\{"name": "mine", "steps": [{"prune": {"unused_nodes": true}}, {"join": {}}]}
+;
+
+test "user presets: save, list, load, delete round-trip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try seedPresetDir(a, &tmp);
+
+    const saved = try b.presetSaveJsonTo(a, dir, "mine", user_preset_json);
+    try testing.expectEqualStrings("{\"ok\":true}", saved.text);
+    // The bytes actually landed on disk, untouched by the backend.
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.allocPrint(a, "{s}/mine.json", .{dir}), a, .limited(max_text_bytes));
+    try testing.expectEqualStrings(user_preset_json, on_disk);
+
+    const listed = try b.presetsIn(a, dir);
+    try testing.expect(std.mem.indexOf(u8, listed.text, "{\"name\":\"base\",\"kind\":\"builtin\",\"file\":\"base.zon\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, listed.text, "{\"name\":\"mine\",\"kind\":\"user\",\"file\":\"mine.json\"}") != null);
+
+    // The loader prefers the `.json` text — which is what `optimizeCustom`
+    // accepts as a spec.
+    const loaded = try b.presetLoadFrom(a, dir, "mine");
+    try testing.expectEqualStrings(user_preset_json, loaded);
+    const base_text = try b.presetLoadFrom(a, dir, "base");
+    try testing.expectEqualStrings(".{ .name = \"base\" }", base_text);
+
+    // Overwriting your own preset is fine.
+    const again = try b.presetSaveJsonTo(a, dir, "mine", user_preset_json);
+    try testing.expectEqualStrings("{\"ok\":true}", again.text);
+
+    const deleted = try b.presetDeleteFrom(a, dir, "mine");
+    try testing.expectEqualStrings("{\"ok\":true}", deleted.text);
+    try testing.expectError(error.PresetNotFound, b.presetLoadFrom(a, dir, "mine"));
+}
+
+test "user presets: garbage fails validation, builtins are read-only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try seedPresetDir(a, &tmp);
+
+    for ([_][]const u8{
+        "not json",
+        "{\"name\":\"x\"}",
+        "{\"name\":\"x\",\"steps\":[]}",
+        "{\"name\":\"x\",\"steps\":[{\"frobnicate\":{}}]}",
+        "{\"name\":\"x\",\"steps\":[{\"weld\":{\"tolerance\":\"far\"}}]}",
+    }) |bad| {
+        const r = try b.presetSaveJsonTo(a, dir, "mine", bad);
+        try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") != null);
+    }
+    // Nothing landed on disk.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, try std.fmt.allocPrint(a, "{s}/mine.json", .{dir}), .{}));
+
+    // Built-in names are refused for save and delete alike.
+    const save_builtin = try b.presetSaveJsonTo(a, dir, "base", user_preset_json);
+    try testing.expect(std.mem.indexOf(u8, save_builtin.text, "builtin") != null);
+    const delete_builtin = try b.presetDeleteFrom(a, dir, "base");
+    try testing.expect(std.mem.indexOf(u8, delete_builtin.text, "builtin") != null);
+    // ... and unknown names have nothing to delete.
+    const delete_missing = try b.presetDeleteFrom(a, dir, "ghost");
+    try testing.expect(std.mem.indexOf(u8, delete_missing.text, "not found") != null);
+
+    // The name sanitizer: slashes, dots and blanks never become paths.
+    for ([_][]const u8{ "", "../build", "a/b", "has space", "semi;colon" }) |bad_name| {
+        try testing.expectError(error.InvalidPresetName, b.presetSaveJsonTo(a, dir, bad_name, user_preset_json));
+        try testing.expectError(error.InvalidPresetName, b.presetDeleteFrom(a, dir, bad_name));
+        try testing.expectError(error.InvalidPresetName, b.presetLoadFrom(a, dir, bad_name));
+    }
 }
 
 test "settings: save/load round-trip and atomic file on disk" {

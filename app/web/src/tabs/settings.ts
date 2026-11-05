@@ -17,6 +17,7 @@ import {
 } from "../settings";
 import type { Language, SettingsStatus, ThemeMode } from "../settings";
 import { clear, el } from "../ui";
+import type { PresetEntry } from "../bridge";
 import type { TabHandle } from "./types";
 
 /**
@@ -482,8 +483,9 @@ export function mountSettings(): TabHandle {
 
   root.append(main, side);
 
-  let names: string[] = [];
+  let entries: PresetEntry[] = [];
   let active: string | null = null;
+  let activeKind: PresetEntry["kind"] = "builtin";
   let presetBusy = false;
 
   function setPresetStatus(text: string, warn = false): void {
@@ -493,15 +495,15 @@ export function mountSettings(): TabHandle {
 
   function renderList(): void {
     clear(listHost);
-    if (names.length === 0) {
+    if (entries.length === 0) {
       listHost.append(el("div", { class: "muted", text: t("set.noPresets") }));
     }
-    for (const name of names) {
+    for (const entry of entries) {
       listHost.append(
         el(
           "div",
           {
-            class: `item ${name === active ? "selected" : ""}`,
+            class: `item ${entry.name === active ? "selected" : ""}`,
             style: {
               display: "flex",
               alignItems: "center",
@@ -512,10 +514,10 @@ export function mountSettings(): TabHandle {
               fontFamily: "var(--mono)",
               fontSize: "12px",
             },
-            onclick: () => void selectPreset(name),
+            onclick: () => void selectPreset(entry.name),
           },
-          el("span", { class: "kind", text: "preset" }),
-          el("span", { text: name }),
+          el("span", { class: "kind", text: entry.kind }),
+          el("span", { text: entry.name }),
         ),
       );
     }
@@ -523,16 +525,18 @@ export function mountSettings(): TabHandle {
 
   async function loadNames(): Promise<void> {
     try {
-      names = await app.bridge.presets();
+      entries = await app.bridge.presets();
     } catch (err) {
       app.toast(t("set.presetsFail", { message: (err as Error).message }), "error");
-      names = [];
+      entries = [];
     }
+    active = null;
     renderList();
   }
 
   async function selectPreset(name: string): Promise<void> {
     active = name;
+    activeKind = entries.find((e) => e.name === name)?.kind ?? "builtin";
     renderList();
     presetZon.disabled = true;
     presetZon.value = t("set.presetLoading");
@@ -552,7 +556,13 @@ export function mountSettings(): TabHandle {
     presetBusy = true;
     presetSaveBtn.disabled = true;
     try {
-      await app.bridge.presetSave(active, presetZon.value);
+      // User presets are JSON: validate + write the `.json` file like the
+      // Optimize tab does; built-ins keep the legacy `.zon` write.
+      if (activeKind === "user") {
+        await app.bridge.presetSaveJson(active, presetZon.value);
+      } else {
+        await app.bridge.presetSave(active, presetZon.value);
+      }
       setPresetStatus(t("set.presetSaved", { name: active }));
     } catch (err) {
       setPresetStatus(t("set.presetSaveFail", { message: (err as Error).message }), true);
@@ -619,7 +629,7 @@ export function mountSettings(): TabHandle {
     syncTheme();
     syncLangButtons();
     if (!dirty) json.value = settingsToJson();
-    if (names.length === 0) void loadNames();
+    if (entries.length === 0) void loadNames();
   });
 
   syncStrings();
@@ -638,7 +648,7 @@ export function mountSettings(): TabHandle {
       defaultsForm.sync();
       if (!updInfo && !updBusy) void loadUpdInfo();
       if (!dirty) json.value = settingsToJson();
-      if (names.length === 0) void loadNames();
+      if (entries.length === 0) void loadNames();
     },
     deactivate: () => {
       closeFieldHelp();

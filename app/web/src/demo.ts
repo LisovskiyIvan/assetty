@@ -9,6 +9,7 @@ import type {
   UpdateApply,
   UpdateCheck,
 } from "./types";
+import type { PresetEntry } from "./bridge/types";
 import type { ProgressEvent } from "./bridge/types";
 
 const helmetImages = [
@@ -104,8 +105,7 @@ export const demoEncode: EncodeResult = {
 /**
  * Stand-in image for demo mode (no host, no real pixels). Keyed by the path the
  * backend would have returned so before/after stay visually distinct.
- */
-const demoPngCache = new Map<string, string>();
+ */ const demoPngCache = new Map<string, string>();
 
 export function demoPngDataUrl(key: string): string {
   const hit = demoPngCache.get(key);
@@ -223,6 +223,9 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Demo-mode stand-in for `assetty.settings.json`. */
 const DEMO_SETTINGS_KEY = "assetty.settings.json";
+
+/** Demo-mode user presets: in-memory only, seeded empty every reload. */
+const userPresets = new Map<string, string>();
 
 export class DemoBackend {
   async info(path: string): Promise<Info> {
@@ -353,18 +356,52 @@ export class DemoBackend {
     await sleep(120);
   }
 
-  async presets(): Promise<string[]> {
+  async presets(): Promise<PresetEntry[]> {
     await sleep(40);
-    return [...demoPresets];
+    const builtin: PresetEntry[] = demoPresets.map((name) => ({
+      name,
+      kind: "builtin",
+      file: `${name}.zon`,
+    }));
+    const users: PresetEntry[] = [...userPresets.keys()]
+      .sort()
+      .map((name) => ({ name, kind: "user", file: `${name}.json` }));
+    return [...builtin, ...users];
   }
 
   async presetLoad(name: string): Promise<string> {
     await sleep(60);
+    const hit = userPresets.get(name);
+    if (hit !== undefined) return hit;
     return name === "desktop" ? demoZon : demoZon.replace(/\.desktop/g, `.${name}`);
   }
 
   async presetSave(): Promise<void> {
     await sleep(80);
+  }
+
+  /**
+   * Demo mode keeps user presets in memory (no disk, no backend): same
+   * validation shape as the host — JSON with a non-empty `steps` array.
+   */
+  async presetSaveJson(name: string, presetJson: string): Promise<void> {
+    await sleep(80);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(presetJson);
+    } catch {
+      throw new Error("invalid spec");
+    }
+    const steps = (parsed as { steps?: unknown })?.steps;
+    if (!Array.isArray(steps) || steps.length === 0) throw new Error("no steps");
+    userPresets.set(name, presetJson);
+  }
+
+  /** Demo mode drops the in-memory preset; built-ins are refused like live. */
+  async presetDelete(name: string): Promise<void> {
+    await sleep(60);
+    if (demoPresets.includes(name)) throw new Error(`cannot delete builtin preset "${name}"`);
+    if (!userPresets.delete(name)) throw new Error(`preset "${name}" not found`);
   }
 
   /**

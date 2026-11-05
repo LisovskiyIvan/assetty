@@ -1572,6 +1572,67 @@ input[type="range"] {
   color: var(--accent-fg);
 }
 
+/* --- user presets: dropdown menu + inline save --- */
+.preset-menu-wrap {
+  position: relative;
+}
+
+.preset-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 180px;
+  max-width: 260px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+}
+
+.preset-menu-row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.preset-menu-row + .preset-menu-row {
+  margin-top: 2px;
+}
+
+.preset-load {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  border-color: transparent;
+  background: none;
+}
+
+.preset-menu-empty {
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.preset-save-wrap {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+input.preset-name {
+  width: 140px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
 /* --- progress log line --- */
 .logline {
   font-size: 10px;

@@ -62,6 +62,10 @@ export function mountOptimize(): TabHandle {
       lods.render(items);
     },
     refreshTexExtra: () => syncTexExtra(),
+    syncStepsForm: () => {
+      form.sync();
+      syncTexExtra();
+    },
   });
   side.append(run.panel);
 

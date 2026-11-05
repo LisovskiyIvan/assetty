@@ -7,6 +7,13 @@ export interface ProgressEvent {
   sub?: { label: string; done: number; total: number };
 }
 
+/** One row of the `presets()` listing: built-ins ship as `.zon`, user presets save as `.json`. */
+export interface PresetEntry {
+  name: string;
+  kind: "builtin" | "user";
+  file: string;
+}
+
 /** Result of the native file picker. `path` is null when the user cancels. */
 export interface OpenDialogResult {
   path: string | null;
