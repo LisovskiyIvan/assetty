@@ -17,7 +17,11 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun install
+      # The inspector pulls the whole FluentUI tree into the bundle graph —
+      # rollup OOMs at the default 2 GB node heap on smaller runners.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       - run: bun run typecheck
       - run: bun install -g oxlint
       - run: oxlint src

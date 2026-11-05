@@ -49,8 +49,11 @@ jobs:
       # Fresh dist, so the GUI in the release is never stale.
       - run: bun install
         working-directory: app/web
+      # FluentUI (inspector peers) bloats the rollup graph — bigger heap.
       - run: bun run build
         working-directory: app/web
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       - run: zig build -Dtarget=${{ matrix.target }} -Dversion=${GITHUB_REF_NAME#v} -Drepo=${{ github.repository }} --summary all
       - run: sh tools/package.sh "${GITHUB_REF_NAME#v}" "${{ matrix.os }}" "${{ matrix.arch }}" "${{ matrix.ext }}"
         shell: bash

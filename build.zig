@@ -215,9 +215,16 @@ fn distAssets(b: *std.Build) *std.Build.Module {
                 continue;
             }
             if (entry.kind != .file) continue;
+            // Forward slashes everywhere: on a Windows host the walker yields
+            // `assets\name.js`, and `\a` is an invalid escape in the generated
+            // Zig string literals.
+            const rel = gpa.dupe(u8, entry.path) catch @panic("OOM");
+            for (rel) |*ch| {
+                if (ch.* == '\\') ch.* = '/';
+            }
             entries.append(gpa, .{
-                .url = b.fmt("/{s}", .{entry.path}),
-                .rel = b.dupe(entry.path),
+                .url = b.fmt("/{s}", .{rel}),
+                .rel = rel,
             }) catch @panic("OOM");
         }
     } else |_| {}
