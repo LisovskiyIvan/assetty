@@ -44,6 +44,16 @@ fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
 }
 
 fn viewBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
+    // Meshopt-compressed views keep the COMPRESSED payload in `data` while
+    // `size` reports the DECOMPRESSED length: slice the payload, not the view.
+    // (Parsed files without a linked decoder have `data == null` here and
+    // correctly fall through to the graceful `error.Unsupported` in serialize.)
+    if (v.has_meshopt_compression != 0) {
+        const d = v.data orelse return null;
+        const p: [*]const u8 = @ptrCast(d);
+        const n: usize = @intCast(v.meshopt_compression.size);
+        return p[0..n];
+    }
     if (v.data) |d| {
         const p: [*]const u8 = @ptrCast(d);
         return p[0..v.size];
@@ -552,6 +562,13 @@ const Ctx = struct {
     keep_stride: []const bool,
     bounds: []const ?Bounds,
     keep: *const Keep,
+    /// per old view index: kept meshopt-compressed view (payload in BIN at
+    /// view_off[i], decompressed layout at mc_ph[i] in the placeholder buffer)
+    mc_view: []const bool,
+    mc_ph: []const u64,
+    ph_total: u64,
+    placeholder_idx: u32,
+    has_mc: bool,
 };
 
 /// Map an old pool index to the emitted index, or null when the entry was
@@ -671,7 +688,22 @@ fn writeBuffer(o: *Out, ctx: *const Ctx, b: *const c.cgltf_buffer) !void {
     try o.endObj();
 }
 
+fn mcModeLabel(mode: c.cgltf_meshopt_compression_mode) []const u8 {
+    if (mode == c.cgltf_meshopt_compression_mode_attributes) return "ATTRIBUTES";
+    if (mode == c.cgltf_meshopt_compression_mode_triangles) return "TRIANGLES";
+    return "INDICES";
+}
+
+fn mcFilterLabel(filter: c.cgltf_meshopt_compression_filter) ?[]const u8 {
+    if (filter == c.cgltf_meshopt_compression_filter_none) return null;
+    if (filter == c.cgltf_meshopt_compression_filter_octahedral) return "OCTAHEDRAL";
+    if (filter == c.cgltf_meshopt_compression_filter_quaternion) return "QUATERNION";
+    if (filter == c.cgltf_meshopt_compression_filter_exponential) return "EXPONENTIAL";
+    return "COLOR";
+}
+
 fn writeBufferView(o: *Out, ctx: *const Ctx, i: usize, v: *const c.cgltf_buffer_view) !void {
+    if (i < ctx.mc_view.len and ctx.mc_view[i]) return writeMeshoptBufferView(o, ctx, i, v);
     try o.beginObj();
     if (cstr(v.name)) |s| {
         try o.key("name");
@@ -701,6 +733,85 @@ fn writeBufferView(o: *Out, ctx: *const Ctx, i: usize, v: *const c.cgltf_buffer_
         else => {},
     }
     try writeRawExtensions(o, v.extensions, v.extensions_count);
+    try writeExtras(o, &v.extras);
+    try o.endObj();
+}
+
+/// A meshopt-compressed view: `buffer`/`byteOffset`/`byteLength` describe the
+/// DECOMPRESSED layout in the placeholder buffer; the extension object points
+/// at the compressed payload in buffer 0 (the GLB BIN chunk).
+fn writeMeshoptBufferView(o: *Out, ctx: *const Ctx, i: usize, v: *const c.cgltf_buffer_view) !void {
+    const e = v.meshopt_compression;
+    const stride: usize = @intCast(e.stride);
+    const is_attr = e.mode == c.cgltf_meshopt_compression_mode_attributes;
+    try o.beginObj();
+    if (cstr(v.name)) |s| {
+        try o.key("name");
+        try o.str(s);
+    }
+    try o.key("buffer");
+    try o.int(ctx.placeholder_idx);
+    try o.key("byteOffset");
+    try o.int(ctx.mc_ph[i]);
+    // Decompressed size: stride * count (== v.size for our outputs).
+    try o.key("byteLength");
+    try o.int(v.size);
+    if (is_attr) {
+        // Emit byteStride only when it differs from the natural accessor
+        // stride (index views must not carry byteStride at all).
+        var natural: ?usize = null;
+        for (sl(c.cgltf_accessor, ctx.d.accessors, ctx.d.accessors_count), 0..) |*acc, ai| {
+            if (!ctx.keep.accessors.keep[ai] or acc.buffer_view != v) continue;
+            natural = c.cgltf_calc_size(acc.type, acc.component_type);
+            break;
+        }
+        if (natural == null or natural.? != stride) {
+            try o.key("byteStride");
+            try o.int(stride);
+        }
+    }
+    switch (v.type) {
+        1 => {
+            try o.key("target");
+            try o.int(@as(u32, 34963));
+        },
+        2 => {
+            try o.key("target");
+            try o.int(@as(u32, 34962));
+        },
+        else => {},
+    }
+    try o.key("extensions");
+    try o.beginObj();
+    try o.key("EXT_meshopt_compression");
+    try o.beginObj();
+    try o.key("buffer");
+    try o.int(@as(u32, 0));
+    try o.key("byteOffset");
+    try o.int(ctx.view_off[i]);
+    try o.key("byteLength");
+    try o.int(e.size);
+    try o.key("byteStride");
+    try o.int(stride);
+    try o.key("count");
+    try o.int(e.count);
+    try o.key("mode");
+    try o.str(mcModeLabel(e.mode));
+    if (mcFilterLabel(e.filter)) |f| {
+        try o.key("filter");
+        try o.str(f);
+    }
+    try o.endObj();
+    // Raw view extensions alongside ours (not produced by our op, but a
+    // parsed file could carry both — keep them, don't clobber).
+    for (sl(c.cgltf_extension, v.extensions, v.extensions_count)) |*re| {
+        const name = cstr(re.name) orelse continue;
+        if (std.mem.eql(u8, name, "EXT_meshopt_compression")) continue;
+        const edata = if (@intFromPtr(re.data) != 0) std.mem.span(re.data) else "{}";
+        try o.key(name);
+        try o.raw(if (isEmptyObjSlice(edata)) "{}" else edata);
+    }
+    try o.endObj();
     try writeExtras(o, &v.extras);
     try o.endObj();
 }
@@ -1550,12 +1661,34 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
         if (@intFromPtr(b.uri) != 0) return error.Unsupported;
     }
-    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count)) |*v| {
-        if (v.has_meshopt_compression != 0) return error.Unsupported;
-    }
+    // Meshopt-compressed views are first-class: the BIN chunk carries the
+    // compressed payloads, each view's extension object points at them, and a
+    // placeholder buffer backs the decompressed layout (see spec: fallback
+    // buffers). Re-serializing a parsed meshopt file still fails gracefully
+    // (`viewBytes` finds no decoded data) — no decoder is linked.
 
     // --- reachability GC: which pool entries are actually referenced? ---
     const keep = try Keep.compute(a, data);
+
+    // --- meshopt layout: placeholder offsets for compressed views ---------
+    const mc_view = try a.alloc(bool, data.buffer_views_count);
+    @memset(mc_view, false);
+    const mc_ph = try a.alloc(u64, data.buffer_views_count);
+    @memset(mc_ph, 0);
+    var ph_total: u64 = 0;
+    var has_mc = false;
+    for (sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
+        if (!keep.views.keep[i] or v.has_meshopt_compression == 0) continue;
+        mc_view[i] = true;
+        has_mc = true;
+        const rem = ph_total % 4;
+        if (rem != 0) ph_total += 4 - rem;
+        mc_ph[i] = ph_total;
+        ph_total += v.size;
+    }
+    // The compressed payloads live in buffer 0 (the BIN chunk): without any
+    // real buffer there is nowhere to point the extension objects.
+    if (has_mc and data.buffers_count == 0) return error.Unsupported;
 
     // --- BIN chunk: copy every kept buffer view, 4-byte aligned ---
     const view_off = try a.alloc(u64, data.buffer_views_count);
@@ -1629,6 +1762,11 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         .keep_stride = keep_stride,
         .bounds = bounds,
         .keep = &keep,
+        .mc_view = mc_view,
+        .mc_ph = mc_ph,
+        .ph_total = ph_total,
+        .placeholder_idx = @intCast(data.buffers_count),
+        .has_mc = has_mc,
     };
 
     // --- JSON chunk ---
@@ -1708,6 +1846,24 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
             try o.item();
             try writeBuffer(&o, &ctx, b);
+        }
+        if (ctx.has_mc) {
+            // Fallback buffer backing the decompressed layout (no URI, no
+            // BIN data): loaders with the extension ignore it, loaders
+            // without it fail on extensionsRequired, as the spec requires.
+            try o.item();
+            try o.beginObj();
+            try o.key("byteLength");
+            try o.int(ctx.ph_total);
+            try o.key("extensions");
+            try o.beginObj();
+            try o.key("EXT_meshopt_compression");
+            try o.beginObj();
+            try o.key("fallback");
+            try o.raw("true");
+            try o.endObj();
+            try o.endObj();
+            try o.endObj();
         }
         try o.endArr();
     }

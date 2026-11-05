@@ -1,4 +1,4 @@
-// Desktop pipeline: BC7 textures, highest quality, meshopt compression.
+// Desktop pipeline: BC7 textures, highest quality (meshopt_compression opt-in).
 .{
     .name = "desktop",
     .target = .desktop,
@@ -27,7 +27,7 @@
             .position_bits = 14,
             .normal_oct = true,
             .uv_bits = 12,
-            .compress = true,
+            .meshopt_compression = false,
         } },
     },
 }

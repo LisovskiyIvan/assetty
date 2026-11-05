@@ -150,3 +150,29 @@ export interface TexturePreview {
   width: number;
   height: number;
 }
+
+/** This build's identity (`appInfo` binding). */
+export interface AppInfo {
+  version: string;
+  repo: string;
+  platform: string;
+  arch: string;
+  asset: string;
+}
+
+/** Release-feed comparison (`updateCheck` binding). */
+export interface UpdateCheck {
+  available: boolean;
+  current: string;
+  version: string;
+  asset: string;
+  download_url: string;
+  notes_url: string;
+}
+
+/** Install outcome (`updateApply` binding). */
+export interface UpdateApply {
+  installed: boolean;
+  version: string;
+  restarted: boolean;
+}

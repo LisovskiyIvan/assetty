@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-macos
+            os: macos
+            arch: arm64
+            ext: zip
+          - runner: windows-latest
+            target: x86_64-windows-gnu
+            os: windows
+            arch: x64
+            ext: zip
+          - runner: ubuntu-22.04
+            target: x86_64-linux-gnu
+            os: linux
+            arch: x64
+            ext: tar.gz
+          - runner: ubuntu-22.04
+            target: aarch64-linux-gnu
+            os: linux
+            arch: arm64
+            ext: tar.gz
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: oven-sh/setup-bun@v2
+      # Fresh dist, so the GUI in the release is never stale.
+      - run: bun install
+        working-directory: app/web
+      - run: bun run build
+        working-directory: app/web
+      - run: zig build -Dtarget=${{ matrix.target }} -Dversion=${GITHUB_REF_NAME#v} -Drepo=${{ github.repository }} --summary all
+      - run: sh tools/package.sh "${GITHUB_REF_NAME#v}" "${{ matrix.os }}" "${{ matrix.arch }}" "${{ matrix.ext }}"
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assetty-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: python3 tools/manifest.py "${GITHUB_REF_NAME#v}" out
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

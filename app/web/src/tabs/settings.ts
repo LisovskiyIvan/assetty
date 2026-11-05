@@ -109,6 +109,168 @@ export function mountSettings(): TabHandle {
   });
   const info = el("div", { class: "hint settings-info" }, infoText, infoSchema);
 
+  /* ---------------------------------------------------------------- update */
+
+  type UpdView =
+    | { kind: "idle" }
+    | { kind: "checking" }
+    | { kind: "uptodate"; version: string }
+    | { kind: "available"; version: string }
+    | { kind: "updating" }
+    | { kind: "restarting"; manual: boolean; version: string }
+    | { kind: "error"; message: string };
+
+  const updHead = el("span");
+  const updVersion = el("div", { class: "hint" });
+  const updStatus = el("div", { class: "hint", role: "status" });
+  const updNotes = el("div", { class: "hint mono", style: { overflowWrap: "anywhere" } });
+  const updCheckBtn = el("button", { class: "small" });
+  const updApplyBtn = el("button", { class: "small primary" });
+
+  let updView: UpdView = { kind: "idle" };
+  let updInfo: { version: string; platform: string; arch: string } | null = null;
+  let updNotesUrl: string | null = null;
+  let updBusy = false;
+  /** Stale token for check/apply (busy-guarded ops). */
+  let updSeq = 0;
+  /** Separate token for the version load: it must never strand `updBusy`. */
+  let updInfoSeq = 0;
+
+  /** Re-renders the panel from state (static labels + dynamic status). */
+  function renderUpd(): void {
+    updHead.textContent = t("upd.title");
+    updVersion.textContent = updInfo
+      ? t("upd.current", {
+          version: updInfo.version,
+          platform: updInfo.platform,
+          arch: updInfo.arch,
+        })
+      : "…";
+    updCheckBtn.textContent = updView.kind === "checking" ? t("upd.checking") : t("upd.check");
+    updCheckBtn.disabled = updBusy;
+    updApplyBtn.hidden = !(
+      updView.kind === "available" ||
+      updView.kind === "updating" ||
+      updView.kind === "restarting"
+    );
+    updApplyBtn.textContent =
+      updView.kind === "updating"
+        ? t("upd.updating")
+        : updView.kind === "restarting"
+          ? t("upd.restarting")
+          : t("upd.updateRestart");
+    updApplyBtn.disabled = updBusy;
+    updStatus.className = "hint";
+    updStatus.style.color = "";
+    switch (updView.kind) {
+      case "idle":
+        updStatus.textContent = "";
+        break;
+      case "checking":
+        updStatus.textContent = t("upd.checking");
+        break;
+      case "uptodate":
+        updStatus.textContent = t("upd.upToDate", { version: updView.version });
+        break;
+      case "available":
+        updStatus.textContent = t("upd.available", { version: updView.version });
+        updStatus.style.color = "var(--accent)";
+        break;
+      case "updating":
+        updStatus.textContent = t("upd.updating");
+        break;
+      case "restarting":
+        updStatus.textContent = updView.manual
+          ? t("upd.installedManual", { version: updView.version })
+          : t("upd.restarting");
+        break;
+      case "error":
+        updStatus.textContent = updView.message;
+        updStatus.className = "hint settings-bad";
+        break;
+    }
+    const showNotes = updView.kind === "available" && !!updNotesUrl;
+    updNotes.hidden = !showNotes;
+    if (showNotes) updNotes.textContent = t("upd.notes", { url: updNotesUrl ?? "" });
+  }
+
+  async function loadUpdInfo(): Promise<void> {
+    const seq = ++updInfoSeq;
+    try {
+      const info = await app.bridge.appInfo();
+      if (seq !== updInfoSeq) return;
+      updInfo = { version: info.version, platform: info.platform, arch: info.arch };
+    } catch (err) {
+      if (seq !== updInfoSeq) return;
+      updInfo = null;
+      updView = { kind: "error", message: t("upd.loadFail", { message: (err as Error).message }) };
+    }
+    renderUpd();
+  }
+
+  async function checkUpdates(): Promise<void> {
+    if (updBusy) return;
+    updBusy = true;
+    const seq = ++updSeq;
+    updView = { kind: "checking" };
+    renderUpd();
+    try {
+      const res = await app.bridge.updateCheck();
+      if (seq !== updSeq) return;
+      updNotesUrl = res.available && res.notes_url ? res.notes_url : null;
+      updView = res.available
+        ? { kind: "available", version: res.version }
+        : { kind: "uptodate", version: res.version };
+    } catch (err) {
+      if (seq !== updSeq) return;
+      if (!app.bridge.live) {
+        app.toast(t("upd.demo"), "error");
+        updView = { kind: "error", message: t("upd.demo") };
+      } else {
+        const message = (err as Error).message;
+        app.toast(t("upd.checkFail", { message }), "error");
+        updView = { kind: "error", message: t("upd.checkFail", { message }) };
+      }
+    } finally {
+      if (seq === updSeq) updBusy = false;
+      renderUpd();
+    }
+  }
+
+  async function applyUpdates(): Promise<void> {
+    if (updBusy || updView.kind !== "available") return;
+    updBusy = true;
+    const seq = ++updSeq;
+    updView = { kind: "updating" };
+    renderUpd();
+    try {
+      const res = await app.bridge.updateApply();
+      if (seq !== updSeq) return;
+      // The host quits itself on success — "Restarting…" is the last thing
+      // this page shows; on `restarted: false` the install still stands and
+      // the user relaunches by hand.
+      updView = res.installed
+        ? { kind: "restarting", manual: !res.restarted, version: res.version }
+        : { kind: "uptodate", version: res.version };
+    } catch (err) {
+      if (seq !== updSeq) return;
+      if (!app.bridge.live) {
+        app.toast(t("upd.demo"), "error");
+        updView = { kind: "error", message: t("upd.demo") };
+      } else {
+        const message = (err as Error).message;
+        app.toast(t("upd.applyFail", { message }), "error");
+        updView = { kind: "error", message: t("upd.applyFail", { message }) };
+      }
+    } finally {
+      if (seq === updSeq) updBusy = false;
+      renderUpd();
+    }
+  }
+
+  updCheckBtn.addEventListener("click", () => void checkUpdates());
+  updApplyBtn.addEventListener("click", () => void applyUpdates());
+
   /* ---------------------------------------------------------------- theme */
 
   const themeHead = el("span");
@@ -230,6 +392,19 @@ export function mountSettings(): TabHandle {
   });
 
   const themeHint = el("div", { class: "hint" });
+  const updPanel = el(
+    "div",
+    { class: "panel" },
+    el("div", { class: "panel-head" }, updHead),
+    el(
+      "div",
+      { class: "panel-body" },
+      updVersion,
+      updStatus,
+      updNotes,
+      el("div", { class: "row" }, updCheckBtn, updApplyBtn),
+    ),
+  );
   const themePanel = el(
     "div",
     { class: "panel" },
@@ -266,7 +441,7 @@ export function mountSettings(): TabHandle {
       ),
     ),
   );
-  scroll.append(themePanel, langPanel, defaultsPanel, jsonPanel);
+  scroll.append(updPanel, themePanel, langPanel, defaultsPanel, jsonPanel);
 
   main.append(head, info, scroll);
 
@@ -422,6 +597,7 @@ export function mountSettings(): TabHandle {
       saveOk === null ? statusText(lastStatus) : saveOk ? t("set.savedNow") : t("set.saveFail");
     statusLine.className = lastStatus.state === "error" ? "hint settings-bad" : "hint muted";
     renderList();
+    renderUpd();
   }
 
   const offChange = onSettingsChange(() => {
@@ -449,6 +625,8 @@ export function mountSettings(): TabHandle {
   syncStrings();
   syncTheme();
   syncLangButtons();
+  renderUpd();
+  void loadUpdInfo();
 
   return {
     el: root,
@@ -456,7 +634,9 @@ export function mountSettings(): TabHandle {
       syncStrings();
       syncTheme();
       syncLangButtons();
+      renderUpd();
       defaultsForm.sync();
+      if (!updInfo && !updBusy) void loadUpdInfo();
       if (!dirty) json.value = settingsToJson();
       if (names.length === 0) void loadNames();
     },
@@ -464,6 +644,8 @@ export function mountSettings(): TabHandle {
       closeFieldHelp();
     },
     dispose: () => {
+      updSeq++;
+      updInfoSeq++;
       offChange();
       offStatus();
       offLang();

@@ -69,6 +69,10 @@ pub fn build(b: *std.Build) void {
         .files = &.{
             "meshoptimizer/quantization.cpp",
             "meshoptimizer/simplifier.cpp",
+            "meshoptimizer/allocator.cpp",
+            "meshoptimizer/indexcodec.cpp",
+            "meshoptimizer/vertexcodec.cpp",
+            "meshoptimizer/vertexfilter.cpp",
             // basis_universal v1_60: encoder (ETC1S + UASTC + KTX2) and transcoder
             "basisu/transcoder/basisu_transcoder.cpp",
             "basisu/encoder/3rdparty/android_astc_decomp.cpp",
@@ -101,9 +105,22 @@ pub fn build(b: *std.Build) void {
         core_mod.linkFramework("OpenCL", .{});
     }
 
+    // Release identity baked into the binary: `zig build -Dversion=0.2.0
+    // -Drepo=owner/name`. The release workflow passes both; local builds get
+    // dev defaults. Consumed by `assetty --version` and the app's
+    // updater bindings (appInfo/updateCheck/updateApply), which expect release
+    // assets named per `app/src/update.zig`.
+    const version = b.option([]const u8, "version", "Semver of this build (no leading v)") orelse "0.1.0-dev";
+    const repo = b.option([]const u8, "repo", "GitHub repo as owner/name (release feed)") orelse "LisovskiyIvan/assetty";
+
     // `config.has_app` is comptime-known, so a `-Dapp=false` CLI-only build
     // prunes the app branch in main.zig entirely (nanoui is never referenced).
-    const config_src = b.addWriteFiles().add("config.zig", b.fmt("pub const has_app: bool = {s};\n", .{if (want_app) "true" else "false"}));
+    const config_src = b.addWriteFiles().add("config.zig", b.fmt(
+        \\pub const has_app: bool = {s};
+        \\pub const version: []const u8 = "{s}";
+        \\pub const repo: []const u8 = "{s}";
+        \\
+    , .{ if (want_app) "true" else "false", version, repo }));
     const config_mod = b.createModule(.{ .root_source_file = config_src });
 
     const exe_imports: []const std.Build.Module.Import = if (want_app) &.{
@@ -159,6 +176,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "core", .module = core_mod },
+                .{ .name = "config", .module = config_mod },
                 .{ .name = "nanoui", .module = b.dependency("nanoui", .{
                     .target = target,
                     .optimize = optimize,

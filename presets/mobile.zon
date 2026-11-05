@@ -1,4 +1,4 @@
-// Mobile pipeline: ASTC textures, meshopt compression, no simplification.
+// Mobile pipeline: ASTC textures, no simplification (meshopt_compression opt-in).
 .{
     .name = "mobile",
     .target = .mobile,
@@ -27,7 +27,7 @@
             .position_bits = 14,
             .normal_oct = true,
             .uv_bits = 12,
-            .compress = true,
+            .meshopt_compression = false,
         } },
         // Optional aggressive step for mobile - not enabled by default:
         // .{ .simplify = .{ .target_ratio = 0.5, .aggressive = true } },

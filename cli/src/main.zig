@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const config = @import("config");
 
 const usage =
     \\assetty — glTF/GLB asset toolkit
@@ -11,6 +12,7 @@ const usage =
     \\  assetty textures <file.glb> [--encode N] [--json]
     \\  assetty presets
     \\  assetty optimize <file.glb> --preset <name|path.zon> [-o <out.glb>] [--report <r.json>] [--strip-animations]
+    \\  assetty --version          — print the build version
     \\
     \\Exit codes: 0 ok, 2 error
 ;
@@ -63,6 +65,13 @@ pub fn run(init: std.process.Init) !u8 {
         .textures => try cmdTextures(init, args[1..]),
         .presets => try cmdPresets(),
         .optimize => try cmdOptimize(init, args[1..]),
+        .version => blk: {
+            var stdout_buf: [256]u8 = undefined;
+            var wtr = std.Io.File.stdout().writer(init.io, &stdout_buf);
+            try wtr.interface.print("assetty {s}\n", .{config.version});
+            try wtr.interface.flush();
+            break :blk 0;
+        },
         .help => blk: {
             std.debug.print("{s}\n", .{usage});
             break :blk 0;
@@ -75,13 +84,14 @@ pub fn run(init: std.process.Init) !u8 {
     std.process.exit(code);
 }
 
-const Cmd = enum { info, textures, presets, optimize, help, unknown };
+const Cmd = enum { info, textures, presets, optimize, version, help, unknown };
 
 fn cmdId(s: []const u8) Cmd {
     if (std.mem.eql(u8, s, "info")) return .info;
     if (std.mem.eql(u8, s, "textures")) return .textures;
     if (std.mem.eql(u8, s, "presets")) return .presets;
     if (std.mem.eql(u8, s, "optimize")) return .optimize;
+    if (std.mem.eql(u8, s, "version") or std.mem.eql(u8, s, "--version") or std.mem.eql(u8, s, "-V")) return .version;
     if (std.mem.eql(u8, s, "help") or std.mem.eql(u8, s, "--help") or std.mem.eql(u8, s, "-h")) return .help;
     return .unknown;
 }

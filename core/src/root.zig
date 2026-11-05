@@ -13,6 +13,7 @@ pub const dedup = @import("ops/dedup.zig");
 pub const weld = @import("ops/weld.zig");
 pub const join = @import("ops/join.zig");
 pub const quantize = @import("ops/quantize.zig");
+pub const meshopt = @import("ops/meshopt.zig");
 pub const simplify = @import("ops/simplify.zig");
 
 test {

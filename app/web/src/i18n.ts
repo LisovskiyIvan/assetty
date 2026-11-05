@@ -354,6 +354,24 @@ const en: Dict = {
   "set.presetLoading": "// loading…",
   "set.presetLoadFail": "// load failed: {message}",
 
+  // updates (Settings tab)
+  "upd.title": "Update",
+  "upd.current": "Current: {version} ({platform}-{arch})",
+  "upd.check": "Check for updates",
+  "upd.checking": "Checking…",
+  "upd.upToDate": "You're on the latest ({version})",
+  "upd.available": "{version} available",
+  "upd.updateRestart": "Update & restart",
+  "upd.updating": "Updating…",
+  "upd.restarting": "Restarting…",
+  "upd.installedManual": "Installed {version} — quit and reopen the app",
+  "upd.alreadyUp": "Already up to date",
+  "upd.notes": "Release notes: {url}",
+  "upd.checkFail": "Check failed: {message}",
+  "upd.applyFail": "Update failed: {message}",
+  "upd.demo": "demo mode — updates need the assetty binary",
+  "upd.loadFail": "version unavailable: {message}",
+
   // toasts / backend wrappers
   "toast.openFailed": "open failed: {message}",
   "toast.noOptimizeCustom":
@@ -761,6 +779,23 @@ const ru: Dict = {
   "set.presetPick": "// выберите пресет ниже",
   "set.presetLoading": "// загрузка…",
   "set.presetLoadFail": "// ошибка загрузки: {message}",
+
+  "upd.title": "Обновление",
+  "upd.current": "Текущая: {version} ({platform}-{arch})",
+  "upd.check": "Проверить обновления",
+  "upd.checking": "Проверка…",
+  "upd.upToDate": "У вас последняя версия ({version})",
+  "upd.available": "Доступна {version}",
+  "upd.updateRestart": "Обновить и перезапустить",
+  "upd.updating": "Обновление…",
+  "upd.restarting": "Перезапуск…",
+  "upd.installedManual": "Установлено {version} — закройте и откройте приложение",
+  "upd.alreadyUp": "Уже последняя версия",
+  "upd.notes": "Что нового: {url}",
+  "upd.checkFail": "Проверка не удалась: {message}",
+  "upd.applyFail": "Обновление не удалось: {message}",
+  "upd.demo": "демо-режим — для обновлений нужен бинарник assetty",
+  "upd.loadFail": "версию узнать не удалось: {message}",
 
   "toast.openFailed": "ошибка открытия: {message}",
   "toast.noOptimizeCustom": 'у бэкенда нет optimizeCustom() — запускаю пресет "{preset}"',

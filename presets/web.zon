@@ -27,7 +27,7 @@
             .position_bits = 14,
             .normal_oct = true,
             .uv_bits = 12,
-            .compress = true,
+            .meshopt_compression = false,
         } },
     },
 }

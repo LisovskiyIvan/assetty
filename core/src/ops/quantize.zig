@@ -40,11 +40,14 @@
 //!
 //! `normal_oct` is accepted for API stability: octahedral encoding would require
 //! emitting NORMAL as a 2-component attribute, which core glTF forbids, so we
-//! emit plain 15-bit SNORM VEC3/VEC4 instead.
+//! emit plain 15-bit SNORM VEC3/VEC4 instead. (With `meshopt_compression` the
+//! oct path still happens — inside EXT_meshopt_compression views with the
+//! OCTAHEDRAL filter, where the extension spec explicitly allows it.)
 
 const std = @import("std");
 const c = @import("cgltf");
 const mo = @import("meshopt");
+const mc = @import("meshopt.zig");
 
 pub const Options = struct {
     position_bits: u5 = 14,
@@ -53,6 +56,13 @@ pub const Options = struct {
     /// quantize in place: rewrite accessors as normalized u16/u8 (valid core
     /// glTF, no EXT_meshopt_compression yet)
     in_place: bool = true,
+    /// EXT_meshopt_compression (gltfpack-style `-cc`): meshopt-compress every
+    /// eligible vertex/index buffer view (quantized or not) and mark it with
+    /// the extension. Output requires an EXT_meshopt_compression-capable
+    /// loader (registered in extensionsUsed + extensionsRequired). Needs the
+    /// codec objects linked (see ops/meshopt.zig); without them the flag is a
+    /// loud no-op (Result.meshopt_no_codec) and the output stays plain glTF.
+    meshopt_compression: bool = false,
 };
 
 pub const Result = struct {
@@ -61,6 +71,10 @@ pub const Result = struct {
     quantized_normals: u32 = 0,
     /// nodes whose TRS got a dequant map baked in
     dequantized_nodes: u32 = 0,
+    /// buffer views carrying EXT_meshopt_compression
+    meshopt_views: u32 = 0,
+    /// meshopt requested but the codec objects are not linked
+    meshopt_no_codec: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -671,6 +685,9 @@ fn computeBounds(a: std.mem.Allocator, acc: [*c]const c.cgltf_accessor) !?Bounds
 }
 
 /// Build the quantized accessor + buffer view for one source accessor.
+///
+/// Always emits the historical tight layout (6-byte VEC3): the meshopt pass
+/// picks its own padded / octahedral layouts per view when they win on size.
 fn build(
     a: std.mem.Allocator,
     data: *const c.cgltf_data,
@@ -1215,7 +1232,460 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
         try ensureExtension(data, "KHR_mesh_quantization", true);
         try ensureExtension(data, "KHR_mesh_quantization", false);
     }
+
+    // EXT_meshopt_compression over every eligible vertex/index view.
+    if (mc.have_codec) {
+        if (opts.meshopt_compression) {
+            try compressViews(a, data, &res, opts);
+            if (res.meshopt_views > 0) {
+                try ensureExtension(data, "EXT_meshopt_compression", true);
+                try ensureExtension(data, "EXT_meshopt_compression", false);
+            }
+        }
+    } else if (opts.meshopt_compression) {
+        res.meshopt_no_codec = true;
+    }
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// EXT_meshopt_compression (all codec calls live here, behind have_codec)
+// ---------------------------------------------------------------------------
+
+/// Views smaller than this are left uncompressed: the extension JSON (~150 B)
+/// would eat the savings.
+const min_compress_bytes: usize = 256;
+
+const Use = struct {
+    const vertex: u8 = 1;
+    const index: u8 = 2;
+    const image: u8 = 4;
+    const other: u8 = 8;
+};
+
+/// Raw bytes of a buffer view (op-built `data` or the buffer slice).
+/// Null when unavailable — including already-compressed views, which our
+/// cgltf cannot decode (no meshopt decoder linked): never touch those.
+fn viewRawBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
+    if (v.has_meshopt_compression != 0) return null;
+    if (v.data) |d| {
+        const p: [*]const u8 = @ptrCast(d);
+        return p[0..v.size];
+    }
+    if (@intFromPtr(v.buffer) == 0) return null;
+    const data = v.buffer.*.data orelse return null;
+    const bsize: usize = @intCast(v.buffer.*.size);
+    const off: usize = @intCast(v.offset);
+    const sz: usize = @intCast(v.size);
+    if (off > bsize or sz > bsize - off) return null;
+    const p: [*]const u8 = @ptrCast(data);
+    return p[off .. off + sz];
+}
+
+/// Install `enc` as the view payload: op-built allocations are reused
+/// in place (the encoding only ever shrinks), parsed buffer-backed views get
+/// a fresh cgltf-owned allocation. `v.size` keeps the DECOMPRESSED length.
+fn installPayload(data: *const c.cgltf_data, a: std.mem.Allocator, v: *c.cgltf_buffer_view, enc: []u8) !void {
+    if (v.data) |d| {
+        const p: [*]u8 = @ptrCast(d);
+        @memcpy(p[0..enc.len], enc);
+        a.free(enc);
+    } else {
+        const mem = allocRaw(data, enc.len) orelse return error.OutOfMemory;
+        @memcpy(mem[0..enc.len], enc);
+        a.free(enc);
+        v.data = mem;
+    }
+    v.has_meshopt_compression = 1;
+}
+
+/// Per-view attribute census for the ATTRIBUTES candidate picker.
+const AttrUse = struct {
+    /// Natural element size of every user, 0 when mixed.
+    elem: usize = 0,
+    /// Accessor stride consensus, 0 when mixed.
+    astride: usize = 0,
+    /// cgltf_attribute_type of every user, -2 when mixed, -1 when none yet.
+    sem: c_int = -1,
+    /// Any user is a morph-target attribute (deltas, never unit vectors).
+    has_morph: bool = false,
+    /// Every user is a normalized snorm accessor (oct needs unit vectors).
+    all_signed_norm: bool = true,
+    /// Every user has a 6-byte element (VEC3 x 16-bit).
+    all_elem6: bool = true,
+    found: bool = false,
+    /// Referencing accessors (for post-compress stride updates).
+    accs: std.ArrayListUnmanaged(*c.cgltf_accessor) = .empty,
+};
+
+/// Fold one vertex accessor into the census. Returns true when the view is
+/// ineligible (mixed strides, unreadable offsets).
+fn checkAttrElem(
+    at: *const c.cgltf_attribute,
+    is_morph: bool,
+    v: *const c.cgltf_buffer_view,
+    use: *AttrUse,
+    a: std.mem.Allocator,
+) !bool {
+    if (@intFromPtr(at.data) == 0) return false;
+    const acc: *c.cgltf_accessor = @ptrCast(at.data);
+    const e: usize = c.cgltf_calc_size(acc.type, acc.component_type);
+    if (e == 0) return true;
+    const off: usize = @intCast(acc.offset);
+    const astride: usize = if (acc.stride != 0) @intCast(acc.stride) else e;
+    if (astride < e) return true;
+    if (v.stride != 0) {
+        const s: usize = @intCast(v.stride);
+        if (off + e > s) return true;
+    } else {
+        if (off % e != 0) return true;
+    }
+    if (use.elem != 0 and use.elem != e) use.all_elem6 = false else use.elem = e;
+    if (use.found and use.astride != astride) return true;
+    use.astride = astride;
+    if (use.sem == -1) {
+        use.sem = @intCast(at.type);
+    } else if (use.sem != @as(c_int, @intCast(at.type))) {
+        use.sem = -2;
+    }
+    if (is_morph) use.has_morph = true;
+    const signed = acc.component_type == c.cgltf_component_type_r_16 or acc.component_type == c.cgltf_component_type_r_8;
+    if (acc.normalized == 0 or !signed) use.all_signed_norm = false;
+    if (!use.found) use.all_elem6 = e == 6;
+    use.found = true;
+    try use.accs.append(a, acc);
+    return false;
+}
+
+/// Encode `raw` (count elements of `stride` bytes) when it shrinks; null on
+/// incompressible input or when the codec is unavailable (unreachable here,
+/// the caller guards on have_codec). OOM propagates.
+fn tryEncode(a: std.mem.Allocator, raw: []const u8, count: usize, stride: usize) !?[]u8 {
+    const enc = mc.encodeVertices(a, raw, count, stride) catch |err| switch (err) {
+        error.CodecFailed => return null,
+        else => |e| return e,
+    };
+    return enc;
+}
+
+/// Compress one vertex-attribute view (ATTRIBUTES mode).
+///
+/// Tries every layout the codec allows and installs the smallest payload —
+/// but only when it beats the current (tight) size, so meshopt can never
+/// lose against the plain quantize output:
+///   * direct encode when the stride is already a multiple of 4 (covers
+///     interleaved views too: the codec is byte-exact for any stride),
+///   * VEC3 (6 B) zero-padded to an 8-byte stride,
+///   * octahedral K=12 re-encode (8 B, filter OCTAHEDRAL) for uniform,
+///     normalized, non-morph NORMAL (VEC3) / TANGENT (VEC4, W preserved).
+fn compressAttributes(
+    a: std.mem.Allocator,
+    data: *c.cgltf_data,
+    res: *Result,
+    v: *c.cgltf_buffer_view,
+    raw: []const u8,
+    opts: Options,
+) !void {
+    var use: AttrUse = .{};
+    defer use.accs.deinit(a);
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
+                if (try checkAttrElem(at, false, v, &use, a)) return;
+            }
+            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+                    if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
+                    if (try checkAttrElem(at, true, v, &use, a)) return;
+                }
+            }
+        }
+    }
+    if (!use.found) return;
+    const base_stride: usize = if (v.stride != 0) @intCast(v.stride) else use.astride;
+    // A view stride that disagrees with every accessor stride is corrupt.
+    if (v.stride != 0 and use.astride != 0 and base_stride != use.astride) return;
+    if (base_stride == 0 or base_stride > 256) return;
+    if (raw.len % base_stride != 0) return;
+    const count: usize = raw.len / base_stride;
+    if (count == 0) return;
+
+    var best: ?[]u8 = null;
+    defer if (best) |b| a.free(b);
+    var best_stride: usize = 0;
+    var best_oct = false;
+
+    // Candidate 1: direct encode (byte-exact for any stride).
+    if (base_stride % 4 == 0) {
+        if (try tryEncode(a, raw, count, base_stride)) |enc| {
+            best = enc;
+            best_stride = base_stride;
+        }
+    }
+    // Candidate 2: VEC3 zero-padded to 8.
+    if (use.all_elem6 and use.elem == 6) {
+        const padded = try a.alloc(u8, count * 8);
+        defer a.free(padded);
+        for (0..count) |k| {
+            @memcpy(padded[k * 8 ..][0..6], raw[k * 6 ..][0..6]);
+            @memset(padded[k * 8 + 6 ..][0..2], 0);
+        }
+        if (try tryEncode(a, padded, count, 8)) |enc| {
+            if (best == null or enc.len < best.?.len) {
+                if (best) |b| a.free(b);
+                best = enc;
+                best_stride = 8;
+            } else {
+                a.free(enc);
+            }
+        }
+    }
+    // Candidate 3: octahedral K=12 (unit normals/tangents only).
+    const oct_sem = use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_normal)) or use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent));
+    const oct_elem_ok = (use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_normal)) and use.elem == 6) or
+        (use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent)) and use.elem == 8);
+    if (oct_sem and oct_elem_ok and use.all_elem6 and !use.has_morph and use.all_signed_norm and opts.normal_oct) {
+        const f4 = try a.alloc(f32, count * 4);
+        defer a.free(f4);
+        const is_tangent = use.sem == @as(c_int, @intCast(c.cgltf_attribute_type_tangent));
+        for (0..count) |k| {
+            for (0..3) |ax| {
+                const q = std.mem.readInt(i16, raw[k * use.elem + ax * 2 ..][0..2], .little);
+                f4[k * 4 + ax] = @as(f32, @floatFromInt(q)) / 32767.0;
+            }
+            // Tangent W passes through verbatim; normals store 0.
+            f4[k * 4 + 3] = if (is_tangent) @as(f32, @floatFromInt(std.mem.readInt(i16, raw[k * use.elem + 6 ..][0..2], .little))) / 32767.0 else 0;
+        }
+        // 12-bit oct: matches gltfpack's -cc quality/size trade-off.
+        const oct = try a.alloc(u8, count * 8);
+        defer a.free(oct);
+        try mc.encodeFilterOct(oct, count, 8, 12, f4);
+        if (try tryEncode(a, oct, count, 8)) |enc| {
+            if (best == null or enc.len < best.?.len) {
+                if (best) |b| a.free(b);
+                best = enc;
+                best_stride = 8;
+                best_oct = true;
+            } else {
+                a.free(enc);
+            }
+        }
+    }
+
+    const win = best orelse return;
+    if (win.len >= raw.len) return; // never lose vs the tight layout
+    if (best_stride != base_stride) {
+        // Padded / octahedral layouts decode to best_stride bytes per
+        // element: resize the view and the accessor strides to match.
+        for (use.accs.items) |acc| acc.stride = best_stride;
+        v.size = count * best_stride;
+    }
+    const enc_len: usize = win.len;
+    best = null; // installPayload takes ownership (frees after copying)
+    try installPayload(data, a, v, win);
+    v.meshopt_compression = .{
+        .buffer = if (data.buffers_count > 0) data.buffers else null,
+        .offset = 0, // assigned by the writer's BIN layout
+        .size = enc_len,
+        .stride = best_stride,
+        .count = count,
+        .mode = c.cgltf_meshopt_compression_mode_attributes,
+        .filter = if (best_oct) c.cgltf_meshopt_compression_filter_octahedral else c.cgltf_meshopt_compression_filter_none,
+        .is_khr = 0,
+    };
+    res.meshopt_views += 1;
+}
+
+/// Compress one index view (TRIANGLES for triangle lists, else INDICES).
+/// u8 indices widen to u16; every referencing accessor must cover the whole
+/// view (rotation within a triangle keeps per-triangle sets, so sub-range
+/// accessors would read shifted values — those views stay uncompressed).
+fn compressIndices(
+    a: std.mem.Allocator,
+    data: *c.cgltf_data,
+    res: *Result,
+    v: *c.cgltf_buffer_view,
+    raw: []const u8,
+) !void {
+    var refs: std.ArrayListUnmanaged(*c.cgltf_accessor) = .empty;
+    defer refs.deinit(a);
+    var s_orig: usize = 0;
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            if (@intFromPtr(p.indices) == 0) continue;
+            const acc: *c.cgltf_accessor = @ptrCast(p.indices);
+            if (acc.buffer_view != v) continue;
+            const s: usize = switch (acc.component_type) {
+                c.cgltf_component_type_r_8u => 1,
+                c.cgltf_component_type_r_16u => 2,
+                c.cgltf_component_type_r_32u => 4,
+                else => return,
+            };
+            if (s_orig == 0) {
+                s_orig = s;
+            } else if (s_orig != s) {
+                return;
+            }
+            // Whole-view coverage only (see doc comment).
+            if (acc.offset != 0) return;
+            if (@as(usize, @intCast(acc.count)) * s != raw.len) return;
+            try refs.append(a, acc);
+        }
+    }
+    if (refs.items.len == 0 or s_orig == 0) return;
+    if (raw.len % s_orig != 0) return;
+    const n_idx: usize = raw.len / s_orig;
+    if (n_idx == 0) return;
+
+    const idx = try a.alloc(u32, n_idx);
+    defer a.free(idx);
+    switch (s_orig) {
+        1 => {
+            for (raw, 0..) |b, k| idx[k] = b;
+        },
+        2 => {
+            for (0..n_idx) |k| idx[k] = std.mem.readInt(u16, raw[k * 2 ..][0..2], .little);
+        },
+        else => {
+            for (0..n_idx) |k| idx[k] = std.mem.readInt(u32, raw[k * 4 ..][0..4], .little);
+        },
+    }
+    var idx_max: u32 = 0;
+    for (idx) |ix| idx_max = @max(idx_max, ix);
+    const s_new: usize = if (idx_max <= 0xffff) 2 else 4;
+    if (n_idx * s_new < min_compress_bytes) return;
+
+    // Triangle lists (default/empty mode counts as triangles, like the
+    // writer) use the triangle codec; anything else the index sequence.
+    var all_tris = n_idx % 3 == 0;
+    var any_user = false;
+    outer: for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            if (@intFromPtr(p.indices) == 0) continue;
+            const acc: *c.cgltf_accessor = @ptrCast(p.indices);
+            if (acc.buffer_view != v) continue;
+            any_user = true;
+            if (p.type != 0 and p.type != 5) {
+                all_tris = false;
+                break :outer;
+            }
+        }
+    }
+    if (!any_user) return;
+
+    const enc = if (all_tris)
+        mc.encodeTriangles(a, idx) catch |err| switch (err) {
+            error.CodecFailed => return,
+            else => |e| return e,
+        }
+    else
+        mc.encodeSequence(a, idx) catch |err| switch (err) {
+            error.CodecFailed => return,
+            else => |e| return e,
+        };
+    // The codec's own shrink check is against u32 data: enforce the real
+    // never-lose rule against the decoded (possibly 16-bit) size here.
+    if (enc.len >= n_idx * s_new) {
+        a.free(enc);
+        return;
+    }
+    const enc_len: usize = enc.len;
+    try installPayload(data, a, v, enc);
+    v.size = n_idx * s_new; // decoded length (widens u8 -> u16)
+    for (refs.items) |acc| {
+        acc.component_type = if (s_new == 2) c.cgltf_component_type_r_16u else c.cgltf_component_type_r_32u;
+        acc.stride = s_new;
+    }
+    v.meshopt_compression = .{
+        .buffer = if (data.buffers_count > 0) data.buffers else null,
+        .offset = 0, // assigned by the writer's BIN layout
+        .size = enc_len,
+        .stride = s_new,
+        .count = n_idx,
+        .mode = if (all_tris) c.cgltf_meshopt_compression_mode_triangles else c.cgltf_meshopt_compression_mode_indices,
+        .filter = c.cgltf_meshopt_compression_filter_none,
+        .is_khr = 0,
+    };
+    res.meshopt_views += 1;
+}
+
+/// Meshopt-compress every eligible mesh vertex/index view in place.
+/// Ineligible views (sparse, images, animations, skins, instancing,
+/// interleaved-mixed, tiny, incompressible) stay uncompressed; the writer
+/// only marks views with `has_meshopt_compression`.
+fn compressViews(a: std.mem.Allocator, data: *c.cgltf_data, res: *Result, opts: Options) !void {
+    const n_views: usize = data.buffer_views_count;
+    if (n_views == 0) return;
+    const usage = try a.alloc(u8, n_views);
+    defer a.free(usage);
+    @memset(usage, 0);
+    const views = sl(c.cgltf_buffer_view, data.buffer_views, n_views);
+
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                if (@intFromPtr(at.data) == 0) continue;
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
+            }
+            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+                    if (@intFromPtr(at.data) == 0) continue;
+                    if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
+                }
+            }
+            if (@intFromPtr(p.indices) != 0) {
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.indices.*.buffer_view)) |vi| usage[vi] |= Use.index;
+            }
+            if (@intFromPtr(p.draco_mesh_compression.buffer_view) != 0) {
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.draco_mesh_compression.buffer_view)) |vi| usage[vi] |= Use.other;
+            }
+        }
+    }
+    for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
+        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, im.buffer_view)) |vi| usage[vi] |= Use.image;
+    }
+    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+            if (@intFromPtr(s.input) != 0) {
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.input.*.buffer_view)) |vi| usage[vi] |= Use.other;
+            }
+            if (@intFromPtr(s.output) != 0) {
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.output.*.buffer_view)) |vi| usage[vi] |= Use.other;
+            }
+        }
+    }
+    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+        if (@intFromPtr(sk.inverse_bind_matrices) != 0) {
+            if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, sk.inverse_bind_matrices.*.buffer_view)) |vi| usage[vi] |= Use.other;
+        }
+    }
+    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
+        if (nd.has_mesh_gpu_instancing != 0) {
+            for (sl(c.cgltf_attribute, nd.mesh_gpu_instancing.attributes, nd.mesh_gpu_instancing.attributes_count)) |*at| {
+                if (@intFromPtr(at.data) == 0) continue;
+                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.other;
+            }
+        }
+    }
+    // Sparse storage is never eligible.
+    for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
+        if (acc.is_sparse == 0) continue;
+        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.indices_buffer_view)) |vi| usage[vi] |= Use.other;
+        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.values_buffer_view)) |vi| usage[vi] |= Use.other;
+    }
+
+    for (views, 0..) |*v, i| {
+        const u = usage[i];
+        if (u != Use.vertex and u != Use.index) continue;
+        const raw = viewRawBytes(v) orelse continue;
+        if (raw.len < min_compress_bytes) continue;
+        if (u == Use.vertex) {
+            try compressAttributes(a, data, res, v, raw, opts);
+        } else {
+            try compressIndices(a, data, res, v, raw);
+        }
+    }
 }
 
 /// append `name` to extensions_used (required=true) or extensions_required;
@@ -1830,4 +2300,365 @@ test "quantize: transform-animated nodes keep float positions" {
     try std.testing.expectEqual(@as(u32, 0), res.quantized_positions);
     const pos = firstAttrAcc(loaded.cdata, c.cgltf_attribute_type_position) orelse return error.NoPosition;
     try std.testing.expectEqual(@as(c.cgltf_component_type, c.cgltf_component_type_r_32f), pos.component_type);
+}
+
+// ---------------------------------------------------------------------------
+// EXT_meshopt_compression end to end (DamagedHelmet)
+// ---------------------------------------------------------------------------
+
+/// JSON chunk of a GLB (unvalidated; tests only run it on our own output).
+fn glbJson(bytes: []const u8) ![]const u8 {
+    if (bytes.len < 20) return error.BadGlb;
+    const jlen: usize = std.mem.readInt(u32, bytes[12..16], .little);
+    if (20 + jlen > bytes.len) return error.BadGlb;
+    return bytes[20 .. 20 + jlen];
+}
+
+fn jsonU64(v: std.json.Value) !u64 {
+    return switch (v) {
+        .integer => |i| @intCast(i),
+        .float => |f| @intFromFloat(f),
+        else => error.BadJson,
+    };
+}
+
+/// Raw (or, for compressed views, compressed-payload) bytes of a parsed view.
+fn parsedViewBytes(data: *c.cgltf_data, i: usize) ![]const u8 {
+    const views = sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count);
+    if (i >= views.len) return error.BadView;
+    const v = &views[i];
+    if (v.has_meshopt_compression != 0) {
+        const m = v.meshopt_compression;
+        const b = m.buffer orelse return error.NoPayload;
+        const bd = b.*.data orelse return error.NoPayload;
+        const base: [*]const u8 = @ptrCast(bd);
+        const off: usize = @intCast(m.offset);
+        const sz: usize = @intCast(m.size);
+        const bsize: usize = @intCast(b.*.size);
+        if (off > bsize or sz > bsize - off) return error.BadPayload;
+        return (base + off)[0..sz];
+    }
+    if (v.data) |d| {
+        const p: [*]const u8 = @ptrCast(d);
+        return p[0..v.size];
+    }
+    const b = v.buffer orelse return error.NoPayload;
+    const bd = b.*.data orelse return error.NoPayload;
+    const base: [*]const u8 = @ptrCast(bd);
+    const bsize: usize = @intCast(b.*.size);
+    const off: usize = @intCast(v.offset);
+    const sz: usize = @intCast(v.size);
+    if (off > bsize or sz > bsize - off) return error.BadPayload;
+    return (base + off)[0 .. off + sz];
+}
+
+/// First accessor for (mesh, prim, attribute name) in lockstep-walked cdata.
+fn primAttrAcc(data: *c.cgltf_data, mi: usize, pi: usize, name: []const u8) ?*c.cgltf_accessor {
+    const meshes = sl(c.cgltf_mesh, data.meshes, data.meshes_count);
+    if (mi >= meshes.len) return null;
+    const prims = sl(c.cgltf_primitive, meshes[mi].primitives, meshes[mi].primitives_count);
+    if (pi >= prims.len) return null;
+    for (sl(c.cgltf_attribute, prims[pi].attributes, prims[pi].attributes_count)) |*at| {
+        if (@intFromPtr(at.name) == 0) continue;
+        if (!std.mem.eql(u8, std.mem.span(at.name), name)) continue;
+        return @ptrCast(at.data);
+    }
+    return null;
+}
+
+fn unpackFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) ![]f32 {
+    var cp = acc.*;
+    const ncomp = numComponents(cp.type);
+    const out = try a.alloc(f32, @as(usize, @intCast(acc.count)) * ncomp);
+    if (cp.stride == 0) cp.stride = c.cgltf_calc_size(cp.type, cp.component_type);
+    const got = c.cgltf_accessor_unpack_floats(&cp, out.ptr, out.len);
+    if (got < out.len) return error.UnpackFailed;
+    return out;
+}
+
+/// Spec-shape assertions on the emitted JSON: extension objects, decompressed
+/// byteLength, extensionsUsed + extensionsRequired, fallback buffer.
+fn expectMeshoptJson(json_bytes: []const u8, n_views: usize) !void {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json_bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object.get("bufferViews") orelse return error.NoViews;
+    try std.testing.expectEqual(n_views, root.array.items.len);
+
+    var n_mc: usize = 0;
+    for (root.array.items) |vj| {
+        const vo = vj.object;
+        const exts = vo.get("extensions") orelse continue;
+        const mcj = exts.object.get("EXT_meshopt_compression") orelse continue;
+        n_mc += 1;
+        const mco = mcj.object;
+        const byte_stride = try jsonU64(mco.get("byteStride") orelse return error.NoField);
+        const count = try jsonU64(mco.get("count") orelse return error.NoField);
+        _ = try jsonU64(mco.get("buffer") orelse return error.NoField);
+        _ = try jsonU64(mco.get("byteOffset") orelse return error.NoField);
+        _ = try jsonU64(mco.get("byteLength") orelse return error.NoField);
+        const mode = mco.get("mode") orelse return error.NoField;
+        try std.testing.expect(mode == .string);
+        const ok_mode = std.mem.eql(u8, mode.string, "ATTRIBUTES") or
+            std.mem.eql(u8, mode.string, "TRIANGLES") or
+            std.mem.eql(u8, mode.string, "INDICES");
+        try std.testing.expect(ok_mode);
+        if (mco.get("filter")) |f| {
+            try std.testing.expect(f == .string);
+            try std.testing.expect(std.mem.eql(u8, f.string, "OCTAHEDRAL"));
+        }
+        // Parent byteLength reports the DECOMPRESSED size loaders allocate.
+        const parent_len = try jsonU64(vo.get("byteLength") orelse return error.NoField);
+        try std.testing.expectEqual(byte_stride * count, parent_len);
+    }
+    try std.testing.expect(n_mc > 0);
+
+    for ([_]struct { key: []const u8 }{ .{ .key = "extensionsUsed" }, .{ .key = "extensionsRequired" } }) |k| {
+        const arr = parsed.value.object.get(k.key) orelse return error.NoExts;
+        var found = false;
+        for (arr.array.items) |e| {
+            if (e == .string and std.mem.eql(u8, e.string, "EXT_meshopt_compression")) found = true;
+        }
+        try std.testing.expect(found);
+    }
+
+    // Fallback buffer: no uri, tagged, big enough for the decompressed views.
+    const buffers = parsed.value.object.get("buffers") orelse return error.NoBuffers;
+    try std.testing.expectEqual(@as(usize, 2), buffers.array.items.len);
+    const fb = buffers.array.items[1].object;
+    try std.testing.expect(fb.get("uri") == null);
+    const fb_ext = fb.get("extensions") orelse return error.NoExts;
+    const fb_mc = fb_ext.object.get("EXT_meshopt_compression") orelse return error.NoExts;
+    const fb_flag = fb_mc.object.get("fallback") orelse return error.NoExts;
+    try std.testing.expect(fb_flag == .bool and fb_flag.bool);
+}
+
+/// Index component read with a runtime stride.
+fn readIdx(raw: []const u8, s: usize, k: usize) u32 {
+    return switch (s) {
+        1 => raw[k],
+        2 => std.mem.readInt(u16, raw[k * 2 ..][0..2], .little),
+        else => std.mem.readInt(u32, raw[k * 4 ..][0..4], .little),
+    };
+}
+
+/// Decode every compressed view and check it against the ORIGINAL input data,
+/// correlated by (mesh, primitive, attribute) path (quantize appends pools, so
+/// pool indices do not line up). Vertex payloads re-encode to themselves
+/// (codec fixpoint); triangle lists compare rotation-insensitively (the
+/// encoder rotates within a triangle, winding preserved); normalized integer
+/// data dequantizes back to the original floats within tolerance.
+fn expectMeshoptDecodes(a: std.mem.Allocator, orig: *c.cgltf_data, comp: *c.cgltf_data) !void {
+    try std.testing.expectEqual(orig.meshes_count, comp.meshes_count);
+
+    // Payload-level checks: no cross-file correlation needed.
+    const views = sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count);
+    for (views, 0..) |*v, i| {
+        if (v.has_meshopt_compression == 0) continue;
+        const m = v.meshopt_compression;
+        const stride: usize = @intCast(m.stride);
+        const count: usize = @intCast(m.count);
+        const payload = try parsedViewBytes(comp, i);
+
+        if (m.mode == c.cgltf_meshopt_compression_mode_attributes) {
+            const dec = try a.alloc(u8, count * stride);
+            defer a.free(dec);
+            try mc.decodeVertices(dec, payload, count, stride);
+            const re = try mc.encodeVertices(a, dec, count, stride);
+            defer a.free(re);
+            try std.testing.expectEqualSlices(u8, payload, re);
+
+            if (m.filter == c.cgltf_meshopt_compression_filter_octahedral) {
+                try mc.decodeFilterOct(dec, count, stride);
+                var k: usize = 0;
+                while (k < count) : (k += 1) {
+                    const x: f32 = @as(f32, @floatFromInt(std.mem.readInt(i16, dec[k * stride ..][0..2], .little))) / 32767.0;
+                    const y: f32 = @as(f32, @floatFromInt(std.mem.readInt(i16, dec[k * stride + 2 ..][0..2], .little))) / 32767.0;
+                    const z: f32 = @as(f32, @floatFromInt(std.mem.readInt(i16, dec[k * stride + 4 ..][0..2], .little))) / 32767.0;
+                    try std.testing.expectApproxEqAbs(1.0, @sqrt(x * x + y * y + z * z), 0.02);
+                }
+            }
+        }
+    }
+
+    // Value checks against the original input, per (mesh, prim, attribute).
+    const om = sl(c.cgltf_mesh, orig.meshes, orig.meshes_count);
+    const cm = sl(c.cgltf_mesh, comp.meshes, comp.meshes_count);
+    for (om, 0..) |_, mi| {
+        const oprims = sl(c.cgltf_primitive, om[mi].primitives, om[mi].primitives_count);
+        const cprims = sl(c.cgltf_primitive, cm[mi].primitives, cm[mi].primitives_count);
+        try std.testing.expectEqual(oprims.len, cprims.len);
+        for (oprims, 0..) |_, pi| {
+            // Indices: rotation-insensitive triple sets (or exact sequences).
+            if (@intFromPtr(oprims[pi].indices) != 0) {
+                const oa: *c.cgltf_accessor = @ptrCast(oprims[pi].indices);
+                const ca: *c.cgltf_accessor = @ptrCast(cprims[pi].indices);
+                const cvi = ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
+                const cv = &sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
+                if (cv.has_meshopt_compression != 0) {
+                    const mcc = cv.meshopt_compression;
+                    const s_new: usize = @intCast(mcc.stride);
+                    const n: usize = @intCast(mcc.count);
+                    try std.testing.expectEqual(oa.count, n);
+                    const s_orig: usize = @intCast(c.cgltf_calc_size(oa.type, oa.component_type));
+                    const ovi = ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view) orelse return error.NoAcc;
+                    const raw_o = try parsedViewBytes(orig, ovi);
+                    try std.testing.expectEqual(n * s_orig, raw_o.len);
+                    const payload = try parsedViewBytes(comp, cvi);
+                    const dec = try a.alloc(u8, n * s_new);
+                    defer a.free(dec);
+                    const seq = mcc.mode == c.cgltf_meshopt_compression_mode_indices;
+                    try mc.decodeIndices(dec, payload, n, s_new, seq);
+                    if (seq) {
+                        for (0..n) |k| try std.testing.expectEqual(readIdx(raw_o, s_orig, k), readIdx(dec, s_new, k));
+                    } else {
+                        try std.testing.expectEqual(@as(usize, 0), n % 3);
+                        var t: usize = 0;
+                        while (t < n) : (t += 3) {
+                            var got = [_]u32{ readIdx(dec, s_new, t), readIdx(dec, s_new, t + 1), readIdx(dec, s_new, t + 2) };
+                            var want = [_]u32{ readIdx(raw_o, s_orig, t), readIdx(raw_o, s_orig, t + 1), readIdx(raw_o, s_orig, t + 2) };
+                            std.mem.sort(u32, &got, {}, std.sort.asc(u32));
+                            std.mem.sort(u32, &want, {}, std.sort.asc(u32));
+                            try std.testing.expectEqualSlices(u32, &want, &got);
+                        }
+                    }
+                }
+            }
+            // Attributes: float data compares exactly, normalized integer
+            // data dequantizes back within its quantization tolerance.
+            for ([_]struct { name: []const u8, is_position: bool }{ .{ .name = "POSITION", .is_position = true }, .{ .name = "NORMAL", .is_position = false }, .{ .name = "TANGENT", .is_position = false }, .{ .name = "TEXCOORD_0", .is_position = false }, .{ .name = "TEXCOORD_1", .is_position = false } }) |attr| {
+                const oa = primAttrAcc(orig, mi, pi, attr.name) orelse continue;
+                const ca = primAttrAcc(comp, mi, pi, attr.name) orelse return error.NoAcc;
+                const cvi = ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
+                const cv = &sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
+                if (cv.has_meshopt_compression == 0) continue;
+                const mcc = cv.meshopt_compression;
+                const cstride: usize = @intCast(mcc.stride);
+                const ccount: usize = @intCast(mcc.count);
+                try std.testing.expectEqual(oa.count, ccount);
+                const of = try unpackFloats(a, oa);
+                defer a.free(of);
+                const payload = try parsedViewBytes(comp, cvi);
+                const dec = try a.alloc(u8, ccount * cstride);
+                defer a.free(dec);
+                try mc.decodeVertices(dec, payload, ccount, cstride);
+                if (mcc.filter == c.cgltf_meshopt_compression_filter_octahedral) try mc.decodeFilterOct(dec, ccount, cstride);
+                const ncomp = numComponents(ca.type);
+                const ccomp = ca.component_type;
+                // Original per-component bounds (only POSITION accessors
+                // carry min/max; UVs normalize against these same bounds).
+                var omn = [_]f32{ 0, 0, 0, 0 };
+                var omx = [_]f32{ 0, 0, 0, 0 };
+                for (0..ncomp) |ax| {
+                    omn[ax] = of[ax];
+                    omx[ax] = of[ax];
+                }
+                for (1..ccount) |k| {
+                    for (0..ncomp) |ax| {
+                        const v = of[k * ncomp + ax];
+                        if (v < omn[ax]) omn[ax] = v;
+                        if (v > omx[ax]) omx[ax] = v;
+                    }
+                }
+                for (0..ccount) |k| {
+                    for (0..ncomp) |ax| {
+                        const want = of[k * ncomp + ax];
+                        if (ccomp == c.cgltf_component_type_r_32f) {
+                            const got = std.mem.readInt(u32, dec[k * cstride + ax * 4 ..][0..4], .little);
+                            try std.testing.expectEqual(@as(u32, @bitCast(want)), got);
+                        } else {
+                            const is_signed = ccomp == c.cgltf_component_type_r_16 or ccomp == c.cgltf_component_type_r_8;
+                            if (!is_signed and ccomp != c.cgltf_component_type_r_16u and ccomp != c.cgltf_component_type_r_8u) return error.BadComp;
+                            const code: f32 = if (is_signed)
+                                @as(f32, @floatFromInt(std.mem.readInt(i16, dec[k * cstride + ax * 2 ..][0..2], .little))) / 32767.0
+                            else
+                                @as(f32, @floatFromInt(std.mem.readInt(u16, dec[k * cstride + ax * 2 ..][0..2], .little))) / 65535.0;
+                            // POSITION dequantizes through the accessor
+                            // bounds (== original bounds); UVs through the
+                            // original bounds; snorm through itself.
+                            const lo = if (attr.is_position) ca.min[ax] else omn[ax];
+                            const hi = if (attr.is_position) ca.max[ax] else omx[ax];
+                            const orange = hi - lo;
+                            const got = if (is_signed) code else if (orange > 0) lo + code * orange else lo;
+                            // 14-bit positions, 12-bit UVs / oct normals.
+                            const tol: f32 = if (attr.is_position) @max(orange / 4096.0, 1e-6) else if (!is_signed) @max(orange / 2048.0, 1e-6) else 0.02;
+                            try std.testing.expectApproxEqAbs(want, got, tol);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn meshoptHelmetOn() !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var orig_l = try parse_mod.loadFile(io, a, "test/fixtures/real/DamagedHelmet.glb");
+    defer orig_l.deinit();
+
+    var loaded = try parse_mod.loadFile(io, a, "test/fixtures/real/DamagedHelmet.glb");
+    defer loaded.deinit();
+
+    const res = try run(aa, loaded.cdata, loaded.map, .{ .meshopt_compression = true });
+    try std.testing.expect(!res.meshopt_no_codec);
+    try std.testing.expect(res.meshopt_views > 0);
+    std.debug.print("quantize+meshopt helmet: meshopt_views={d}\n", .{res.meshopt_views});
+
+    const out = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+    // Deterministic: serializing the same cdata twice is byte-identical.
+    const out_again = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+    try std.testing.expectEqualSlices(u8, out, out_again);
+
+    var rp = try reparse(aa, "quantize-meshopt-helmet.glb", out);
+    defer {
+        rp.loaded.deinit();
+        rp.tmp.cleanup();
+    }
+    // JSON check against the emitted (kept) view count, not the pool count.
+    try expectMeshoptJson(try glbJson(out), rp.loaded.cdata.buffer_views_count);
+
+    // cgltf validates our stride/count/mode/filter declarations.
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(rp.loaded.cdata)),
+    );
+    // NOTE: value checks run on the REPARSED output: only there do the
+    // extension's (buffer, byteOffset) references resolve to real bytes.
+    try expectMeshoptDecodes(aa, orig_l.cdata, rp.loaded.cdata);
+}
+
+fn meshoptHelmetNoCodec() !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(io, a, "test/fixtures/real/DamagedHelmet.glb");
+    defer loaded.deinit();
+    const res = try run(aa, loaded.cdata, loaded.map, .{ .meshopt_compression = true });
+    try std.testing.expect(res.meshopt_no_codec);
+    try std.testing.expectEqual(@as(u32, 0), res.meshopt_views);
+
+    // The flag is a pure no-op: output identical to the plain quantize path.
+    const out_on = try write_mod.serialize(aa, loaded.cdata, loaded.map);
+
+    var loaded2 = try parse_mod.loadFile(io, a, "test/fixtures/real/DamagedHelmet.glb");
+    defer loaded2.deinit();
+    _ = try run(aa, loaded2.cdata, loaded2.map, .{});
+    const out_off = try write_mod.serialize(aa, loaded2.cdata, loaded2.map);
+    try std.testing.expectEqualSlices(u8, out_on, out_off);
+}
+
+test "quantize meshopt_compression end to end" {
+    if (mc.have_codec) {
+        try meshoptHelmetOn();
+    } else {
+        try meshoptHelmetNoCodec();
+    }
 }

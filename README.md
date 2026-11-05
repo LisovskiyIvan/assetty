@@ -1,85 +1,116 @@
 # assetty
 
-glTF/GLB asset toolkit: CLI + desktop app (nanoui + Babylon webview).
+A fast glTF/GLB optimization toolkit — one native binary that is both a desktop app and a CLI.
 
-## Build
+**Why:** game-ready models ship bloated — 2K PNG textures, float32 vertices, unused nodes, full animation sets. assetty takes a source model and produces a small, GPU-friendly GLB: KTX2-compressed textures, quantized geometry, pruned graph. The source file is never touched — every run reads the original and writes a new file, so you can iterate freely (512/1024, different quality, strip animations) and export only when you like the result. Everything runs locally through native encoders (basisu, meshoptimizer) on all your cores.
+
+## Download
+
+Grab a build from [GitHub Releases](../../releases):
+
+| asset | platform | notes |
+|---|---|---|
+| `assetty-macos-arm64.zip` | macOS 12+ (Apple Silicon) | nothing to install |
+| `assetty-windows-x64.zip` | Windows 10/11 x64 | WebView2 preinstalled on Win10/11 |
+| `assetty-linux-x64.tar.gz` | Linux x64 | needs GTK 3/4 + WebKitGTK 2.40+ (`sudo apt install libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`) |
+| `assetty-linux-arm64.tar.gz` | Linux ARM64 | same |
+
+Unpack, run `assetty` — that opens the desktop app. Same binary with arguments is the CLI (`assetty help`).
+
+**Updates:** Settings → check for updates; on a new release the app downloads it, verifies the checksum, swaps the binary and **restarts itself** (all platforms). Releases are published per tag, not per commit.
+
+### Build from source
+
+Requires [Zig 0.17.0](https://ziglang.org) and [bun](https://bun.sh) (frontend only):
 
 ```sh
-zig build --summary none            # zig-out/bin/assetty — CLI + app в одном бинаре
-zig build test                      # core (77) + app (49) tests
-zig build -Dtarget=aarch64-linux-gnu        # CLI + app, cross-compile
-zig build -Dtarget=x86_64-windows-gnu       # CLI + app, cross-compile
-zig build -Dapp=false               # CLI-only binary (no nanoui)
-cd app/web && bun install && bun run build   # frontend → app/web/dist (GUI)
-./zig-out/bin/assetty               # без аргументов — окно приложения
+git clone <repo> && cd assetty
+(cd app/web && bun install && bun run build)   # frontend → app/web/dist
+zig build                                      # zig-out/bin/assetty (CLI + app)
+zig build test --summary all                   # test suite
+zig build -Dapp=false                          # CLI-only binary
+zig build -Dtarget=x86_64-windows-gnu          # cross-compile: also aarch64-linux-gnu, x86_64-linux-gnu
+zig build -Dversion=0.2.0 -Drepo=owner/name    # bake release identity
 ```
 
-Portability: CLI + core build everywhere Zig + C++17 do (Linux/macOS/Windows,
-glibc and musl). The desktop app shell (nanoui 0.12.0) is the same binary on
-all three:
+| OS | app shell | runtime deps |
+|---|---|---|
+| macOS | WKWebView | — |
+| Windows | WebView2 | preinstalled on Win10/11; without it a native notice opens |
+| Linux | WebKitGTK 2.40+ (dlopen) | GTK 3/4 + WebKitGTK; without them a native notice opens |
 
-| OS | web UI | fallback |
-|----|--------|----------|
-| macOS | native (WKWebView) | — |
-| Windows | native via WebView2 (needs the WebView2 runtime — preinstalled on Win10/11; without it a native notice window opens instead) | native window pointing at the CLI |
-| Linux | native via WebKitGTK 2.40+ (runtime dep, dlopened — see below; without it a native notice window opens instead) | native window pointing at the CLI |
+CLI and core compile everywhere Zig does (glibc/musl); OpenCL (basisu) is macOS-only and falls back to CPU elsewhere.
 
-No macOS-only code remains in CLI/core; OpenCL (basisu) is macOS-only and
-falls back to CPU elsewhere (runtime OpenCL was never enabled). Foreign
-binaries are compile-verified on this Mac (can't execute them here); on Linux
-the app needs GTK3/GTK4 at runtime (dlopen) plus WebKitGTK 2.40+ (dlopen:
-`libwebkitgtk-6.0.so.4` for GTK4, else `libwebkit2gtk-4.1.so.0` /
-`libwebkit2gtk-4.0.so.37` for GTK3 — Debian/Ubuntu: `sudo apt install
-libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`; `NANOUI_GTK=3` forces the GTK3
-path), on Windows `WebView2Loader.dll` ships beside the exe when the WebView2
-SDK is present at build time, otherwise the system-installed WebView2 runtime
-is used.
+## Desktop app
+
+Run `assetty` with no arguments. Tabs:
+
+- **Viewer** — Babylon.js scene with the inspector open alongside (scene tree left, properties right, model centered). Drag & drop a `.glb` anywhere to open it; `⌘O`/Open picks from your recent folders.
+- **Optimize** — pick pipeline steps (prune / dedup / weld / join / simplify / quantize / textures), run, and compare. Every step has `?` help explaining what it does and what it affects. After a run: a **split slider** renders the source and the result in one viewport with frame-synced cameras — drag the divider to compare pixel-by-pixel. The report shows before/after stats, per-step timings and texture details. Results land in `.zig-cache/assetty-app/`; the banner offers **Save as…** (native save dialog) and **Discard** (deletes the result file). A pre-run guard warns when the source textures are already KTX2.
+- **Textures** — lists every texture with facts (dims, format, VRAM, disk). **Preview KTX2** is a dry-run encode (before/after, PSNR, VRAM); each texture has its own settings — format (auto/ETC1S/UASTC), quality, resize, mips, normal-map, skip — shown in a side panel on click. **Apply to model** writes the whole textures step into a new file. Auto presets (mobile/desktop/web) live on the Optimize tab.
+- **Settings** — theme (light/dark), language (EN/RU), per-step defaults, per-model texture overrides, JSON editor for the whole settings file (`assetty.settings.json`), update check.
+
+Strip animations: one checkbox — drops all animation tracks, keeps the scene graph and skins (on a 28 MiB animated character: mobile preset 28 → 8.3 MiB, +strip → **3.7 MiB**, −87%).
+
+Pipeline progress is animated: stage chips (load → geometry → textures → write → done) with a spinner, `texture 3/7` sub-progress and an elapsed clock.
 
 ## CLI
 
 ```sh
-assetty info <file.glb> [--json]                 # статистика: трисы, draw calls, VRAM, мусор
-assetty optimize f.glb --preset mobile -o out.glb [--report r.json] [--strip-animations]
-assetty textures <file.glb> [--encode N] [--json] # список текстур; encode → KTX2 + PSNR
-assetty presets                                  # список пресетов
+assetty help
+assetty info <file.glb> [--json]
+assetty textures <file.glb> [--encode N] [--json]
+assetty optimize <file.glb> --preset <name|path.zon> [-o out.glb] [--report r.json] [--strip-animations]
+assetty --version
 ```
 
-Exit codes: `0` ok, `2` ошибка.
+- `info` — triangles, vertices, draw calls, VRAM estimate (mip-chain aware), disk split, per-image table.
+- `textures` — per-image texture report; `--encode N` dry-run-encodes image N to KTX2 (writes before/after PNGs into `.zig-cache/assetty-app/`).
+- `optimize` — runs the pipeline. `--strip-animations` drops all animation tracks on top of any preset. Exit codes: `0` ok, `2` error.
 
-## App
+**Presets** are `.zon` files (`presets/mobile.zon`, `desktop.zon`, `web.zon` — or your own, passed by path):
 
-Вкладки: Viewer (Babylon, анимации, scene explorer) / Optimize (2 вьюпорта до/после,
-синхронизация камер, метрики Δ) / Textures (encode → KTX2, PSNR) /
-Settings (редактор zon-пресетов). Bridge: JS → nanoui bind → core in-process;
-прогресс — события `progress`/`log`.
-
-## Layout
-
-```
-core/src/
-  gltf/       model.zig, parse.zig (cgltf→model, mmap zero-copy), write.zig (GLB writer + GC)
-  stats.zig   метрики + детект мусора (формат/мипы из KTX2 DFD)
-  ops/        prune, dedup, weld, join, quantize (meshopt), simplify, geom.zig (builder)
-  tex/        decode (stb), formats (KTX2/DFD), mips, encode_ktx (basisu)
-  pipeline/   preset.zig (zon), runner.zig
-app/          src/ (nanoui shell + bridge backend), web/ (vite + Babylon)
-vendor/       cgltf, stb_image, meshoptimizer, basisu, zstd
-presets/      mobile.zon, desktop.zon, web.zon
-test/         fixtures (синтетика + 12 моделей glTF-Sample-Assets),
-              fuzz_corpus.py + fuzz_run.sh (203 коррозивных GLB: 0 crash/hang),
-              parse.zig: zig-регрессия на 14 классах битых входов
+```zig
+.{
+    .name = "mobile",
+    .target = .mobile,
+    .steps = .{
+        .{ .prune = .{} },                                   // unused nodes/materials/textures (+ .animations = false to strip)
+        .{ .dedup = .{} },                                   // accessors/meshes/materials
+        .{ .weld = .{} },                                    // vertex welding
+        .{ .simplify = .{ .target_ratio = 0.5 } },           // meshopt simplify, seam-aware + attr weights optional
+        .{ .quantize = .{ .position_bits = 14, .uv_bits = 12, .normal_oct = true, .meshopt_compression = true } },
+        .{ .textures = .{ .format = .etc1s, .quality = 128, .max_size = 1024, .generate_mips = true } },
+    },
+}
 ```
 
-## Status
+Per-texture overrides go in the textures step: `.overrides = .{ .{ .image = 0, .skip = true }, .{ .name = "normal", .format = .uastc, .max_size = 512 } }` — match by image index or name substring, applied in order, `skip` leaves a texture byte-identical.
 
-- [x] GLB parse (mmap, zero-copy BIN) + model + stats
-- [x] GLB writer + round-trip (12/12 реальных моделей), GC-проход
-- [x] ops: prune, dedup, weld, join, quantize, simplify
-- [x] tex: decode, mips, KTX2 encode (ETC1S/UASTC) + PSNR
-- [x] pipeline: zon-пресеты, runner, `optimize`
-- [x] CLI
-- [x] app: nanoui 0.12.0 + Babylon (Viewer/Optimize/Textures/Settings;
-      web-UI на Linux через WebKitGTK, на Windows через WebView2)
-- [ ] EXT_meshopt_compression (пока quantize в core glTF: UNORM16/SNORM16)
+Typical result (10-core Mac, ReleaseFast): DamagedHelmet mobile preset 6.7 → **4.5 s**; output is bit-deterministic across runs and thread counts.
 
+## Pipeline reference
 
+| step | what it does |
+|---|---|
+| `prune` | drops unreferenced nodes/materials/textures; `animations = false` strips all animation tracks (skeletons kept) |
+| `dedup` | merges identical accessors/meshes/materials (content-hash + byte compare) |
+| `weld` | welds duplicate vertices per primitive, tolerance-aware |
+| `join` | merges compatible primitives to cut draw calls |
+| `simplify` | meshoptimizer simplifier; ratio, error tolerance, aggressive, border lock, seam-aware attribute weights |
+| `quantize` | positions/UVs to 16-bit, octahedral normals; dequant is baked into node transforms; `meshopt_compression = true` emits `EXT_meshopt_compression` buffer views (meshopt filters, another −6–15% on top) |
+| `textures` | decode → (resize) → basisu encode to KTX2 (ETC1S/UASTC), mips, per-image overrides, skips already-KTX2 |
+
+The writer garbage-collects everything unreferenced, so ops can leave orphans freely. Sources are immutable by design.
+
+### `EXT_meshopt_compression` output (`quantize.meshopt_compression = true`)
+
+gltfpack-`-cc`-style: every eligible vertex/index buffer view is meshopt-compressed after quantization — positions/UVs with the ATTRIBUTES codec (VEC3 payloads padded to an 8-byte stride), normals/tangents with the 12-bit OCTAHEDRAL filter (8-byte stride), triangle lists with the TRIANGLES codec (index order within a triangle may rotate; winding and triangle sets are preserved). Views that would not shrink, sparse/image/animation/skin/instancing views, and non-triangle index views that cannot use the sequence codec stay uncompressed; only compressed views carry the extension. `extensionsUsed` + `extensionsRequired` gain `EXT_meshopt_compression`, decompressed bytes live in spec fallback layout (placeholder buffer, `fallback: true`).
+
+**The output requires an `EXT_meshopt_compression`-capable loader** (Babylon, three.js, filament with the meshopt decoder). Readers without the extension must refuse the file (`extensionsRequired`) — this is per-spec behavior, not a bug. `assetty info` still opens these files (counts only; it cannot decode the payloads without a linked decoder).
+
+## Notes
+
+- Malformed GLBs exit with clean errors (fuzzed corpus, 600+ runs, zero crashes — ReleaseFast keeps runtime checks off, parse layer validates instead).
+- Settings live in `assetty.settings.json` (cwd) — the app writes it atomically and tolerates hand edits.
+- Roadmap: batch/folder mode, `.gltf` (non-binary) output, signed macOS bundles for in-app updates.

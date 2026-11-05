@@ -1,6 +1,7 @@
 import "./style.css";
 import { app } from "./app";
 import { checkKtx2Assets, configureKtx2, reportDecoderFailure } from "./ktx2";
+import { checkMeshoptAssets, configureMeshopt, reportMeshoptFailure } from "./meshopt";
 import { logHistory, notify, onLog } from "./notify";
 import { createInspectorDock } from "./inspector";
 import { Logger } from "@babylonjs/core/Misc/logger";
@@ -27,6 +28,7 @@ import { mountSettings } from "./tabs/settings";
 import type { TabHandle } from "./tabs/types";
 
 configureKtx2();
+configureMeshopt();
 surfaceDecoderFailures();
 
 /**
@@ -676,6 +678,12 @@ window.addEventListener("keydown", (ev) => {
 void checkKtx2Assets().then((missing) => {
   if (missing.length > 0) {
     notify(t("topbar.ktx2Missing", { list: missing.join(", ") }), "error", 9000);
+  }
+});
+
+void checkMeshoptAssets().then((missing) => {
+  if (missing.length > 0) {
+    reportMeshoptFailure(`meshopt decoder missing: ${missing.join(", ")}`);
   }
 });
 

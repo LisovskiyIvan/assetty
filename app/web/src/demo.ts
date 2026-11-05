@@ -1,5 +1,14 @@
 /** Static fixtures so the whole layout is inspectable in a plain browser (no nanoui). */
-import type { EncodeResult, Info, OptimizeResult, TexturePreview, TexturesResult } from "./types";
+import type {
+  AppInfo,
+  EncodeResult,
+  Info,
+  OptimizeResult,
+  TexturePreview,
+  TexturesResult,
+  UpdateApply,
+  UpdateCheck,
+} from "./types";
 import type { ProgressEvent } from "./bridge/types";
 
 const helmetImages = [
@@ -299,6 +308,40 @@ export class DemoBackend {
       format: "ETC1S",
       settings: { format: "etc1s", quality: 128, max_size: 0, generate_mips: true },
     };
+  }
+
+  /**
+   * Demo mode has no updater (nothing to swap): checks fail unless the URL
+   * carries `?demo-update`, which fakes a newer release so the
+   * check→available→update flow states stay inspectable in a plain browser.
+   */
+  async appInfo(): Promise<AppInfo> {
+    return {
+      version: "0.0.0-demo",
+      repo: "demo/assetty",
+      platform: "web",
+      arch: "wasm",
+      asset: "assetty-demo.zip",
+    };
+  }
+
+  async updateCheck(): Promise<UpdateCheck> {
+    await sleep(150);
+    if (!/[?&]demo-update\b/.test(location.search)) throw new Error("demo mode");
+    return {
+      available: true,
+      current: "0.0.0-demo",
+      version: "9.9.9-demo",
+      asset: "assetty-demo.zip",
+      download_url: "",
+      notes_url: "",
+    };
+  }
+
+  /** Demo mode never swaps a binary: applying always fails like a check. */
+  async updateApply(): Promise<UpdateApply> {
+    await sleep(150);
+    throw new Error("demo mode");
   }
 
   /**

@@ -35,7 +35,7 @@
 //!             .position_bits = 14,
 //!             .normal_oct = true,
 //!             .uv_bits = 12,
-//!             .compress = true,
+//!             .meshopt_compression = true,
 //!         } },
 //!         .{ .simplify = .{
 //!             .target_ratio = 0.5,
@@ -106,8 +106,12 @@ pub const QuantizeParams = struct {
     normal_oct: bool = true,
     /// UVs are quantized to this many bits.
     uv_bits: u5 = 12,
-    /// Emit EXT_meshopt_compression on the resulting buffers.
+    /// Legacy no-op (kept so old presets still parse and old UIs keep
+    /// compiling); the real switch is `meshopt_compression` below.
     compress: bool = true,
+    /// Emit EXT_meshopt_compression on the resulting buffers (gltfpack -cc
+    /// style). Output requires an EXT_meshopt_compression-capable loader.
+    meshopt_compression: bool = false,
 };
 
 pub const SimplifyParams = struct {
@@ -288,7 +292,7 @@ const web_steps = [_]Step{
         .generate_mips = true,
         .max_size = 1024,
     } },
-    .{ .quantize = .{ .compress = true } },
+    .{ .quantize = .{ .meshopt_compression = true } },
 };
 
 /// Built-in preset used when no preset file is supplied.
@@ -326,8 +330,8 @@ pub fn describe(p: Preset, w: anytype) !void {
             .weld => |v| try w.print("weld      tolerance={d}\n", .{v.tolerance}),
             .join => try w.print("join      (merge primitives sharing a material)\n", .{}),
             .quantize => |v| try w.print(
-                "quantize  position_bits={d} normal_oct={} uv_bits={d} compress={}\n",
-                .{ v.position_bits, v.normal_oct, v.uv_bits, v.compress },
+                "quantize  position_bits={d} normal_oct={} uv_bits={d} meshopt_compression={}\n",
+                .{ v.position_bits, v.normal_oct, v.uv_bits, v.meshopt_compression },
             ),
             .simplify => |v| try w.print(
                 "simplify  target_ratio={d} error_tolerance={d} aggressive={} lock_borders={} use_attributes={} weight_normal={d} weight_uv={d}\n",
@@ -401,7 +405,8 @@ test "parse mobile preset file" {
     const q = p.steps[5].quantize;
     try testing.expectEqual(@as(u5, 14), q.position_bits);
     try testing.expectEqual(@as(u5, 12), q.uv_bits);
-    try testing.expect(q.compress);
+    try testing.expect(q.compress); // legacy no-op, still parsed
+    try testing.expect(!q.meshopt_compression); // opt-in, off in shipped zons
 }
 
 test "parse desktop preset file" {
@@ -448,6 +453,7 @@ test "parse web preset file" {
     try testing.expectEqual(@as(u32, 1024), tex.max_size);
 
     try testing.expect(p.steps[5].quantize.compress);
+    try testing.expect(!p.steps[5].quantize.meshopt_compression);
 }
 
 test "parse honours defaults and overrides" {
@@ -477,6 +483,23 @@ test "parse honours defaults and overrides" {
     try testing.expectEqual(@as(f32, 0.25), p.steps[2].simplify.target_ratio);
     try testing.expect(p.steps[2].simplify.aggressive);
     try testing.expect(p.steps[2].simplify.lock_borders);
+}
+
+test "parse meshopt_compression flag" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // Default off; describe reports it.
+    const d = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .quantize = .{} } } }");
+    try testing.expect(!d.steps[0].quantize.meshopt_compression);
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(d, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "meshopt_compression=false") != null);
+
+    // Explicit opt-in parses.
+    const e = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .quantize = .{ .meshopt_compression = true } } } }");
+    try testing.expect(e.steps[0].quantize.meshopt_compression);
 }
 
 test "parse prune animations flag defaults true" {

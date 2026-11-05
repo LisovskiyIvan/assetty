@@ -26,6 +26,11 @@
  *   presetSave(name, zon)   -> anything
  *   settingsLoad()          -> raw JSON text of assetty.settings.json (cwd) or "{}"
  *   settingsSave(text)      -> {"ok":true} | {"error":"..."} (validated, atomic)
+ *   appInfo()               -> { version, repo, platform, arch, asset }
+ *   updateCheck()           -> { available, current, version, asset, download_url, notes_url }
+ *                              | {"error":"..."} when the feed is unreachable
+ *   updateApply()           -> { installed, version, restarted }
+ *                              | {"error":"..."} on failure (app relaunches itself on success)
  *
  * A job that is already running answers `{ "error": "busy" }`.
  *

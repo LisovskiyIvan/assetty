@@ -35,7 +35,14 @@ import type {
   TextureEncodeDoneEvent,
   TexturePreviewDoneEvent,
 } from "./types";
-import type { EncodeSettings, Info, TexturesResult } from "../types";
+import type {
+  AppInfo,
+  EncodeSettings,
+  Info,
+  TexturesResult,
+  UpdateApply,
+  UpdateCheck,
+} from "../types";
 
 export class Bridge {
   readonly native: NativeBackend | null;
@@ -272,6 +279,41 @@ export class Bridge {
   async settingsSave(text: string): Promise<void> {
     if (!this.live) return this.demo.settingsSave(text);
     await this.raw("settingsSave", [text]);
+  }
+
+  /**
+   * This build's identity: `{ version, repo, platform, arch, asset }`.
+   * Shown in the Settings tab next to the update button.
+   */
+  async appInfo(): Promise<AppInfo> {
+    if (!this.live) return this.demo.appInfo();
+    if (!this.native?.methods.includes("appInfo")) throw new Error("backend has no appInfo()");
+    return parseMaybeJson<AppInfo>(await this.raw("appInfo", []));
+  }
+
+  /**
+   * Compares this build to the release feed: `{ available, current, version,
+   * asset, download_url, notes_url }`. Rejects with the host's error text
+   * when the feed is unreachable (or "demo mode" without a host).
+   */
+  async updateCheck(): Promise<UpdateCheck> {
+    if (!this.live) return this.demo.updateCheck();
+    if (!this.native?.methods.includes("updateCheck"))
+      throw new Error("backend has no updateCheck()");
+    return parseMaybeJson<UpdateCheck>(await this.raw("updateCheck", []));
+  }
+
+  /**
+   * Downloads, verifies and installs the newer release, then relaunches:
+   * `{ installed, version, restarted }`. Rejects with the host's error text
+   * on failure. The app quits itself on success — callers show "Restarting…"
+   * and do nothing else.
+   */
+  async updateApply(): Promise<UpdateApply> {
+    if (!this.live) return this.demo.updateApply();
+    if (!this.native?.methods.includes("updateApply"))
+      throw new Error("backend has no updateApply()");
+    return parseMaybeJson<UpdateApply>(await this.raw("updateApply", []));
   }
 
   /**

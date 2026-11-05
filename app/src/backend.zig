@@ -15,10 +15,13 @@
 //! the result arrives as the `optimizeDone` / `textureEncodeDone` /
 //! `texturePreviewDone` event. See "background jobs" below.
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("core");
 const nanoui = @import("nanoui");
+const config = @import("config");
 const json = @import("json.zig");
 const events = @import("events.zig");
+const update = @import("update.zig");
 
 /// Page IPC (`nanoui.Call`) exists wherever pages do (macOS, Windows, Linux
 /// since nanoui 0.12's WebKitGTK backend): there it carries the call's arena
@@ -94,6 +97,9 @@ pub const Backend = struct {
         .presetSave = .{ "name", "zon" },
         .settingsLoad = .{},
         .settingsSave = .{"text"},
+        .appInfo = .{},
+        .updateCheck = .{},
+        .updateApply = .{},
     };
 
     // ---- browse -----------------------------------------------------------
@@ -270,6 +276,35 @@ pub const Backend = struct {
     /// `{"ok":true}` or `{"error":".."}`.
     pub fn settingsSave(self: *Backend, call: *Call, text: []const u8) !json.Raw {
         return self.settingsSaveTo(call.arena, settings_file, text);
+    }
+
+    // ---- update -----------------------------------------------------------
+
+    /// This build's identity: `{"version","repo","platform","arch","asset"}`.
+    /// The Settings tab shows it next to the update button; `asset` is the
+    /// release artifact this platform installs (see `update.assetFor`).
+    pub fn appInfo(self: *Backend, call: *Call) !json.Raw {
+        return self.appInfoImpl(call.arena);
+    }
+
+    /// Compares this build to the release feed's manifest: `{"available",
+    /// "current","version","asset","download_url","notes_url"}` or
+    /// `{"error":..}` when the feed is unreachable. Synchronous (curl,
+    /// 30s cap) — the button awaits it directly.
+    pub fn updateCheck(self: *Backend, call: *Call) !json.Raw {
+        return self.updateCheckImpl(call.arena, null);
+    }
+
+    /// Downloads the newer release, verifies, installs over this program,
+    /// relaunches it and quits so the update takes effect at once:
+    /// `{"installed":true,"version":"..","restarted":true}`;
+    /// `{"installed":false,...,"restarted":false}` when already current;
+    /// `{"error":..}` on failure. `restarted` is false when the new program
+    /// could not be spawned — the install still stands, the user relaunches
+    /// by hand. Synchronous — the UI blocks during download, like it does
+    /// for a native file dialog.
+    pub fn updateApply(self: *Backend, call: *Call) !json.Raw {
+        return self.updateApplyImpl(call.arena, Target.of(call.window), null, null, null);
     }
 
     // ---- implementations --------------------------------------------------
@@ -592,6 +627,103 @@ pub const Backend = struct {
         atomic.replace(self.io) catch |err|
             return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
         return json.raw("{\"ok\":true}");
+    }
+
+    // ---- update impls -----------------------------------------------------
+
+    fn appInfoImpl(self: *Backend, a: std.mem.Allocator) !json.Raw {
+        _ = self;
+        var aw: std.Io.Writer.Allocating = .init(a);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+        try w.writeAll("{\"version\":");
+        try json.jsonStr(w, config.version);
+        try w.writeAll(",\"repo\":");
+        try json.jsonStr(w, config.repo);
+        try w.print(",\"platform\":\"{s}\",\"arch\":\"{s}\",\"asset\":", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
+        try json.jsonStr(w, update.asset_name);
+        try w.writeByte('}');
+        return json.raw(try aw.toOwnedSlice());
+    }
+
+    /// `feed` overrides the repo's release feed (tests pass a `file://`
+    /// dir); null means the default.
+    fn updateCheckImpl(self: *Backend, a: std.mem.Allocator, feed: ?[]const u8) !json.Raw {
+        const f = feed orelse try update.feedDefault(a, config.repo);
+        const c = update.check(a, self.io, f, config.repo, update.asset_name, update.comparable(config.version)) catch |err|
+            return json.errorRaw(a, "update check: {s}", .{@errorName(err)});
+        var aw: std.Io.Writer.Allocating = .init(a);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+        try w.print("{{\"available\":{s},\"current\":", .{if (c.available) "true" else "false"});
+        try json.jsonStr(w, c.current);
+        try w.writeAll(",\"version\":");
+        try json.jsonStr(w, c.version);
+        try w.writeAll(",\"asset\":");
+        try json.jsonStr(w, c.asset);
+        try w.writeAll(",\"download_url\":");
+        try json.jsonStr(w, c.download_url);
+        try w.writeAll(",\"notes_url\":");
+        try json.jsonStr(w, c.notes_url);
+        try w.writeByte('}');
+        return json.raw(try aw.toOwnedSlice());
+    }
+
+    /// `feed`/`exe`/`cache_dir` override the live paths (tests inject a
+    /// feed dir, a scratch program and a scratch cache); nulls resolve to
+    /// the release feed, the running program and the system cache dir.
+    /// `target` carries the window/app to quit after the reply is out; a
+    /// null app (tests) skips the quit while still exercising the spawn.
+    fn updateApplyImpl(
+        self: *Backend,
+        a: std.mem.Allocator,
+        target: Target,
+        feed: ?[]const u8,
+        exe: ?[]const u8,
+        cache_dir: ?[]const u8,
+    ) !json.Raw {
+        const f = feed orelse try update.feedDefault(a, config.repo);
+        const program = exe orelse try std.process.executablePathAlloc(self.io, a);
+        const cache = cache_dir orelse try nanoui.path(a, .cache, "assetty");
+        switch (update.apply(a, self.io, f, config.repo, update.asset_name, update.comparable(config.version), program, cache)) {
+            .installed => |i| {
+                // Spawn now (its success is known synchronously and reported
+                // back) but quit only after the reply reaches the page: the
+                // quit is posted to the main thread, which runs it once this
+                // binding's reply is delivered. `Backend.shutdown` (deferred
+                // in `main`) then turns late job deliveries into no-ops.
+                const restarted = update.relaunch(self.io, program);
+                if (restarted) quitSoon(target);
+                var aw: std.Io.Writer.Allocating = .init(a);
+                errdefer aw.deinit();
+                try aw.writer.print("{{\"installed\":true,\"version\":", .{});
+                try json.jsonStr(&aw.writer, i.version);
+                try aw.writer.print(",\"restarted\":{s}}}", .{if (restarted) "true" else "false"});
+                return json.raw(try aw.toOwnedSlice());
+            },
+            .up_to_date => |u| {
+                var aw: std.Io.Writer.Allocating = .init(a);
+                errdefer aw.deinit();
+                try aw.writer.writeAll("{\"installed\":false,\"version\":");
+                try json.jsonStr(&aw.writer, u.version);
+                try aw.writer.writeAll(",\"restarted\":false}");
+                return json.raw(try aw.toOwnedSlice());
+            },
+            .failed => |msg| return json.errorRaw(a, "{s}", .{msg}),
+        }
+    }
+
+    /// Quits the app on the main thread, soon: posted (not called) so the
+    /// binding's `{installed:true}` reply is delivered to the page first and
+    /// the fresh program takes over after. No-op without an app (tests).
+    fn quitSoon(target: Target) void {
+        const app = target.app orelse return;
+        nanoui.App.onMain(app, quitApp);
+    }
+
+    fn quitApp(ctx: ?*anyopaque) callconv(.c) void {
+        const app: *nanoui.App = @ptrCast(@alignCast(ctx.?));
+        app.quit();
     }
 
     // ---- background jobs --------------------------------------------------
@@ -2032,6 +2164,161 @@ test "settings: missing file loads as an empty object" {
 
     const loaded = try b.settingsLoadFrom(a, path);
     try testing.expectEqualStrings("{}", loaded.text);
+}
+
+test "appInfo reports the build version and this platform's asset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    const r = try b.appInfoImpl(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, r.text, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings(config.version, o.get("version").?.string);
+    try testing.expectEqualStrings(config.repo, o.get("repo").?.string);
+    try testing.expectEqualStrings(@tagName(builtin.os.tag), o.get("platform").?.string);
+    try testing.expectEqualStrings(update.asset_name, o.get("asset").?.string);
+}
+
+/// A feed dir holding only `manifest.json` (check never downloads archives).
+fn writeFeedManifest(a: std.mem.Allocator, feed: []const u8, version: []const u8) !void {
+    const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const text = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, update.asset_name, sha });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = text });
+}
+
+test "updateCheck finds a newer file feed, quiet when current" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const feed = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(testing.io, feed);
+    try writeFeedManifest(a, feed, "9.9.9");
+    const url = try std.fmt.allocPrint(a, "file://{s}", .{try std.Io.Dir.cwd().realPathFileAlloc(testing.io, feed, a)});
+
+    const hit = try b.updateCheckImpl(a, url);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, hit.text, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object;
+        try testing.expect(o.get("available").?.bool);
+        try testing.expectEqualStrings("9.9.9", o.get("version").?.string);
+        try testing.expectEqualStrings(update.asset_name, o.get("asset").?.string);
+        try testing.expect(std.mem.indexOf(u8, o.get("download_url").?.string, update.asset_name) != null);
+        try testing.expect(std.mem.indexOf(u8, o.get("notes_url").?.string, "releases/tag/v9.9.9") != null);
+    }
+
+    try writeFeedManifest(a, feed, update.comparable(config.version));
+    const miss = try b.updateCheckImpl(a, url);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, miss.text, .{});
+        defer parsed.deinit();
+        try testing.expect(!parsed.value.object.get("available").?.bool);
+    }
+}
+
+test "updateApply reports up-to-date without touching the exe" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const feed = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(testing.io, feed);
+    try writeFeedManifest(a, feed, update.comparable(config.version));
+    const url = try std.fmt.allocPrint(a, "file://{s}", .{try std.Io.Dir.cwd().realPathFileAlloc(testing.io, feed, a)});
+
+    // Neither path exists: the up-to-date short-circuit must not read them.
+    const r = try b.updateApplyImpl(a, .{}, url, "/nonexistent/assetty", "/nonexistent/cache");
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, r.text, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expect(!o.get("installed").?.bool);
+    try testing.expectEqualStrings(update.comparable(config.version), o.get("version").?.string);
+}
+
+test "updateApply installs, relaunches the probe and reports restarted" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the fake program is a shell script
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const feed = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/feed", .{tmp.sub_path[0..]});
+    try std.Io.Dir.cwd().createDirPath(testing.io, feed);
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, root, a);
+    const marker = try std.fmt.allocPrint(a, "{s}/impl-relaunched", .{abs});
+    // The impl always installs this platform's release artifact.
+    const asset = update.asset_name;
+    const program_text = try std.fmt.allocPrint(a,
+        \\#!/bin/sh
+        \\if [ "$1" = "--version" ]; then echo "assetty 9.9.9"; else echo launched > "{s}"; fi
+        \\
+    , .{marker});
+    // A release newer than any dev build: a shell-built archive (tar for
+    // .tar.gz, zip for the macOS/Windows artifact) plus a manifest for it.
+    const pack = try std.fmt.allocPrint(a, "{s}/pack/app-9.9.9", .{abs});
+    try std.Io.Dir.cwd().createDirPath(testing.io, pack);
+    const packed_prog = try std.fmt.allocPrint(a, "{s}/assetty-test-prog", .{pack});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = packed_prog, .data = program_text, .flags = .{ .permissions = .fromMode(0o755) } });
+    const archive = try std.fmt.allocPrint(a, "{s}/{s}", .{ feed, asset });
+    if (std.mem.endsWith(u8, asset, ".tar.gz")) {
+        const argv: []const []const u8 = &.{ "/usr/bin/tar", "-czf", archive, "-C", try std.fmt.allocPrint(a, "{s}/pack", .{abs}), "app-9.9.9" };
+        const r = try std.process.run(a, testing.io, .{ .argv = argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) });
+        if (!r.term.success()) return error.SkipZigTest;
+    } else {
+        const argv: []const []const u8 = &.{ "/usr/bin/zip", "-jq", archive, packed_prog };
+        const r = std.process.run(a, testing.io, .{ .argv = argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) }) catch return error.SkipZigTest;
+        if (!r.term.success()) return error.SkipZigTest;
+    }
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, archive, a, .limited(1 << 20));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try writeFeedManifestFor(a, feed, asset, "9.9.9", &std.fmt.bytesToHex(digest, .lower));
+
+    const url = try std.fmt.allocPrint(a, "file://{s}", .{try std.Io.Dir.cwd().realPathFileAlloc(testing.io, feed, a)});
+    const exe = try std.fmt.allocPrint(a, "{s}/assetty-test-prog", .{abs});
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = exe, .data = "#!/bin/sh\necho \"assetty 0.1.0\"\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    const cache = try std.fmt.allocPrint(a, "{s}/cache", .{abs});
+    try std.Io.Dir.cwd().createDirPath(testing.io, cache);
+
+    // No window/app in tests: the quit post is skipped, the spawn is real.
+    const r = try b.updateApplyImpl(a, .{}, url, exe, cache);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, r.text, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expect(o.get("installed").?.bool);
+    try testing.expectEqualStrings("9.9.9", o.get("version").?.string);
+    try testing.expect(o.get("restarted").?.bool);
+
+    // The swap landed and the staged probe actually got launched detached.
+    const said = try std.process.run(a, testing.io, .{ .argv = &.{ exe, "--version" }, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) });
+    try testing.expect(std.mem.indexOf(u8, said.stdout, "9.9.9") != null);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        std.Io.Dir.cwd().access(testing.io, marker, .{}) catch {
+            testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            continue;
+        };
+        break;
+    } else return error.Timeout;
+}
+
+/// A manifest naming one archive at `version` with the given sha hex.
+fn writeFeedManifestFor(a: std.mem.Allocator, feed: []const u8, asset: []const u8, version: []const u8, sha_hex: []const u8) !void {
+    const text = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, asset, sha_hex });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = text });
 }
 
 test "optimize impl runs a preset and reports deltas" {

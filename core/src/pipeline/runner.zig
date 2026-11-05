@@ -175,14 +175,21 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     .position_bits = p.position_bits,
                     .uv_bits = p.uv_bits,
                     .normal_oct = p.normal_oct,
+                    .meshopt_compression = p.meshopt_compression,
                 });
                 break :blk .{
                     .kind = kind,
                     .applied = true,
                     .note = try std.fmt.allocPrint(
                         a,
-                        "quantized {d} pos, {d} uv, {d} normal accessor(s)",
-                        .{ res.quantized_positions, res.quantized_uvs, res.quantized_normals },
+                        "quantized {d} pos, {d} uv, {d} normal accessor(s){s}{s}",
+                        .{
+                            res.quantized_positions,
+                            res.quantized_uvs,
+                            res.quantized_normals,
+                            if (res.meshopt_views > 0) try std.fmt.allocPrint(a, "; {d} meshopt view(s)", .{res.meshopt_views}) else "",
+                            if (res.meshopt_no_codec) "; meshopt requested but codec not linked" else "",
+                        },
                     ),
                 };
             },
