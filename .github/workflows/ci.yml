@@ -41,4 +41,6 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - run: zig build --summary all
+      # Explicit gnu target: same cross config the release matrix ships, and
+      # it does not depend on the runner's MSVC environment.
+      - run: zig build -Dtarget=x86_64-windows-gnu --summary all
