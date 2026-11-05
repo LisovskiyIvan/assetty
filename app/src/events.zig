@@ -1,10 +1,10 @@
 //! Typed events pushed from Zig to the page (`window.nanoui.on("<name>")`).
 //!
 //! Pages (and their typed IPC) exist where nanoui has a webview (macOS,
-//! Windows): elsewhere (Linux) `Call` and `Event` are `void`. The payload
-//! structs below stay shared — tests and the background-job code construct
-//! them on every platform — while the `Event` bindings degrade to a no-op
-//! `emit` where pages don't exist.
+//! Windows, Linux since 0.12's WebKitGTK backend): elsewhere `Call` and
+//! `Event` are `void`. The payload structs below stay shared — tests and the
+//! background-job code construct them on every platform — while the `Event`
+//! bindings degrade to a no-op `emit` where pages don't exist.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const json = @import("json.zig");

@@ -15,21 +15,25 @@ cd app/web && bun install && bun run build   # frontend → app/web/dist (GUI)
 ```
 
 Portability: CLI + core build everywhere Zig + C++17 do (Linux/macOS/Windows,
-glibc and musl). The desktop app shell (nanoui 0.11.0) is the same binary on
+glibc and musl). The desktop app shell (nanoui 0.12.0) is the same binary on
 all three:
 
 | OS | web UI | fallback |
 |----|--------|----------|
 | macOS | native (WKWebView) | — |
 | Windows | native via WebView2 (needs the WebView2 runtime — preinstalled on Win10/11; without it a native notice window opens instead) | native window pointing at the CLI |
-| Linux | not supported upstream (`PagesUnsupported`) | native window pointing at the CLI |
+| Linux | native via WebKitGTK 2.40+ (runtime dep, dlopened — see below; without it a native notice window opens instead) | native window pointing at the CLI |
 
 No macOS-only code remains in CLI/core; OpenCL (basisu) is macOS-only and
 falls back to CPU elsewhere (runtime OpenCL was never enabled). Foreign
 binaries are compile-verified on this Mac (can't execute them here); on Linux
-the app needs GTK3/GTK4 at runtime (dlopen), on Windows `WebView2Loader.dll`
-ships beside the exe when the WebView2 SDK is present at build time, otherwise
-the system-installed WebView2 runtime is used.
+the app needs GTK3/GTK4 at runtime (dlopen) plus WebKitGTK 2.40+ (dlopen:
+`libwebkitgtk-6.0.so.4` for GTK4, else `libwebkit2gtk-4.1.so.0` /
+`libwebkit2gtk-4.0.so.37` for GTK3 — Debian/Ubuntu: `sudo apt install
+libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`; `NANOUI_GTK=3` forces the GTK3
+path), on Windows `WebView2Loader.dll` ships beside the exe when the WebView2
+SDK is present at build time, otherwise the system-installed WebView2 runtime
+is used.
 
 ## CLI
 
@@ -74,10 +78,8 @@ test/         fixtures (синтетика + 12 моделей glTF-Sample-Asset
 - [x] tex: decode, mips, KTX2 encode (ETC1S/UASTC) + PSNR
 - [x] pipeline: zon-пресеты, runner, `optimize`
 - [x] CLI
-- [x] app: nanoui 0.11.0 + Babylon (Viewer/Optimize/Textures/Settings)
+- [x] app: nanoui 0.12.0 + Babylon (Viewer/Optimize/Textures/Settings;
+      web-UI на Linux через WebKitGTK, на Windows через WebView2)
 - [ ] EXT_meshopt_compression (пока quantize в core glTF: UNORM16/SNORM16)
-- [ ] webview на Linux (nanoui 0.11.0: `PagesUnsupported` — там приложение
-      открывает нативное окно; web-UI через WebKitGTK — будущая работа в
-      nanoui, не в assetty; на Windows web-UI уже нативно через WebView2)
 
 

@@ -5,8 +5,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // The desktop app shell: nanoui is cross-platform (AppKit/WebKit on
-    // macOS, GTK via runtime dlopen on Linux, Win32 + WebView2 pages on
-    // Windows), so `-Dapp` defaults to true everywhere. `-Dapp=false` builds the CLI alone.
+    // macOS, GTK + WebKitGTK via runtime dlopen on Linux, Win32 + WebView2
+    // pages on Windows), so `-Dapp` defaults to true everywhere. `-Dapp=false`
+    // builds the CLI alone. Nothing extra to link on Linux: both GTK and
+    // WebKitGTK are dlopened at runtime, never linked at build time.
     const is_mac = target.result.os.tag == .macos;
     const want_app = b.option(bool, "app", "Build the desktop app shell alongside the CLI") orelse true;
     // Plain `zig build` ships a fast binary; `-Doptimize=Debug` stays available.
@@ -147,8 +149,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // ---- desktop app tests -------------------------------------------------
-    // Backend impls are platform-independent (the page/IPC glue is mac-only
-    // inside backend.zig); they run wherever the host can execute them.
+    // Backend impls are platform-independent (the page/IPC glue works wherever
+    // nanoui has a webview — macOS, Windows, Linux); they run wherever the
+    // host can execute them.
     {
         const app_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path("app/src/tests.zig"),

@@ -2,10 +2,10 @@
 //! glTF toolkit exposed to it through `Backend`.
 //!
 //! The web UI runs in the system webview: WKWebView on macOS, WebView2 on
-//! Windows (nanoui 0.10+). Linux has no webview upstream (`PagesUnsupported`),
-//! and a Windows machine without the WebView2 runtime can't show a page
-//! either; both fall back to a native window pointing at the CLI, where the
-//! full toolkit stays available.
+//! Windows (nanoui 0.10+), WebKitGTK on Linux (nanoui 0.12+). A machine whose
+//! runtime webview is missing (no WebView2 on Windows, no WebKitGTK on
+//! Linux) falls back to a native window pointing at the CLI, where the full
+//! toolkit stays available.
 //!
 //! Headless checks nanoui understands:
 //!   assetty-app --nanoui-eval='...' --nanoui-wait=2
@@ -55,10 +55,12 @@ fn runPage(init: std.process.Init) !u8 {
         } },
     });
 
-    // Windows without the WebView2 runtime: nanoui keeps the window but shows
-    // its own notice view instead of a page (`page == null`). Swap it for
-    // ours, which points at the CLI.
-    if (builtin.os.tag == .windows and w.page == null) {
+    // No runtime webview (Windows without the WebView2 runtime, Linux without
+    // WebKitGTK 2.40+): nanoui keeps the window but shows its own notice view
+    // instead of a page (`page == null`). Swap it for ours, which points at
+    // the CLI.
+    const no_webview = builtin.os.tag == .windows or builtin.os.tag == .linux;
+    if (no_webview and w.page == null) {
         w.close();
         try showNotice(app);
     }

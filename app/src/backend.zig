@@ -20,11 +20,11 @@ const nanoui = @import("nanoui");
 const json = @import("json.zig");
 const events = @import("events.zig");
 
-/// Page IPC (`nanoui.Call`) exists wherever pages do (macOS and Windows): there
-/// it carries the call's arena and window. Where pages don't exist (Linux) it
-/// is `void` and bound methods are never invoked (`.page` windows are
-/// unsupported there). The wrappers still analyze on every platform, so they
-/// take this mirror of the fields they use instead.
+/// Page IPC (`nanoui.Call`) exists wherever pages do (macOS, Windows, Linux
+/// since nanoui 0.12's WebKitGTK backend): there it carries the call's arena
+/// and window. Where pages don't exist it is `void` and bound methods are
+/// never invoked; the wrappers still analyze on every platform, so they take
+/// this mirror of the fields they use instead.
 const has_page = nanoui.Call != void;
 const Call = if (has_page) nanoui.Call else struct {
     arena: std.mem.Allocator,
