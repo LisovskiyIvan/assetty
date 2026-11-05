@@ -4,11 +4,13 @@ import { buildOptimizeForm, closeFieldHelp, fieldHelpButton } from "../../optimi
 import { onLang, t } from "../../i18n";
 import { getSettings, onSettingsChange, textureOverridesCount } from "../../settings";
 import type { OptimizeSteps, TextureFormat } from "../../settings";
+import type { LodsItem } from "../../bridge";
 import { el, clear } from "../../ui";
 import { notify } from "../../notify";
 import type { OptimizeResult } from "../../types";
 import type { TabHandle } from "../types";
 import { createDualView } from "./dual";
+import { createLodsSection } from "./lods";
 import { createReport } from "./report";
 import { createRunFlow } from "./run";
 
@@ -24,6 +26,8 @@ export function mountOptimize(): TabHandle {
   /** Last rendered report numbers. Survives a discard (only the artifact
    * goes) so the before/after table stays put; cleared by the next run. */
   let lastReport: OptimizeResult | null = null;
+  /** Last finished LOD ladder; cleared by the next ladder, survives discards. */
+  let lastLods: LodsItem[] | null = null;
 
   const run = createRunFlow({
     dual,
@@ -49,6 +53,14 @@ export function mountOptimize(): TabHandle {
       if (app.viewPath === outPath && app.sourcePath) app.setView(app.sourcePath);
       notify(t("opt.discarded"), "ok");
     },
+    onLodsStarted: () => {
+      lastLods = null;
+      lods.reset();
+    },
+    onLodsFinished: (items) => {
+      lastLods = items;
+      lods.render(items);
+    },
     refreshTexExtra: () => syncTexExtra(),
   });
   side.append(run.panel);
@@ -66,16 +78,16 @@ export function mountOptimize(): TabHandle {
   // Step parameters live in the shared settings state (Settings tab edits the
   // same object); every change is applied in-app immediately and debounce-saved.
   const steps = (): OptimizeSteps => getSettings().optimize.steps;
-  /** (Re)builds the shared step form in the active language. */
-  let form = buildOptimizeForm(stepsBody, { get: steps, edit: run.edit });
+  /** (Re)builds the shared step form in the active language (collapsible here). */
+  let form = buildOptimizeForm(stepsBody, { get: steps, edit: run.edit, collapsible: true });
   function buildForm(): void {
     clear(stepsBody);
-    form = buildOptimizeForm(stepsBody, { get: steps, edit: run.edit });
-    // Inside the textures step block so the chips read as part of the step;
-    // falls back to a standalone block if the form layout ever changes.
+    form = buildOptimizeForm(stepsBody, { get: steps, edit: run.edit, collapsible: true });
+    // The auto presets are the fast path: they stay OUTSIDE the collapsed
+    // textures section (as its next sibling); the overrides note rides along.
     for (const block of Array.from(stepsBody.querySelectorAll(".step-block"))) {
       if (block.querySelector(".step-name")?.textContent === "textures") {
-        block.append(texExtra);
+        block.after(texExtra);
         break;
       }
     }
@@ -176,12 +188,18 @@ export function mountOptimize(): TabHandle {
     onSaveAs: (path) => void run.saveAs(path),
     onDiscard: (path) => run.discardResult(path),
   });
+  const lods = createLodsSection({
+    onSaveAs: (path) => void run.saveAs(path),
+    onView: (path) => void run.viewResult(path),
+  });
+  side.append(lods.panel);
   side.append(report.panel);
   side.append(run.exportNote);
 
   function syncStatic(): void {
     stepsHead.textContent = t("opt.stepsTitle");
     report.syncHead();
+    lods.syncTexts();
     dual.resync();
     run.syncTexts();
     dual.syncEmptyHint();
@@ -217,6 +235,8 @@ export function mountOptimize(): TabHandle {
     buildForm();
     if (lastReport) report.render(lastReport, lastResult?.out_path === lastReport.out_path);
     else report.reset();
+    if (lastLods) lods.render(lastLods);
+    else lods.reset();
     syncAll();
   });
 

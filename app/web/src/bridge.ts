@@ -15,6 +15,8 @@
  *   optimize(path, preset)  -> { started: true } — result arrives as "optimizeDone"
  *                              (older hosts: { out_path, report } synchronously)
  *   optimizeCustom(path, spec) -> same shape; spec is a JSON string
+ *   optimizeLODs(path, spec, ratios) -> { started: true } — the ladder arrives
+ *                              as "lodsDone" (older hosts: result directly)
  *   textures(path)          -> { images }
  *   texturePreview(path, i) -> { started: true } — image arrives as "texturePreviewDone"
  *                              (missing on older hosts: feature-detected, preview disabled)
@@ -34,8 +36,10 @@
  *
  * A job that is already running answers `{ "error": "busy" }`.
  *
- * Events: "progress" { step, pct }, "log" { line },
+ * Events: "progress" { step, pct, sub? }, "log" { line },
  *         "optimizeDone" { ok: true, out_path, report } | { ok: false, error },
+ *         "lodsDone" { ok: true, results: [{ ratio, out_path, disk_bytes,
+ *                    triangles, secs }] } | { ok: false, error },
  *         "exportDone" { ok: true, src, dst } | { ok: false, error },
  *         "texturePreviewDone" { ok: true, index, b64, width, height } | { ok: false, index, error },
  *         "textureEncodeDone" { ok: true, index, ktx2_size, psnr, vram_after, before_png, after_png,
@@ -48,6 +52,9 @@ export { isBusyError } from "./guards";
 export type {
   EncodeInvocation,
   ExportDoneEvent,
+  LodsDoneEvent,
+  LodsInvocation,
+  LodsItem,
   OpenDialogResult,
   OptimizeDoneEvent,
   OptimizeInvocation,

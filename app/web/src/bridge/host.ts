@@ -10,6 +10,7 @@ const METHOD_NAMES = [
   "loadBytes",
   "optimize",
   "optimizeCustom",
+  "optimizeLODs",
   "textures",
   "texturePreview",
   "textureEncode",

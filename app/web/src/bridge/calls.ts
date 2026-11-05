@@ -16,6 +16,7 @@ import {
   normalizeEncodeResult,
   normalizeExportDone,
   normalizeImages,
+  normalizeLodsDone,
   normalizeOptimize,
   normalizeOptimizeDone,
   normalizePreviewDone,
@@ -26,6 +27,8 @@ import {
 import type {
   EncodeInvocation,
   ExportDoneEvent,
+  LodsDoneEvent,
+  LodsInvocation,
   NativeBackend,
   OpenDialogResult,
   OptimizeDoneEvent,
@@ -150,6 +153,38 @@ export class Bridge {
   async textures(path: string): Promise<TexturesResult> {
     if (!this.live) return this.demo.textures();
     return normalizeImages(parseMaybeJson(await this.raw("textures", [path])));
+  }
+
+  /**
+   * LOD ladder: `specJson` is the same JSON string `optimizeCustom` takes,
+   * `ratiosJson` a JSON array like `[0.5,0.25,0.1]` (null/blank = host
+   * default). New hosts answer `{ started: true }` and report the ladder
+   * through `lodsDone`; each rung is built from the source, never compounded.
+   */
+  async optimizeLODs(
+    path: string,
+    specJson: string,
+    ratiosJson: string | null,
+    onProgress?: (p: ProgressEvent) => void,
+  ): Promise<LodsInvocation> {
+    if (!this.live) throw new Error(t("opt.lodsDemo"));
+    if (!this.native?.methods.includes("optimizeLODs")) {
+      throw new Error("backend has no optimizeLODs()");
+    }
+    const off = this.progressInto(onProgress);
+    let res: unknown;
+    try {
+      const args = ratiosJson == null ? [path, specJson] : [path, specJson, ratiosJson];
+      res = parseMaybeJson(await this.raw("optimizeLODs", args));
+    } catch (err) {
+      off();
+      throw err;
+    }
+    if (isStartedAck(res)) return { started: true, stopProgress: off };
+    off();
+    const event = normalizeLodsDone(res);
+    if (!event.ok) throw new Error(event.error);
+    return { started: false, result: event.results };
   }
 
   /**
@@ -433,6 +468,14 @@ export class Bridge {
    */
   onOptimizeDone(cb: (event: OptimizeDoneEvent) => void): () => void {
     return this.on("optimizeDone", (payload) => cb(normalizeOptimizeDone(payload)));
+  }
+
+  /**
+   * Final result of a background `optimizeLODs()` ladder. Fires once per job,
+   * after the call already resolved with `{ started: true }`.
+   */
+  onLodsDone(cb: (event: LodsDoneEvent) => void): () => void {
+    return this.on("lodsDone", (payload) => cb(normalizeLodsDone(payload)));
   }
 
   /** Final result of a background `textureEncode()` run. */

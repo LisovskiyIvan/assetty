@@ -115,6 +115,19 @@ const en: Dict = {
   "opt.diverged": "Viewing a different file (results are not the source)",
   "opt.run": "Run optimize",
   "opt.running": "Running…",
+  "opt.lods": "Generate LODs…",
+  "opt.lodsRunning": "Generating LODs…",
+  "opt.lodsTitle": "Build 50/25/10% LODs from the current steps and the source model",
+  "opt.lodsDemo": "demo mode — LODs need the assetty binary",
+  "opt.lodsNoHost": "LODs unavailable — rebuild the assetty binary",
+  "opt.lodsSection": "LODs",
+  "opt.lodsEmpty": "generate LODs to see one file per ratio",
+  "opt.lodsNote": "each LOD is built from the source — they don't compound",
+  "opt.lodsColRatio": "ratio",
+  "opt.lodsColFile": "file",
+  "opt.lodsFinished": "LODs finished",
+  "opt.lodsFailedMsg": "lods failed: {message}",
+  "opt.stepDisabled": "Disabled",
   "opt.progressIdle": "idle · 0%",
   "opt.export": "Export",
   "opt.exporting": "Exporting…",
@@ -399,6 +412,9 @@ const en: Dict = {
   // background texture progress ("texture 3/7")
   "progress.texture": "texture {done}/{total}",
 
+  // LOD ladder progress ("LOD 1/3")
+  "progress.lods": "LOD {done}/{total}",
+
   // field help button chrome
   "help.whatDoes": "what does this do?",
   "help.aria": "help: {id}",
@@ -542,6 +558,19 @@ const ru: Dict = {
   "opt.diverged": "Открыт другой файл (это не источник результатов)",
   "opt.run": "Запустить",
   "opt.running": "Работает…",
+  "opt.lods": "Создать LOD…",
+  "opt.lodsRunning": "Создание LOD…",
+  "opt.lodsTitle": "Построить LOD 50/25/10% из текущих шагов и исходной модели",
+  "opt.lodsDemo": "демо-режим — для LOD нужен бинарник assetty",
+  "opt.lodsNoHost": "LOD недоступны — пересоберите бинарник assetty",
+  "opt.lodsSection": "LOD",
+  "opt.lodsEmpty": "создайте LOD, чтобы увидеть файл на каждую долю",
+  "opt.lodsNote": "каждый LOD строится из источника — они не накапливаются",
+  "opt.lodsColRatio": "доля",
+  "opt.lodsColFile": "файл",
+  "opt.lodsFinished": "LOD готовы",
+  "opt.lodsFailedMsg": "ошибка LOD: {message}",
+  "opt.stepDisabled": "Выкл",
   "opt.progressIdle": "ожидание · 0%",
   "opt.export": "Экспорт",
   "opt.exporting": "Экспорт…",
@@ -819,6 +848,8 @@ const ru: Dict = {
   "drop.failed": "ошибка сброса: {message}",
 
   "progress.texture": "текстура {done}/{total}",
+
+  "progress.lods": "ЛОД {done}/{total}",
 
   "help.whatDoes": "что это делает?",
   "help.aria": "справка: {id}",

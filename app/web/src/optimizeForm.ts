@@ -11,6 +11,12 @@ export interface OptimizeFormOptions {
   get(): OptimizeSteps;
   /** Applies one edit to the live settings state (debounce-saved by settings.ts). */
   edit(mutate: (steps: OptimizeSteps) => void): void;
+  /**
+   * Collapsible sections (Optimize tab): only the step name + a one-line live
+   * summary stay visible, the controls hide behind a click. Flat (Settings
+   * tab) keeps today's always-open layout.
+   */
+  collapsible?: boolean;
 }
 
 export interface OptimizeForm {
@@ -223,7 +229,9 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     const steps = opts.get();
     for (const block of blocks) {
       block.box.checked = steps[block.id].enabled;
-      block.params.hidden = !steps[block.id].enabled;
+      // Collapsible sections keep the user's own open state (the live summary
+      // carries the enabled state instead); flat mode hides disabled params.
+      if (!opts.collapsible) block.params.hidden = !steps[block.id].enabled;
     }
     for (const fn of refreshSyncers) fn();
   }
@@ -340,6 +348,7 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     hint: string,
     buildParams: () => HTMLElement[],
     helpId?: string,
+    summarize?: () => string,
   ): void {
     const box = el("input", { type: "checkbox" });
     box.checked = opts.get()[id].enabled;
@@ -350,224 +359,337 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     );
     const params = el("div", { class: "step-params" });
     params.append(...buildParams());
-    params.hidden = !box.checked;
-    blocks.push({ id, box, params });
-    host.append(
-      el(
-        "div",
-        { class: "step-block" },
+    if (!opts.collapsible) {
+      params.hidden = !box.checked;
+      blocks.push({ id, box, params });
+      host.append(
         el(
-          "label",
-          { class: "step-toggle" },
-          box,
-          el("span", { class: "step-name", text: label }),
-          helpId ? fieldHelpButton(helpId) : null,
-          el("span", { class: "step-hint", text: hint }),
+          "div",
+          { class: "step-block" },
+          el(
+            "label",
+            { class: "step-toggle" },
+            box,
+            el("span", { class: "step-name", text: label }),
+            helpId ? fieldHelpButton(helpId) : null,
+            el("span", { class: "step-hint", text: hint }),
+          ),
+          params,
         ),
-        params,
-      ),
+      );
+      return;
+    }
+    // Collapsible: the header carries the enable checkbox, the help button and
+    // a live one-line summary; the controls hide behind a click. Open state is
+    // the user's own (refresh() only syncs the checkbox + summary, never the
+    // disclosure), so everything stays reachable within two clicks.
+    const summaryEl = el("span", { class: "step-summary" });
+    const updateSummary = (): void => {
+      const on = opts.get()[id].enabled;
+      summaryEl.textContent = on ? (summarize?.() ?? hint) : t("opt.stepDisabled");
+      summaryEl.classList.toggle("off", !on);
+    };
+    refreshSyncers.push(updateSummary);
+    updateSummary();
+    const chevron = el("span", { class: "step-chevron", text: "▸", "aria-hidden": "true" });
+    const block = el("div", { class: "step-block collapsed" });
+    const head = el(
+      "div",
+      {
+        class: "step-head",
+        role: "button",
+        tabIndex: 0,
+        "aria-expanded": "false",
+        title: hint,
+      },
+      box,
+      el("span", { class: "step-name", text: label }),
+      helpId ? fieldHelpButton(helpId) : null,
+      summaryEl,
+      chevron,
     );
+    const setOpen = (next: boolean): void => {
+      open = next;
+      params.hidden = !open;
+      block.classList.toggle("collapsed", !open);
+      head.setAttribute("aria-expanded", open ? "true" : "false");
+      chevron.textContent = open ? "▾" : "▸";
+    };
+    head.addEventListener("click", (ev) => {
+      const target = ev.target as HTMLElement | null;
+      // The checkbox and the "?" keep their own behavior (never toggle).
+      if (target && (target === box || target.closest("input,button"))) return;
+      setOpen(!open);
+    });
+    head.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        setOpen(!open);
+      }
+    });
+    let open = false;
+    params.hidden = true;
+    blocks.push({ id, box, params });
+    block.append(head, params);
+    host.append(block);
   }
 
   /* ----------------------------------------------------------------- prune */
-  stepBlock("prune", "prune", t("opt.hint.prune"), () => [
-    el(
-      "div",
-      { class: "checks" },
-      check(
-        "nodes",
-        () => opts.get().prune.unused_nodes,
-        (value) =>
-          edit((steps) => {
-            steps.prune.unused_nodes = value;
-          }),
-        "prune.unused_nodes",
+  stepBlock(
+    "prune",
+    "prune",
+    t("opt.hint.prune"),
+    () => [
+      el(
+        "div",
+        { class: "checks" },
+        check(
+          "nodes",
+          () => opts.get().prune.unused_nodes,
+          (value) =>
+            edit((steps) => {
+              steps.prune.unused_nodes = value;
+            }),
+          "prune.unused_nodes",
+        ),
+        check(
+          "materials",
+          () => opts.get().prune.unused_materials,
+          (value) =>
+            edit((steps) => {
+              steps.prune.unused_materials = value;
+            }),
+          "prune.unused_materials",
+        ),
+        check(
+          "textures",
+          () => opts.get().prune.unused_textures,
+          (value) =>
+            edit((steps) => {
+              steps.prune.unused_textures = value;
+            }),
+          "prune.unused_textures",
+        ),
+        check(
+          t("opt.stripAnimations"),
+          () => !opts.get().prune.animations,
+          (value) =>
+            edit((steps) => {
+              steps.prune.animations = !value;
+            }),
+          "prune.animations",
+        ),
       ),
-      check(
-        "materials",
-        () => opts.get().prune.unused_materials,
-        (value) =>
-          edit((steps) => {
-            steps.prune.unused_materials = value;
-          }),
-        "prune.unused_materials",
-      ),
-      check(
-        "textures",
-        () => opts.get().prune.unused_textures,
-        (value) =>
-          edit((steps) => {
-            steps.prune.unused_textures = value;
-          }),
-        "prune.unused_textures",
-      ),
-      check(
-        t("opt.stripAnimations"),
-        () => !opts.get().prune.animations,
-        (value) =>
-          edit((steps) => {
-            steps.prune.animations = !value;
-          }),
-        "prune.animations",
-      ),
-    ),
-  ]);
+    ],
+    undefined,
+    () => {
+      const p = opts.get().prune;
+      const kept: string[] = [];
+      if (p.unused_nodes) kept.push("nodes");
+      if (p.unused_materials) kept.push("materials");
+      if (p.unused_textures) kept.push("textures");
+      if (p.animations) kept.push(t("opt.rowAnimations"));
+      return kept.length > 0 ? kept.join(" · ") : t("opt.hint.prune");
+    },
+  );
 
   /* ----------------------------------------------------------------- dedup */
-  stepBlock("dedup", "dedup", t("opt.hint.dedup"), () => [
-    el(
-      "div",
-      { class: "checks" },
-      check(
-        "accessors",
-        () => opts.get().dedup.accessors,
-        (value) =>
-          edit((steps) => {
-            steps.dedup.accessors = value;
-          }),
-        "dedup.accessors",
+  stepBlock(
+    "dedup",
+    "dedup",
+    t("opt.hint.dedup"),
+    () => [
+      el(
+        "div",
+        { class: "checks" },
+        check(
+          "accessors",
+          () => opts.get().dedup.accessors,
+          (value) =>
+            edit((steps) => {
+              steps.dedup.accessors = value;
+            }),
+          "dedup.accessors",
+        ),
+        check(
+          "meshes",
+          () => opts.get().dedup.meshes,
+          (value) =>
+            edit((steps) => {
+              steps.dedup.meshes = value;
+            }),
+          "dedup.meshes",
+        ),
+        check(
+          "materials",
+          () => opts.get().dedup.materials,
+          (value) =>
+            edit((steps) => {
+              steps.dedup.materials = value;
+            }),
+          "dedup.materials",
+        ),
       ),
-      check(
-        "meshes",
-        () => opts.get().dedup.meshes,
-        (value) =>
-          edit((steps) => {
-            steps.dedup.meshes = value;
-          }),
-        "dedup.meshes",
-      ),
-      check(
-        "materials",
-        () => opts.get().dedup.materials,
-        (value) =>
-          edit((steps) => {
-            steps.dedup.materials = value;
-          }),
-        "dedup.materials",
-      ),
-    ),
-  ]);
+    ],
+    undefined,
+    () => {
+      const d = opts.get().dedup;
+      const kept: string[] = [];
+      if (d.accessors) kept.push("accessors");
+      if (d.meshes) kept.push("meshes");
+      if (d.materials) kept.push("materials");
+      return kept.length > 0 ? kept.join(" · ") : t("opt.hint.dedup");
+    },
+  );
 
   /* ------------------------------------------------------------------ weld */
-  stepBlock("weld", "weld", t("opt.hint.weld"), () => [
-    field(
-      "tolerance",
-      numberInput(
-        0,
-        1,
-        0.0001,
-        () => opts.get().weld.tolerance,
-        (value) =>
-          edit((steps) => {
-            steps.weld.tolerance = value;
-          }),
+  stepBlock(
+    "weld",
+    "weld",
+    t("opt.hint.weld"),
+    () => [
+      field(
+        "tolerance",
+        numberInput(
+          0,
+          1,
+          0.0001,
+          () => opts.get().weld.tolerance,
+          (value) =>
+            edit((steps) => {
+              steps.weld.tolerance = value;
+            }),
+        ),
+        true,
+        "weld.tolerance",
       ),
-      true,
-      "weld.tolerance",
-    ),
-  ]);
+    ],
+    undefined,
+    () => `tolerance ${opts.get().weld.tolerance}`,
+  );
 
   /* ------------------------------------------------------------------ join */
   stepBlock("join", "join", t("opt.hint.join"), () => [], "join");
 
   /* -------------------------------------------------------------- textures */
-  stepBlock("textures", "textures", t("opt.hint.textures"), () => [
-    field(
-      "format",
-      select(
-        TEXTURE_FORMATS.map(([label, value]): [string, string] => [label, value]),
-        () => opts.get().textures.format,
-        (value) =>
-          edit((steps) => {
-            steps.textures.format = value as TextureFormat;
-          }),
+  stepBlock(
+    "textures",
+    "textures",
+    t("opt.hint.textures"),
+    () => [
+      field(
+        "format",
+        select(
+          TEXTURE_FORMATS.map(([label, value]): [string, string] => [label, value]),
+          () => opts.get().textures.format,
+          (value) =>
+            edit((steps) => {
+              steps.textures.format = value as TextureFormat;
+            }),
+        ),
+        false,
+        "textures.format",
       ),
-      false,
-      "textures.format",
-    ),
-    field(
-      "quality",
-      slider(
-        1,
-        255,
-        1,
-        () => opts.get().textures.quality,
-        (value) =>
-          edit((steps) => {
-            steps.textures.quality = value;
-          }),
+      field(
+        "quality",
+        slider(
+          1,
+          255,
+          1,
+          () => opts.get().textures.quality,
+          (value) =>
+            edit((steps) => {
+              steps.textures.quality = value;
+            }),
+        ),
+        true,
+        "textures.quality",
       ),
-      true,
-      "textures.quality",
-    ),
-    field(
-      "max size",
-      select(
-        maxSizeOptions().map(([label, value]): [string, string] => [label, value]),
-        () => String(opts.get().textures.max_size),
-        (value) =>
-          edit((steps) => {
-            steps.textures.max_size = Number(value);
-          }),
+      field(
+        "max size",
+        select(
+          maxSizeOptions().map(([label, value]): [string, string] => [label, value]),
+          () => String(opts.get().textures.max_size),
+          (value) =>
+            edit((steps) => {
+              steps.textures.max_size = Number(value);
+            }),
+        ),
+        false,
+        "textures.max_size",
       ),
-      false,
-      "textures.max_size",
-    ),
-    field(
-      "mips",
-      check(
-        "generate",
-        () => opts.get().textures.generate_mips,
-        (value) =>
-          edit((steps) => {
-            steps.textures.generate_mips = value;
-          }),
-        "textures.generate_mips",
+      field(
+        "mips",
+        check(
+          "generate",
+          () => opts.get().textures.generate_mips,
+          (value) =>
+            edit((steps) => {
+              steps.textures.generate_mips = value;
+            }),
+          "textures.generate_mips",
+        ),
       ),
-    ),
-  ]);
+    ],
+    undefined,
+    () => {
+      const tx = opts.get().textures;
+      const size = tx.max_size > 0 ? String(tx.max_size) : t("common.noResize");
+      return `${tx.format} · q${tx.quality} · ${size} · ${tx.generate_mips ? t("tex.mips") : t("tex.noMips")}`;
+    },
+  );
 
   /* -------------------------------------------------------------- quantize */
-  stepBlock("quantize", "quantize", t("opt.hint.quantize"), () => [
-    field(
-      "position bits",
-      select(
-        POSITION_BITS,
-        () => String(opts.get().quantize.position_bits),
-        (value) =>
-          edit((steps) => {
-            steps.quantize.position_bits = Number(value);
-          }),
+  stepBlock(
+    "quantize",
+    "quantize",
+    t("opt.hint.quantize"),
+    () => [
+      field(
+        "position bits",
+        select(
+          POSITION_BITS,
+          () => String(opts.get().quantize.position_bits),
+          (value) =>
+            edit((steps) => {
+              steps.quantize.position_bits = Number(value);
+            }),
+        ),
+        false,
+        "quantize.position_bits",
       ),
-      false,
-      "quantize.position_bits",
-    ),
-    field(
-      "uv bits",
-      select(
-        UV_BITS,
-        () => String(opts.get().quantize.uv_bits),
-        (value) =>
-          edit((steps) => {
-            steps.quantize.uv_bits = Number(value);
-          }),
+      field(
+        "uv bits",
+        select(
+          UV_BITS,
+          () => String(opts.get().quantize.uv_bits),
+          (value) =>
+            edit((steps) => {
+              steps.quantize.uv_bits = Number(value);
+            }),
+        ),
+        false,
+        "quantize.uv_bits",
       ),
-      false,
-      "quantize.uv_bits",
-    ),
-    field(
-      "normals",
-      check(
-        "oct-encode",
-        () => opts.get().quantize.normal_oct,
-        (value) =>
-          edit((steps) => {
-            steps.quantize.normal_oct = value;
-          }),
-        "quantize.normal_oct",
+      field(
+        "normals",
+        check(
+          "oct-encode",
+          () => opts.get().quantize.normal_oct,
+          (value) =>
+            edit((steps) => {
+              steps.quantize.normal_oct = value;
+            }),
+          "quantize.normal_oct",
+        ),
       ),
-    ),
-  ]);
+    ],
+    undefined,
+    () => {
+      const q = opts.get().quantize;
+      return `${q.position_bits}/${q.uv_bits}${q.normal_oct ? " · oct" : ""}`;
+    },
+  );
 
   /* -------------------------------------------------------------- simplify */
   const weightNormal = numberInput(
@@ -596,76 +718,87 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
     weightUv.disabled = !on;
   });
 
-  stepBlock("simplify", "simplify", t("opt.hint.simplify"), () => [
-    field(
-      "keep",
-      slider(
-        10,
-        100,
-        1,
-        () => Math.round(opts.get().simplify.target_ratio * 100),
-        (value) =>
-          edit((steps) => {
-            steps.simplify.target_ratio = value / 100;
-          }),
-        "%",
+  stepBlock(
+    "simplify",
+    "simplify",
+    t("opt.hint.simplify"),
+    () => [
+      field(
+        "keep",
+        slider(
+          10,
+          100,
+          1,
+          () => Math.round(opts.get().simplify.target_ratio * 100),
+          (value) =>
+            edit((steps) => {
+              steps.simplify.target_ratio = value / 100;
+            }),
+          "%",
+        ),
+        true,
+        "simplify.target_ratio",
       ),
-      true,
-      "simplify.target_ratio",
-    ),
-    field(
-      "max error",
-      select(
-        ERROR_TOLERANCES.map(([label, value]): [string, string] => [label, String(value)]),
-        () => String(opts.get().simplify.error_tolerance),
-        (value) =>
-          edit((steps) => {
-            steps.simplify.error_tolerance = Number(value);
-          }),
+      field(
+        "max error",
+        select(
+          ERROR_TOLERANCES.map(([label, value]): [string, string] => [label, String(value)]),
+          () => String(opts.get().simplify.error_tolerance),
+          (value) =>
+            edit((steps) => {
+              steps.simplify.error_tolerance = Number(value);
+            }),
+        ),
+        false,
+        "simplify.error_tolerance",
       ),
-      false,
-      "simplify.error_tolerance",
-    ),
-    field(
-      "mode",
-      check(
-        "aggressive",
-        () => opts.get().simplify.aggressive,
-        (value) =>
-          edit((steps) => {
-            steps.simplify.aggressive = value;
-          }),
-        "simplify.aggressive",
+      field(
+        "mode",
+        check(
+          "aggressive",
+          () => opts.get().simplify.aggressive,
+          (value) =>
+            edit((steps) => {
+              steps.simplify.aggressive = value;
+            }),
+          "simplify.aggressive",
+        ),
       ),
-    ),
-    field(
-      "borders",
-      check(
-        "lock",
-        () => opts.get().simplify.lock_borders,
-        (value) =>
-          edit((steps) => {
-            steps.simplify.lock_borders = value;
-          }),
-        "simplify.lock_borders",
+      field(
+        "borders",
+        check(
+          "lock",
+          () => opts.get().simplify.lock_borders,
+          (value) =>
+            edit((steps) => {
+              steps.simplify.lock_borders = value;
+            }),
+          "simplify.lock_borders",
+        ),
       ),
-    ),
-    field(
-      "seam-aware",
-      check(
-        "use attributes",
-        () => opts.get().simplify.use_attributes,
-        (value) =>
-          edit((steps) => {
-            steps.simplify.use_attributes = value;
-          }),
-        "simplify.use_attributes",
+      field(
+        "seam-aware",
+        check(
+          "use attributes",
+          () => opts.get().simplify.use_attributes,
+          (value) =>
+            edit((steps) => {
+              steps.simplify.use_attributes = value;
+            }),
+          "simplify.use_attributes",
+        ),
+        true,
       ),
-      true,
-    ),
-    field("weight normal", weightNormal, false, "simplify.weight_normal"),
-    field("weight uv", weightUv, false, "simplify.weight_uv"),
-  ]);
+      field("weight normal", weightNormal, false, "simplify.weight_normal"),
+      field("weight uv", weightUv, false, "simplify.weight_uv"),
+    ],
+    undefined,
+    () => {
+      const s = opts.get().simplify;
+      const pct = Math.round(s.target_ratio * 100);
+      return `keep ${pct}%${s.aggressive ? " · aggressive" : ""}${s.lock_borders ? "" : " · unlocked"}`;
+    },
+  );
 
   sync();
   return { sync };

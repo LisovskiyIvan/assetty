@@ -89,6 +89,7 @@ pub const Backend = struct {
         .loadBytes = .{"path"},
         .optimize = .{ "path", "preset" },
         .optimizeCustom = .{ "path", "spec" },
+        .optimizeLODs = .{ "path", "spec", "ratios" },
         .textures = .{"path"},
         .textureEncode = .{ "path", "index", "settings" },
         .texturePreview = .{ "path", "index", "settings" },
@@ -191,6 +192,41 @@ pub const Backend = struct {
             .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
         };
         return self.launch(call.arena, Target.of(call.window), .optimize, path, p, 0, null);
+    }
+
+    /// Generates LODs from one source: runs the pipeline N times FROM THE
+    /// SOURCE (never compounded) with the same spec but `simplify.target_ratio`
+    /// overridden per rung, into `<stem>_lod<NN>.glb` files (`NN` is
+    /// `round(ratio*100)`, e.g. `helmet_lod50.glb`).
+    ///
+    /// `spec` is the same JSON text `optimizeCustom` takes; `ratios` is a JSON
+    /// array of fractions (`[0.5,0.25,0.1]`, null/blank for the default) with
+    /// one simplified output per entry. Values outside `(0,1)` are dropped
+    /// (`1.0` is the base file — the regular run result — not an LOD),
+    /// duplicates (after `round(ratio*100)`) collapse, the ladder runs
+    /// descending. A spec without a simplify step still gains one (backend
+    /// defaults + the rung's `target_ratio`) — for the LODs only.
+    ///
+    /// Answers `{"started":true}` at once like `optimize`; each rung's steps
+    /// arrive as `progress` events and the ladder as `lodsDone`. Shares the
+    /// pipeline gate: one job at a time, same cancel/shutdown semantics.
+    pub fn optimizeLODs(
+        self: *Backend,
+        call: *Call,
+        path: []const u8,
+        spec: []const u8,
+        ratios: ?[]const u8,
+    ) !json.Raw {
+        if (self.busy()) return json.errorRaw(call.arena, "busy", .{});
+        const resolved = specPresetOrMessage(call.arena, spec);
+        const base = switch (resolved) {
+            .preset => |p2| p2,
+            .err => |msg| return json.errorRaw(call.arena, "{s}", .{msg}),
+        };
+        const ladder = parseLodRatios(call.arena, ratios) catch
+            return json.errorRaw(call.arena, "invalid ratios", .{});
+        if (ladder.len == 0) return json.errorRaw(call.arena, "no valid ratios", .{});
+        return self.launchLods(call.arena, Target.of(call.window), path, base, ladder);
     }
 
     // ---- textures ---------------------------------------------------------
@@ -519,16 +555,26 @@ pub const Backend = struct {
             sinks.logFmt("optimize failed: {s}", .{msg});
             return .{ .failed = msg };
         };
+        return self.runPipelineTo(a, path, p, out_path, sinks);
+    }
 
-        const rep = core.runner.run(self.io, a, path, .{
-            .preset = p,
-            .out_path = out_path,
-            .progress = sinks.progress,
-            .progress_ctx = sinks.progress_ctx,
-        }) catch |err| {
-            const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) catch return .out_of_memory;
-            sinks.logFmt("optimize failed: {s}", .{msg});
-            return .{ .failed = msg };
+    /// Same as `runPipeline` but into the caller's `out_path` (the LOD ladder
+    /// names its own files). `out_dir` must already exist.
+    fn runPipelineTo(
+        self: *Backend,
+        a: std.mem.Allocator,
+        path: []const u8,
+        p: core.preset.Preset,
+        out_path: []const u8,
+        sinks: Sinks,
+    ) PipelineOutcome {
+        const rep = switch (self.execPipeline(a, path, p, out_path, sinks)) {
+            .done => |r| r,
+            .failed => |msg| {
+                sinks.logFmt("optimize failed: {s}", .{msg});
+                return .{ .failed = msg };
+            },
+            .out_of_memory => return .out_of_memory,
         };
         sinks.logFmt("optimize \"{s}\" -> {s}", .{ p.name, out_path });
 
@@ -537,6 +583,29 @@ pub const Backend = struct {
         json.writeOptimize(&aw.writer, path, out_path, p, rep) catch return .out_of_memory;
         const report = aw.toOwnedSlice() catch return .out_of_memory;
         return .{ .done = .{ .out_path = out_path, .report = json.raw(report) } };
+    }
+
+    /// Runs the pipeline once, into `out_path`. The report comes back
+    /// arena-owned for the caller to mine (LOD ladders read `after`/`total_secs`
+    /// off it; single runs format it as JSON).
+    fn execPipeline(
+        self: *Backend,
+        a: std.mem.Allocator,
+        path: []const u8,
+        p: core.preset.Preset,
+        out_path: []const u8,
+        sinks: Sinks,
+    ) ExecOutcome {
+        const rep = core.runner.run(self.io, a, path, .{
+            .preset = p,
+            .out_path = out_path,
+            .progress = sinks.progress,
+            .progress_ctx = sinks.progress_ctx,
+        }) catch |err| {
+            const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) catch return .out_of_memory;
+            return .{ .failed = msg };
+        };
+        return .{ .done = rep };
     }
 
     fn texturesImpl(self: *Backend, a: std.mem.Allocator, path: []const u8) !json.Raw {
@@ -747,7 +816,29 @@ pub const Backend = struct {
         // `{"error":..}` instead of an event a second later.
         _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
             return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        _ = self.spawn(target, kind, path, p, index, extra) catch |err| switch (err) {
+        _ = self.spawn(target, kind, path, p, index, extra, null) catch |err| switch (err) {
+            error.Busy => return json.errorRaw(a, "busy", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SpawnFailed => return json.errorRaw(a, "cannot start a worker thread", .{}),
+        };
+        return json.raw(started_reply);
+    }
+
+    /// Validates `path`, hands the LOD ladder to a worker and answers
+    /// `{"started":true}`. `ladder` is already parsed, filtered and sorted
+    /// (see `parseLodRatios`); the worker deep-copies it again via `spawn`.
+    fn launchLods(
+        self: *Backend,
+        a: std.mem.Allocator,
+        target: Target,
+        path: []const u8,
+        p: core.preset.Preset,
+        ladder: []const f32,
+    ) !json.Raw {
+        if (self.busy()) return json.errorRaw(a, "busy", .{});
+        _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        _ = self.spawn(target, .optimize_lods, path, p, 0, null, ladder) catch |err| switch (err) {
             error.Busy => return json.errorRaw(a, "busy", .{}),
             error.OutOfMemory => return error.OutOfMemory,
             error.SpawnFailed => return json.errorRaw(a, "cannot start a worker thread", .{}),
@@ -777,6 +868,7 @@ pub const Backend = struct {
         p: ?core.preset.Preset,
         index: u32,
         extra: ?[]const u8,
+        ratios: ?[]const f32,
     ) SpawnError!*Job {
         self.job_lock.lock();
         defer self.job_lock.unlock();
@@ -798,6 +890,11 @@ pub const Backend = struct {
         errdefer {
             if (extra_copy) |copy| gpa.free(copy);
         }
+        // The LOD ladder; null for every other kind.
+        const ratios_copy: ?[]f32 = if (ratios) |r| try gpa.dupe(f32, r) else null;
+        errdefer {
+            if (ratios_copy) |copy| gpa.free(copy);
+        }
 
         const job = try gpa.create(Job);
         errdefer gpa.destroy(job);
@@ -811,6 +908,7 @@ pub const Backend = struct {
             .path = path_copy,
             .preset = preset_copy,
             .arg = extra_copy,
+            .ratios = ratios_copy,
         };
 
         // The gate is closed before the worker exists: a job that finishes
@@ -859,7 +957,7 @@ pub const Backend = struct {
 /// The `{"started":true}` reply of every background method.
 const started_reply = "{\"started\":true}";
 
-const JobKind = enum { optimize, texture_encode, texture_preview, export_file };
+const JobKind = enum { optimize, optimize_lods, texture_encode, texture_preview, export_file };
 
 /// Guards `Backend.job`. Critical sections are a pointer compare, so a spin
 /// lock is plenty (and `std.Io.Mutex` would need an `Io` in a `.c` callback).
@@ -946,6 +1044,14 @@ const PipelineOutcome = union(enum) {
     out_of_memory,
 };
 
+/// How one pipeline execution ended. The report is arena-owned.
+const ExecOutcome = union(enum) {
+    done: core.runner.Report,
+    /// Human-readable reason, already formatted the way replies want it.
+    failed: []const u8,
+    out_of_memory,
+};
+
 /// A resolved preset, or the text of the error reply.
 const Resolved = union(enum) {
     preset: core.preset.Preset,
@@ -973,6 +1079,158 @@ fn specPresetOrMessage(a: std.mem.Allocator, spec: []const u8) Resolved {
     } };
 }
 
+// ---- LOD ladders ------------------------------------------------------------
+
+// One finished ladder rung, owned by the job (`Job.destroy` frees `out_path`).
+const LodOwned = struct {
+    ratio: f32,
+    out_path: []u8,
+    disk_bytes: u64,
+    triangles: u64,
+    secs: f64,
+};
+
+/// Default ladder when the binding gets null/blank ratios: the simplified
+/// rungs only — the base file is the regular run result.
+const default_lod_ladder = [_]f32{ 0.5, 0.25, 0.1 };
+
+/// Parses the `ratios` argument of `optimizeLODs`: a JSON array of fractions.
+/// Null/blank means the default ladder. Non-numbers are skipped; values
+/// outside `(0,1)` are dropped; the rest is sorted descending with
+/// `round(x*100)` duplicates collapsed (one file per `<stem>_lod<NN>.glb` name).
+fn parseLodRatios(a: std.mem.Allocator, text: ?[]const u8) error{ OutOfMemory, InvalidRatios }![]f32 {
+    const t = std.mem.trim(u8, text orelse "", " \t\r\n");
+    if (t.len == 0) return try a.dupe(f32, &default_lod_ladder);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, t, .{}) catch
+        return error.InvalidRatios;
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |arr| arr.items,
+        else => return error.InvalidRatios,
+    };
+    var out: std.ArrayList(f32) = .empty;
+    for (items) |item| {
+        const r: f32 = switch (item) {
+            .float => |f| std.math.lossyCast(f32, f),
+            .integer => |i| @floatFromInt(i),
+            else => continue,
+        };
+        if (!(r > 0 and r < 1)) continue;
+        try out.append(a, r);
+    }
+    const ladder = try out.toOwnedSlice(a);
+    std.mem.sort(f32, ladder, {}, struct {
+        fn lt(_: void, x: f32, y: f32) bool {
+            return x > y;
+        }
+    }.lt);
+    // Collapse `round(x*100)` duplicates (they would share a file name).
+    var n: usize = 0;
+    var prev_pct: ?u32 = null;
+    for (ladder) |r| {
+        const pct: u32 = @intFromFloat(@round(r * 100));
+        if (prev_pct == pct) continue;
+        prev_pct = pct;
+        ladder[n] = r;
+        n += 1;
+    }
+    return ladder[0..n];
+}
+
+/// Clones `base` with `simplify.target_ratio = ratio`. When the spec has no
+/// simplify step, one is appended with the backend defaults (simplify is the
+/// canonical last step, so appending keeps the order). Step slices are
+/// shallow-copied (texture overrides stay shared, read-only during the run).
+fn lodPresetFor(a: std.mem.Allocator, base: core.preset.Preset, ratio: f32) !core.preset.Preset {
+    const steps = try a.dupe(core.preset.Step, base.steps);
+    for (steps) |*s| {
+        if (s.* == .simplify) {
+            s.simplify.target_ratio = ratio;
+            return .{ .name = base.name, .target = base.target, .steps = steps };
+        }
+    }
+    const grown = try a.alloc(core.preset.Step, steps.len + 1);
+    @memcpy(grown[0..steps.len], steps);
+    const d = core.preset.SimplifyParams{};
+    grown[steps.len] = .{ .simplify = .{
+        .target_ratio = ratio,
+        .error_tolerance = d.error_tolerance,
+        .aggressive = d.aggressive,
+        .lock_borders = d.lock_borders,
+        .use_attributes = d.use_attributes,
+        .weight_normal = d.weight_normal,
+        .weight_uv = d.weight_uv,
+    } };
+    return .{ .name = base.name, .target = base.target, .steps = grown };
+}
+
+/// `<out_dir>/<stem>_lod<NN>.glb`: `stem` is the source's file stem,
+/// `NN` is `round(ratio*100)` (`box_lod50.glb`).
+fn lodOutName(a: std.mem.Allocator, src_path: []const u8, ratio: f32) ![]u8 {
+    const base = std.fs.path.basename(src_path);
+    const stem = std.fs.path.stem(base);
+    const clean = if (stem.len == 0) "model" else stem;
+    const pct: u32 = @intFromFloat(@round(ratio * 100));
+    return try std.fmt.allocPrint(a, "{s}/{s}_lod{d}.glb", .{ out_dir, clean, pct });
+}
+
+/// One finished ladder rung with arena-owned paths (the sync entry point the
+/// tests use: same semantics as the worker's loop, minus progress).
+const LodItem = struct {
+    ratio: f32,
+    out_path: []const u8,
+    disk_bytes: u64,
+    triangles: u64,
+    secs: f64,
+};
+
+const LodSyncOutcome = union(enum) {
+    done: []LodItem,
+    failed: []const u8,
+    out_of_memory,
+};
+
+/// Runs the whole ladder synchronously, on the calling thread: the entry
+/// point the tests (and any non-UI caller) use. Every rung starts from `path`
+/// (the source is never modified); `ratios` must already be parsed, filtered
+/// and sorted (see `parseLodRatios`).
+fn lodRunSync(
+    self: *Backend,
+    a: std.mem.Allocator,
+    path: []const u8,
+    base: core.preset.Preset,
+    ratios: []const f32,
+    sinks: Sinks,
+) LodSyncOutcome {
+    std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |err| {
+        const msg = std.fmt.allocPrint(a, "out dir: {s}", .{@errorName(err)}) catch return .out_of_memory;
+        return .{ .failed = msg };
+    };
+    var out: std.ArrayList(LodItem) = .empty;
+    errdefer out.deinit(a);
+    for (ratios) |ratio| {
+        const preset = lodPresetFor(a, base, ratio) catch return .out_of_memory;
+        const out_path = lodOutName(a, path, ratio) catch return .out_of_memory;
+        const rep = switch (self.execPipeline(a, path, preset, out_path, sinks)) {
+            .done => |r| r,
+            .failed => |msg| return .{ .failed = msg },
+            .out_of_memory => return .out_of_memory,
+        };
+        const st = std.Io.Dir.cwd().statFile(self.io, out_path, .{}) catch |err| {
+            const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ out_path, @errorName(err) }) catch return .out_of_memory;
+            return .{ .failed = msg };
+        };
+        out.append(a, .{
+            .ratio = ratio,
+            .out_path = out_path,
+            .disk_bytes = st.size,
+            .triangles = rep.after.triangles,
+            .secs = rep.total_secs,
+        }) catch return .out_of_memory;
+    }
+    return .{ .done = out.toOwnedSlice(a) catch return .out_of_memory };
+}
+
 // ---- background jobs ------------------------------------------------------
 
 /// One background run. The main thread owns `Backend.job`; the worker owns
@@ -993,6 +1251,14 @@ const Job = struct {
     /// Extra argument: the `export_file` destination, or the `texture_encode`
     /// settings JSON text; null for every other kind.
     arg: ?[]u8 = null,
+    /// The LOD ladder for `optimize_lods` (job-owned copy); null otherwise.
+    ratios: ?[]f32 = null,
+    /// LOD progress frame: `lod_done` rungs of `lod_total` finished. Step
+    /// progress without its own sub (everything but the textures step) is
+    /// forwarded with `sub = {label:"lods", done, total}`; the textures
+    /// step's own `{label:"texture"}` sub passes through unchanged.
+    lod_done: u32 = 0,
+    lod_total: u32 = 0,
     /// Set by the worker before it posts: null means it failed, see `err`.
     result: ?Result = null,
     /// Failure message, formatted in place: the error path never allocates.
@@ -1002,6 +1268,8 @@ const Job = struct {
     const Result = union(enum) {
         /// `{"out_path","report"}`: the written file and its report JSON.
         optimize: struct { out_path: []u8, report: []u8 },
+        /// One LOD ladder: a rung per ratio, in ladder (descending) order.
+        lods: []LodOwned,
         /// `{"src","dst"}`: the copied file and where it landed.
         exported: struct { src: []u8, dst: []u8 },
         /// The numbers `textureEncodeDone` carries.
@@ -1014,6 +1282,7 @@ const Job = struct {
     fn run(self: *Job) void {
         switch (self.kind) {
             .optimize => self.runOptimize(),
+            .optimize_lods => self.runOptimizeLods(),
             .texture_encode => self.runTextureEncode(),
             .texture_preview => self.runTexturePreview(),
             .export_file => self.runExport(),
@@ -1039,6 +1308,73 @@ const Job = struct {
             .failed => |msg| self.fail("{s}", .{msg}),
             .out_of_memory => self.fail("out of memory", .{}),
         }
+    }
+
+    /// The whole LOD ladder, on this thread: one pipeline run per ratio, every
+    /// run from the SOURCE file. Files land in `out_dir` as `<stem>_lod<NN>.glb`.
+    fn runOptimizeLods(self: *Job) void {
+        const base = self.preset orelse return self.fail("no preset", .{});
+        const ratios = self.ratios orelse return self.fail("no ratios", .{});
+        std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |e|
+            return self.fail("out dir: {s}", .{@errorName(e)});
+        self.lod_total = @intCast(ratios.len);
+
+        var owned: std.ArrayList(LodOwned) = .empty;
+        errdefer {
+            for (owned.items) |item| self.gpa.free(item.out_path);
+            owned.deinit(self.gpa);
+        }
+        for (ratios, 0..) |ratio, i| {
+            self.lod_done = @intCast(i);
+            const rung = self.runSingleLod(base, ratio) orelse return; // fail() already recorded
+            owned.append(self.gpa, rung) catch {
+                self.gpa.free(rung.out_path);
+                return self.fail("out of memory", .{});
+            };
+        }
+        self.result = .{ .lods = owned.toOwnedSlice(self.gpa) catch
+            return self.fail("out of memory", .{}) };
+    }
+
+    /// One ladder rung: clone `base` with `simplify.target_ratio = ratio` (or
+    /// gain a default simplify step), run it from the source, adopt the file
+    /// path into `gpa`. Null when the rung failed (the reason is recorded).
+    fn runSingleLod(self: *Job, base: core.preset.Preset, ratio: f32) ?LodOwned {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const preset = lodPresetFor(a, base, ratio) catch return self.failOOM();
+        const out_path = lodOutName(a, self.path, ratio) catch return self.failOOM();
+        const rep = switch (self.backend.execPipeline(a, self.path, preset, out_path, self.sinks())) {
+            .done => |r| r,
+            .failed => |msg| {
+                self.sinks().logFmt("lods failed: {s}", .{msg});
+                return self.failMsg(msg);
+            },
+            .out_of_memory => return self.failOOM(),
+        };
+        const st = std.Io.Dir.cwd().statFile(self.io, out_path, .{}) catch |e| {
+            self.fail("{s}: {s}", .{ out_path, @errorName(e) });
+            return null;
+        };
+        const owned_path = self.gpa.dupe(u8, out_path) catch return self.failOOM();
+        return .{
+            .ratio = ratio,
+            .out_path = owned_path,
+            .disk_bytes = st.size,
+            .triangles = rep.after.triangles,
+            .secs = rep.total_secs,
+        };
+    }
+
+    fn failOOM(self: *Job) ?LodOwned {
+        self.fail("out of memory", .{});
+        return null;
+    }
+
+    fn failMsg(self: *Job, msg: []const u8) ?LodOwned {
+        self.fail("{s}", .{msg});
+        return null;
     }
 
     fn runTextureEncode(self: *Job) void {
@@ -1126,18 +1462,23 @@ const Job = struct {
 
     /// `step` points into this job's arena, which ends with the run: copy it
     /// and hand it to the main thread. `sub` is plain counters (the label is
-    /// a static token), so it copies by value.
+    /// a static token), so it copies by value. LOD rungs without their own
+    /// sub travel with `{label:"lods"}` so the page can frame them.
     fn postProgress(self: *Job, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
         const app = self.target.app orelse return;
         const window = self.target.window orelse return;
         const copy = self.gpa.dupe(u8, step) catch return;
+        const eff_sub: ?core.runner.ProgressSub = if (sub) |s| s else if (self.kind == .optimize_lods)
+            .{ .label = "lods", .done = self.lod_done, .total = self.lod_total }
+        else
+            null;
         const posted = postToMain(ProgressMsg, self.gpa, .{
             .gpa = self.gpa,
             .app = app,
             .window = window,
             .step = copy,
             .pct = pct,
-            .sub = if (sub) |s| .{ .label = s.label, .done = s.done, .total = s.total } else null,
+            .sub = if (eff_sub) |s| .{ .label = s.label, .done = s.done, .total = s.total } else null,
         });
         if (!posted) self.gpa.free(copy);
     }
@@ -1171,10 +1512,15 @@ const Job = struct {
         if (self.preset) |p| freePreset(gpa, p);
         gpa.free(self.path);
         if (self.arg) |extra| gpa.free(extra);
+        if (self.ratios) |r| gpa.free(r);
         if (self.result) |res| switch (res) {
             .optimize => |o| {
                 gpa.free(o.out_path);
                 gpa.free(o.report);
+            },
+            .lods => |items| {
+                for (items) |item| gpa.free(item.out_path);
+                gpa.free(items);
             },
             .exported => |e| {
                 gpa.free(e.src);
@@ -1251,6 +1597,23 @@ fn delivered(ctx: ?*anyopaque) callconv(.c) void {
                 .out_path = o.out_path,
                 .report = json.raw(o.report),
             }),
+            .lods => |items| {
+                // `items` (and their paths) die with `job.destroy()` below;
+                // the event serializes synchronously, so borrowing is safe.
+                const payload = job.gpa.alloc(events.LodsItemPayload, items.len) catch {
+                    events.LodsDone.emit(window, .{ .ok = false, .@"error" = "out of memory" });
+                    return;
+                };
+                for (items, 0..) |item, i| payload[i] = .{
+                    .ratio = item.ratio,
+                    .out_path = item.out_path,
+                    .disk_bytes = item.disk_bytes,
+                    .triangles = item.triangles,
+                    .secs = item.secs,
+                };
+                events.LodsDone.emit(window, .{ .ok = true, .results = payload });
+                job.gpa.free(payload);
+            },
             .texture => |t| events.TextureEncodeDone.emit(window, .{
                 .ok = true,
                 .index = t.index,
@@ -1293,6 +1656,10 @@ fn emitFailure(job: *Job, window: *nanoui.Window) void {
         .optimize => events.OptimizeDone.emit(window, .{
             .ok = false,
             .@"error" = if (job.err_len > 0) job.err() else "optimize failed",
+        }),
+        .optimize_lods => events.LodsDone.emit(window, .{
+            .ok = false,
+            .@"error" = if (job.err_len > 0) job.err() else "lods failed",
         }),
         .texture_encode => events.TextureEncodeDone.emit(window, .{
             .ok = false,
@@ -2891,6 +3258,248 @@ test "optimizeCustom runs the full pipeline and writes a parseable glb" {
     try testing.expect(out.asset.meshes.len > 0);
 }
 
+// ---- LOD ladders ------------------------------------------------------------
+
+test "lod ratios parse, filter, sort and dedupe" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Null/blank means the default ladder (simplified rungs only).
+    for ([_]?[]const u8{ null, "", "   " }) |t| {
+        const ladder = try parseLodRatios(a, t);
+        try testing.expectEqualSlices(f32, &[_]f32{ 0.5, 0.25, 0.1 }, ladder);
+    }
+
+    // Sorted descending, (0,1) only, non-numbers dropped.
+    const ladder = try parseLodRatios(a, "[0.1, 1.0, 0.5, 0, -2, \"x\", null, 2]");
+    try testing.expectEqualSlices(f32, &[_]f32{ 0.5, 0.1 }, ladder);
+
+    // round(x*100) duplicates collapse to one rung (one file name).
+    const deduped = try parseLodRatios(a, "[0.501, 0.499, 0.25]");
+    try testing.expectEqual(@as(usize, 2), deduped.len);
+    try testing.expectEqual(@as(f32, 0.25), deduped[1]);
+
+    // Garbage is rejected; an all-dropped ladder is empty (binding refuses it).
+    try testing.expectError(error.InvalidRatios, parseLodRatios(a, "not json"));
+    try testing.expectError(error.InvalidRatios, parseLodRatios(a, "{\"a\":1}"));
+    try testing.expectEqual(@as(usize, 0), (try parseLodRatios(a, "[1.0, 0]")).len);
+}
+
+test "lod preset overrides the simplify ratio, or appends the step" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A spec with simplify keeps every param, only the ratio moves.
+    var detail: []const u8 = "";
+    const with_simp = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"prune\":{}},{\"simplify\":{\"target_ratio\":0.9,\"aggressive\":true}}]}",
+        &detail,
+    );
+    const over = try lodPresetFor(a, with_simp, 0.25);
+    try testing.expectEqual(@as(usize, 2), over.steps.len);
+    try testing.expectEqual(@as(f32, 0.25), over.steps[1].simplify.target_ratio);
+    try testing.expect(over.steps[1].simplify.aggressive);
+
+    // A spec without simplify gains one with the backend defaults + the ratio.
+    const bare = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
+    const forced = try lodPresetFor(a, bare, 0.5);
+    try testing.expectEqual(@as(usize, 2), forced.steps.len);
+    try testing.expectEqual(core.preset.StepKind.simplify, std.meta.activeTag(forced.steps[1]));
+    try testing.expectEqual(@as(f32, 0.5), forced.steps[1].simplify.target_ratio);
+    const d = core.preset.SimplifyParams{};
+    try testing.expectEqual(d.error_tolerance, forced.steps[1].simplify.error_tolerance);
+    try testing.expectEqual(d.lock_borders, forced.steps[1].simplify.lock_borders);
+}
+
+test "lod output names encode the source stem and the ratio" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        ".zig-cache/assetty-app/box_lod50.glb",
+        try lodOutName(a, "test/fixtures/box.glb", 0.5),
+    );
+    try testing.expectEqualStrings(
+        ".zig-cache/assetty-app/DamagedHelmet_lod10.glb",
+        try lodOutName(a, "/models/DamagedHelmet.glb", 0.101),
+    );
+}
+
+test "lod ladder on box.glb writes two files with descending triangles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    // The 12-tri box is already minimal (core's own box test expects only
+    // `after <= before`), so both rungs keep 12: the ladder is honored in
+    // the files it writes and the ratios it records, not in fewer triangles.
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"simplify\":{\"target_ratio\":0.9}}]}",
+        &detail,
+    );
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{});
+    const items = switch (outcome) {
+        .done => |items| items,
+        .failed => |msg| {
+            std.debug.print("lod run failed: {s}\n", .{msg});
+            return error.TestUnexpectedResult;
+        },
+        .out_of_memory => return error.OutOfMemory,
+    };
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(f32, 0.5), items[0].ratio);
+    try testing.expectEqual(@as(f32, 0.25), items[1].ratio);
+
+    // Both files exist, parse, and honor the ladder: counts never grow from
+    // rung to rung and never exceed the source.
+    for (items) |item| {
+        const st = try std.Io.Dir.cwd().statFile(testing.io, item.out_path, .{});
+        try testing.expectEqual(st.size, item.disk_bytes);
+        try testing.expect(st.size > 0);
+        var loaded = try core.parse.loadFile(testing.io, a, item.out_path);
+        defer loaded.deinit();
+        try testing.expect(loaded.asset.meshes.len > 0);
+    }
+    try testing.expect(items[0].triangles >= items[1].triangles);
+    try testing.expect(items[1].triangles <= 12);
+    try testing.expect(items[0].secs >= 0);
+    try testing.expect(items[1].secs >= 0);
+    try testing.expect(std.mem.endsWith(u8, items[0].out_path, "box_lod50.glb"));
+    try testing.expect(std.mem.endsWith(u8, items[1].out_path, "box_lod25.glb"));
+}
+
+test "lod ladder on the helmet decimates strictly per rung" {
+    // box.glb is already minimal, so this proves the ladder honors the ratios
+    // geometrically: every rung starts from the source and lands near its own
+    // target (simplify-only spec, no textures to keep it fast).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"simplify\":{\"target_ratio\":0.9,\"error_tolerance\":10.0}}]}",
+        &detail,
+    );
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+
+    const outcome = lodRunSync(&b, a, "test/fixtures/real/DamagedHelmet.glb", base, ladder, .{});
+    const items = switch (outcome) {
+        .done => |items| items,
+        .failed => |msg| {
+            std.debug.print("lod run failed: {s}\n", .{msg});
+            return error.TestUnexpectedResult;
+        },
+        .out_of_memory => return error.OutOfMemory,
+    };
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expect(items[0].triangles > items[1].triangles);
+    try testing.expect(items[1].triangles < 15452);
+    try testing.expect(std.mem.endsWith(u8, items[0].out_path, "DamagedHelmet_lod50.glb"));
+    try testing.expect(std.mem.endsWith(u8, items[1].out_path, "DamagedHelmet_lod25.glb"));
+}
+
+test "lod ladder forces a simplify step when the spec has none" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{});
+    const items = switch (outcome) {
+        .done => |items| items,
+        .failed => |msg| {
+            std.debug.print("lod run failed: {s}\n", .{msg});
+            return error.TestUnexpectedResult;
+        },
+        .out_of_memory => return error.OutOfMemory,
+    };
+    // The forced simplify step ran (prune-only spec still yields LOD files).
+    try testing.expectEqual(@as(usize, 2), items.len);
+    for (items) |item| {
+        const st = try std.Io.Dir.cwd().statFile(testing.io, item.out_path, .{});
+        try testing.expect(st.size > 0);
+        try testing.expect(item.triangles <= 12);
+    }
+}
+
+test "optimizeLODs binding validates before spawning" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    // A bad spec is rejected the same way `optimizeCustom` rejects it.
+    const bad = specPresetOrMessage(a, "{\"steps\":[]}");
+    try testing.expect(bad == .err);
+    try testing.expectEqualStrings("no steps", bad.err);
+    try testing.expect(!b.busy());
+
+    // Bad ratios text is rejected; an all-dropped ladder is empty (refused).
+    try testing.expectError(error.InvalidRatios, parseLodRatios(a, "nope"));
+    try testing.expectEqual(@as(usize, 0), (try parseLodRatios(a, "[1.0]")).len);
+    try testing.expect(!b.busy());
+
+    // An occupied gate answers busy.
+    var occupied: Job = undefined;
+    b.job = &occupied;
+    defer b.job = null;
+    const ladder = try parseLodRatios(a, null);
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
+    const busy_reply = try b.launchLods(a, .{}, "test/fixtures/box.glb", base, ladder);
+    try testing.expectEqualStrings("{\"error\":\"busy\"}", busy_reply.text);
+}
+
+test "lodsDone payload carries the documented shape" {
+    var buf: [512]u8 = undefined;
+    var ok_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.LodsItemPayload{
+        .ratio = 0.5,
+        .out_path = ".zig-cache/assetty-app/box_lod50.glb",
+        .disk_bytes = 2048,
+        .triangles = 6,
+        .secs = 0.42,
+    }, .{}, &ok_w);
+    try testing.expect(std.mem.indexOf(u8, ok_w.buffered(), "\"ratio\":0.5") != null);
+
+    var done_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.LodsDonePayload{
+        .ok = true,
+        .results = &.{.{
+            .ratio = 0.5,
+            .out_path = ".zig-cache/assetty-app/box_lod50.glb",
+            .disk_bytes = 2048,
+            .triangles = 6,
+            .secs = 0.42,
+        }},
+    }, .{}, &done_w);
+    try testing.expectEqualStrings(
+        "{\"ok\":true,\"results\":[{\"ratio\":0.5,\"out_path\":\".zig-cache/assetty-app/box_lod50.glb\"," ++
+            "\"disk_bytes\":2048,\"triangles\":6,\"secs\":0.420}]}",
+        done_w.buffered(),
+    );
+
+    var err_w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(events.LodsDonePayload{ .ok = false, .@"error" = "boom" }, .{}, &err_w);
+    try testing.expectEqualStrings("{\"ok\":false,\"error\":\"boom\"}", err_w.buffered());
+}
+
 // ---- background jobs ------------------------------------------------------
 
 test "a second job answers busy instead of spawning" {
@@ -2938,6 +3547,7 @@ const Collector = struct {
         self.ok = job.result != null;
         if (job.result) |res| switch (res) {
             .optimize => |o| self.report = testing.allocator.dupe(u8, o.report) catch null,
+            .lods => {},
             .texture => |t| {
                 self.mode = t.mode;
                 self.quality = t.quality;

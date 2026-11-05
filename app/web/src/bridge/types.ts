@@ -24,6 +24,26 @@ export type OptimizeInvocation =
 
 export type OptimizeDoneEvent = { ok: true; result: OptimizeResult } | { ok: false; error: string };
 
+/** One LOD ladder rung: ratio used, file written, its size/triangles/time. */
+export interface LodsItem {
+  ratio: number;
+  out_path: string;
+  disk_bytes: number;
+  triangles: number;
+  secs?: number;
+}
+
+/**
+ * What `optimizeLODs()` resolves to. Same shape as an optimize run:
+ * `started: true` means the ladder runs in the background — the rungs arrive
+ * through `onLodsDone()`.
+ */
+export type LodsInvocation =
+  | { started: true; stopProgress: () => void }
+  | { started: false; result: LodsItem[] };
+
+export type LodsDoneEvent = { ok: true; results: LodsItem[] } | { ok: false; error: string };
+
 export type ExportDoneEvent = { ok: true; src: string; dst: string } | { ok: false; error: string };
 
 /** What `textureEncode()` resolves to (async on new hosts, immediate on old ones). */

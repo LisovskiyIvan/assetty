@@ -89,7 +89,46 @@ pub const OptimizeDonePayload = struct {
 };
 pub const OptimizeDone = Ev("optimizeDone", OptimizeDonePayload);
 
-/// A background `textureEncode` finished: `{"ok":true,"index":N,
+/// A background `optimizeLODs` finished: `{"ok":true,"results":[{ "ratio",
+/// "out_path", "disk_bytes", "triangles", "secs" }, ...]}` or
+/// `{"ok":false,"error":".."}`. Each result was built from the SOURCE file
+/// (never compounded): `ratio` is the `simplify.target_ratio` that run used,
+/// `out_path` the `<stem>_lod<NN>.glb` file, `triangles` its `after`
+/// triangle count, `secs` that run's `total_secs`.
+pub const LodsItemPayload = struct {
+    ratio: f32,
+    out_path: []const u8,
+    disk_bytes: u64,
+    triangles: u64,
+    secs: f64,
+};
+
+pub const LodsDonePayload = struct {
+    ok: bool,
+    results: []const LodsItemPayload = &.{},
+    @"error": ?[]const u8 = null,
+
+    pub fn jsonStringify(self: LodsDonePayload, jws: anytype) !void {
+        const w = jws.writer;
+        if (self.ok) {
+            try w.writeAll("{\"ok\":true,\"results\":[");
+            for (self.results, 0..) |r, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print("{{\"ratio\":{d},\"out_path\":", .{r.ratio});
+                try json.jsonStr(w, r.out_path);
+                try w.print(",\"disk_bytes\":{d},\"triangles\":{d},\"secs\":{d:.3}}}", .{
+                    r.disk_bytes, r.triangles, r.secs,
+                });
+            }
+            try w.writeAll("]}");
+        } else {
+            try w.writeAll("{\"ok\":false,\"error\":");
+            try json.jsonStr(w, self.@"error" orelse "lods failed");
+            try w.writeByte('}');
+        }
+    }
+};
+pub const LodsDone = Ev("lodsDone", LodsDonePayload);
 /// "ktx2_size":..,"psnr":..,"vram_after":..,"before_png":"<abs>.png",
 /// "after_png":"<abs>.png","width":W,"height":H,"mip_levels":N,
 /// "format":"ETC1S","settings":{"format":"etc1s","quality":128,

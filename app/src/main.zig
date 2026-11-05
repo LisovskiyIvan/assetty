@@ -39,6 +39,7 @@ fn runPage(init: std.process.Init) !u8 {
     try app.registerEvent(events.Progress);
     try app.registerEvent(events.Log);
     try app.registerEvent(events.OptimizeDone);
+    try app.registerEvent(events.LodsDone);
     try app.registerEvent(events.ExportDone);
     try app.registerEvent(events.TextureEncodeDone);
     try app.registerEvent(events.TexturePreviewDone);

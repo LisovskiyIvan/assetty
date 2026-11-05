@@ -1508,6 +1508,56 @@ input[type="range"] {
   font-size: 11px;
 }
 
+/* --- collapsible step sections (Optimize tab; the Settings tab stays flat) --- */
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.step-head input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  flex: none;
+}
+
+.step-head:focus-visible {
+  outline: 1px solid var(--accent-border);
+  border-radius: 4px;
+}
+
+.step-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.step-summary.off {
+  font-style: italic;
+}
+
+.step-chevron {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* quieter per-option checkboxes inside the collapsed sections */
+.step-params .inline-check {
+  color: var(--text-dim);
+}
+
 /* --- preset quick row --- */
 .preset-row {
   display: flex;

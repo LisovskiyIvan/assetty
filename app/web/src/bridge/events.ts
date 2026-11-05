@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import type {
   ExportDoneEvent,
+  LodsDoneEvent,
   OptimizeDoneEvent,
   ProgressEvent,
   TextureEncodeDoneEvent,
@@ -96,6 +97,27 @@ export function normalizeOptimizeDone(raw: unknown): OptimizeDoneEvent {
   const payload =
     r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
   return { ok: true, result: normalizeOptimize(payload) };
+}
+
+/** Normalizes the `lodsDone` payload (flat contract or `{ ok, results }` wrapper). */
+export function normalizeLodsDone(raw: unknown): LodsDoneEvent {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
+  if (!ok) return { ok: false, error: String(r.error ?? "lods failed") };
+  const payload =
+    r.results !== undefined ? r : r.result && typeof r.result === "object" ? r.result : r;
+  const list = (payload as Record<string, unknown>).results;
+  const items = (Array.isArray(list) ? list : []).map((entry) => {
+    const e = (entry ?? {}) as Record<string, unknown>;
+    return {
+      ratio: asNumber(e.ratio),
+      out_path: String(e.out_path ?? e.path ?? ""),
+      disk_bytes: asNumber(e.disk_bytes ?? e.disk ?? e.size),
+      triangles: asNumber(e.triangles),
+      secs: optNumber(e.secs ?? e.seconds),
+    };
+  });
+  return { ok: true, results: items };
 }
 
 export function normalizeExportDone(raw: unknown): ExportDoneEvent {

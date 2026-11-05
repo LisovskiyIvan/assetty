@@ -10,6 +10,7 @@ import { getSettings, getTextureOverrides, updateSettings } from "../../settings
 import type { OptimizeSteps } from "../../settings";
 import { notify, onLog } from "../../notify";
 import type { ImageInfo, Info, OptimizeResult } from "../../types";
+import type { LodsItem } from "../../bridge";
 import type { DualApi } from "./dual";
 
 /** Pipeline stages shown as chips. Geometry merges every mesh-op step kind
@@ -202,6 +203,10 @@ export interface RunDeps {
   onFinished(res: OptimizeResult): void;
   /** Discard confirmed on the host: forget the artifact, keep the numbers. */
   onDiscarded(outPath: string): void;
+  /** A ladder started: clear the previous LOD table. */
+  onLodsStarted(): void;
+  /** A ladder finished: render the per-ratio table. */
+  onLodsFinished(items: LodsItem[]): void;
   refreshTexExtra(): void;
 }
 
@@ -218,6 +223,8 @@ export interface RunApi {
   loadPresets(): Promise<void>;
   saveAs(outPath: string): Promise<void>;
   discardResult(outPath: string): Promise<void>;
+  /** Loads a finished file (optimize result or LOD rung) into the viewer. */
+  viewResult(outPath: string): Promise<void>;
   dispose(): void;
 }
 
@@ -243,6 +250,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
   viewNote.hidden = true;
   const presetRow = el("div", { class: "preset-row" });
   const runBtn = el("button", { class: "primary", disabled: true });
+  const lodBtn = el("button", {
+    disabled: true,
+    title: t("opt.lodsTitle"),
+    onclick: () => void generateLods(),
+  });
   const exportBtn = el("button", { disabled: true });
   /** Compact progress strip: lives with the Run button so it stays visible. */
   const progressFill = el("div");
@@ -282,7 +294,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       viewNote,
       guardBox,
       presetRow,
-      el("div", { class: "row" }, runBtn, exportBtn),
+      el("div", { class: "row" }, runBtn, lodBtn, exportBtn),
       chipsRow,
       el("div", { class: "row run-progress" }, progressBar, progressMeta),
       logLine,
@@ -293,6 +305,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
 
   /** True while a background job owns the backend (Run stays disabled). */
   let running = false;
+  /** Which job owns the gate: an optimize run or an LOD ladder. */
+  let jobKind: "optimize" | "lods" | null = null;
   /** True while an exportTo copy is in flight (Save as… stays disabled). */
   let exporting = false;
   /** `dst` of the in-flight export; only the matching exportDone notifies. */
@@ -303,6 +317,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
   /** Texture sub-progress (optimize-textures step): `{done,total}`, max kept. */
   let progressDone = -1;
   let progressTotal = 0;
+  /** LOD ladder sub-progress (`{label:"lods"}`): current rung, max kept. */
+  let lodsDone = -1;
+  let lodsTotal = 0;
   let doneTimer: ReturnType<typeof setTimeout> | null = null;
   let stopProgress: (() => void) | null = null;
   /** Stage chips: the plan (hidden-if-not-run) + the active stage. Done-all
@@ -376,6 +393,24 @@ export function createRunFlow(deps: RunDeps): RunApi {
           mini,
         );
       }
+      // LOD ladders ride the same chips; the rung counter hangs off the
+      // active one (rungs report their own step names underneath).
+      if (active && lodsDone >= 0 && lodsTotal > 0) {
+        const shown = Math.min(lodsDone + 1, lodsTotal);
+        const frac = shown / lodsTotal;
+        const mini = el(
+          "span",
+          { class: "stage-subbar" },
+          el("span", { style: { width: `${frac * 100}%` } }),
+        );
+        chip.append(
+          el("span", {
+            class: "stage-sub",
+            text: t("progress.lods", { done: shown, total: lodsTotal }),
+          }),
+          mini,
+        );
+      }
       chipsRow.append(chip);
     });
   }
@@ -403,7 +438,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
     progressFill.style.width = `${progressPct}%`;
   }
 
-  function setProgress(step: string, pct: number, sub?: { done: number; total: number }): void {
+  function setProgress(
+    step: string,
+    pct: number,
+    sub?: { label: string; done: number; total: number },
+  ): void {
     const clamped = Math.max(0, Math.min(100, pct));
     progressStep = step;
     progressPct = clamped;
@@ -412,8 +451,13 @@ export function createRunFlow(deps: RunDeps): RunApi {
     const st = stageForStep(step);
     if (st && st !== "done" && stagePlan.includes(st)) stageActive = st;
     if (sub) {
-      progressDone = Math.max(progressDone, sub.done);
-      progressTotal = sub.total;
+      if (sub.label === "lods") {
+        lodsDone = Math.max(lodsDone, sub.done);
+        lodsTotal = sub.total;
+      } else if (sub.label === "texture") {
+        progressDone = Math.max(progressDone, sub.done);
+        progressTotal = sub.total;
+      }
     } else {
       // Outside the textures step the payload carries no sub: revert to plain.
       resetSub();
@@ -422,10 +466,12 @@ export function createRunFlow(deps: RunDeps): RunApi {
     renderChips();
   }
 
-  /** Clears the texture sub-progress (new run / finished job). */
+  /** Clears the texture + LOD sub-progress (new run / finished job). */
   function resetSub(): void {
     progressDone = -1;
     progressTotal = 0;
+    lodsDone = -1;
+    lodsTotal = 0;
   }
 
   function setLog(message: string): void {
@@ -438,7 +484,9 @@ export function createRunFlow(deps: RunDeps): RunApi {
     if (on) startClock();
     else stopClock();
     runBtn.textContent = on ? t("opt.running") : t("opt.run");
+    lodBtn.textContent = on ? t("opt.lodsRunning") : t("opt.lods");
     runBtn.disabled = on || !app.bridge.live || !app.sourcePath;
+    lodBtn.disabled = on || !app.bridge.live || !app.sourcePath;
     exportBtn.disabled = on || exporting || !deps.getResult();
     progressBar.classList.toggle("running", on);
     renderChips();
@@ -498,6 +546,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     }
     stopProgress?.();
     stopProgress = null;
+    jobKind = null;
     setRunning(false);
   }
 
@@ -511,6 +560,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
   }
 
   async function loadOptimized(outPath: string): Promise<void> {
+    return viewResult(outPath);
+  }
+
+  /** Loads a finished file into the right compare pane (result or LOD rung). */
+  async function viewResult(outPath: string): Promise<void> {
     if (!app.bridge.live) {
       deps.dual.loadRightDemo();
       return;
@@ -526,7 +580,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
   // fires even when the user switched tabs meanwhile; the closure state is
   // kept alive by the mounted tab.
   const offDone = app.bridge.onOptimizeDone((event) => {
-    if (!running) return;
+    if (!running || jobKind !== "optimize") return;
     if (!event.ok) {
       finishJobError(event.error);
       return;
@@ -540,6 +594,31 @@ export function createRunFlow(deps: RunDeps): RunApi {
     deps.onFinished(event.result);
     void loadOptimized(event.result.out_path);
     notify(t("opt.finished"), "ok");
+  });
+
+  // The ladder this tab asked for reports back here (same threading notes as
+  // the optimize run above). Rungs arrive as `progress` with
+  // `sub: {label:"lods", done, total}`; the table lands in one `lodsDone`.
+  const offLodsDone = app.bridge.onLodsDone((event) => {
+    if (!running || jobKind !== "lods") return;
+    if (!event.ok) {
+      stopJob();
+      resetSub();
+      resetStages();
+      freezeClock();
+      setProgress(t("common.failed"), 0);
+      notify(t("opt.lodsFailedMsg", { message: event.error }), "error");
+      return;
+    }
+    stopJob();
+    resetSub();
+    stageActive = "done";
+    stageDoneAll = true;
+    const total = event.results.reduce((acc, item) => acc + (item.secs ?? 0), 0);
+    freezeClock(total > 0 ? total : undefined);
+    setProgress(t("common.done"), 100);
+    deps.onLodsFinished(event.results);
+    notify(t("opt.lodsFinished"), "ok");
   });
 
   // The copy this tab asked for (matched by dst so the Textures tab's exports
@@ -610,6 +689,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       deps.dual.showOpenHint();
     }
     runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
+    lodBtn.disabled = running || !app.bridge.live || !app.sourcePath;
   }
 
   /** Images of the optimize source (cached info when it matches, else fresh). */
@@ -668,6 +748,18 @@ export function createRunFlow(deps: RunDeps): RunApi {
     await doRun();
   }
 
+  /** Rungs from the source: `optimizeLODs(path, spec, "[0.5,0.25,0.1]")`. */
+  const LOD_LADDER = [0.5, 0.25, 0.1];
+
+  function forwardSub(p: {
+    sub?: { label: string; done: number; total: number };
+  }): { label: string; done: number; total: number } | undefined {
+    if (p.sub?.label === "texture" || p.sub?.label === "lods") {
+      return { label: p.sub.label, done: p.sub.done, total: p.sub.total };
+    }
+    return undefined;
+  }
+
   async function doRun(): Promise<void> {
     const path = app.sourcePath;
     if (!path || running) return;
@@ -679,6 +771,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     const specJson = JSON.stringify({ steps: specSteps });
     stopProgress?.();
     stopProgress = null;
+    jobKind = "optimize";
     setRunning(true);
     /* The run supersedes the previous result: drop it before doing any work. */
     deps.onRunStarted();
@@ -694,12 +787,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
         specJson,
         activePreset || "desktop",
         (p) => {
-          if (running)
-            setProgress(
-              p.step || t("opt.runningShort"),
-              p.pct,
-              p.sub?.label === "texture" ? { done: p.sub.done, total: p.sub.total } : undefined,
-            );
+          if (running) setProgress(p.step || t("opt.runningShort"), p.pct, forwardSub(p));
         },
       );
       if (call.started) {
@@ -752,6 +840,90 @@ export function createRunFlow(deps: RunDeps): RunApi {
     if (res) void saveAs(res.out_path);
   });
 
+  /* ------------------------------------------------------------ LOD ladder */
+
+  async function generateLods(): Promise<void> {
+    const path = app.sourcePath;
+    if (!path || running) return;
+    if (!app.bridge.live) {
+      notify(t("opt.lodsDemo"), "error");
+      return;
+    }
+    // The current form spec is the base: same steps, simplify overridden per
+    // rung on the host. Each rung starts from the source — no compounding.
+    const specSteps = buildSpec(steps());
+    if (specSteps.length === 0) {
+      notify(t("opt.pickStep"), "error");
+      return;
+    }
+    const specJson = JSON.stringify({ steps: specSteps });
+    stopProgress?.();
+    stopProgress = null;
+    jobKind = "lods";
+    setRunning(true);
+    deps.onLodsStarted();
+    resetSub();
+    stagePlan = planStages(specSteps);
+    stageActive = "load";
+    stageDoneAll = false;
+    renderChips();
+    setProgress(t("opt.starting"), 0);
+    try {
+      const call = await app.bridge.optimizeLODs(
+        path,
+        specJson,
+        JSON.stringify(LOD_LADDER),
+        (p) => {
+          if (running) setProgress(p.step || t("opt.runningShort"), p.pct, forwardSub(p));
+        },
+      );
+      if (call.started) {
+        // Background job: both buttons stay disabled until lodsDone arrives.
+        stopProgress = call.stopProgress;
+        if (!running) {
+          stopProgress();
+          stopProgress = null;
+          return;
+        }
+        setProgress(t("opt.runningShort"), 0);
+        setLog(t("opt.runningBg"));
+        doneTimer = setTimeout(() => {
+          doneTimer = null;
+          stopJob();
+          resetSub();
+          resetStages();
+          freezeClock();
+          setProgress(t("common.failed"), 0);
+          notify(t("opt.lodsFailedMsg", { message: t("opt.jobTimeout") }), "error");
+        }, RUN_TIMEOUT_MS);
+        return;
+      }
+
+      // Older hosts: the call itself returned the finished ladder.
+      stopJob();
+      resetSub();
+      stageActive = "done";
+      stageDoneAll = true;
+      const total = call.result.reduce((acc, item) => acc + (item.secs ?? 0), 0);
+      freezeClock(total > 0 ? total : undefined);
+      setProgress(t("common.done"), 100);
+      deps.onLodsFinished(call.result);
+      notify(t("opt.lodsFinished"), "ok");
+    } catch (err) {
+      stopJob();
+      resetSub();
+      resetStages();
+      if (isBusyError(err)) {
+        setProgress(t("opt.runningShort"), 0);
+        notify(t("opt.busyMsg"), "error");
+      } else {
+        freezeClock();
+        setProgress(t("common.failed"), 0);
+        notify(t("opt.lodsFailedMsg", { message: (err as Error).message }), "error");
+      }
+    }
+  }
+
   return {
     panel,
     exportNote,
@@ -759,6 +931,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     isInternalEdit: () => internalEdit,
     syncControls: () => {
       runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
+      lodBtn.disabled = running || !app.bridge.live || !app.sourcePath;
       exportBtn.disabled = running || exporting || !deps.getResult();
     },
     syncSourceHead,
@@ -766,6 +939,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
       optSectionHead.textContent = t("opt.section");
       syncSourceHead();
       runBtn.textContent = running ? t("opt.running") : t("opt.run");
+      lodBtn.textContent = running ? t("opt.lodsRunning") : t("opt.lods");
+      lodBtn.title = t("opt.lodsTitle");
       exportBtn.textContent = exporting ? t("opt.exporting") : t("opt.export");
       exportNote.textContent = t("opt.exportNote");
       renderProgress();
@@ -775,8 +950,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
     loadPresets,
     saveAs,
     discardResult,
+    viewResult,
     dispose: () => {
       offDone();
+      offLodsDone();
       offExport();
       offLog();
       stopJob();
