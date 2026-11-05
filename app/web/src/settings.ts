@@ -19,7 +19,8 @@
  *       "join":     { "enabled": true },
  *       "textures": { "enabled": true, "format": "auto" | "etc1s" | "uastc",
  *                     "quality": 128, "max_size": 0, "generate_mips": true,
- *                     "supercompression": "none" | "zstd" },
+ *                     "supercompression": "none" | "zstd",
+ *                     "apply_rules": false, "reencode_ktx2": false, "rules": [] },
  *       "quantize": { "enabled": true, "position_bits": 14, "uv_bits": 12, "normal_oct": true },
  *       "simplify": { "enabled": false, "target_ratio": 0.5, "error_tolerance": 0.001,
  *                     "aggressive": false, "lock_borders": true,
@@ -50,6 +51,7 @@
  * `skip: true` leaves the image unencoded. Missing `per_model` merges to {}.
  */
 export {
+  DEFAULT_TEXTURE_RULES,
   RECENT_DIRS_LIMIT,
   defaultSettings,
   mergeSettings,
@@ -70,7 +72,9 @@ export type {
   Supercompression,
   TextureFormat,
   TextureOverride,
+  TextureRule,
   TextureSettings,
+  TextureSlot,
   ThemeMode,
   WeldSettings,
 } from "./settings/schema";

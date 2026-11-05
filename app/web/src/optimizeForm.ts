@@ -5,7 +5,8 @@
  */
 import { el } from "./ui";
 import { t } from "./i18n";
-import type { OptimizeSteps, TextureFormat } from "./settings";
+import { DEFAULT_TEXTURE_RULES } from "./settings";
+import type { OptimizeSteps, TextureFormat, TextureRule } from "./settings";
 
 export interface OptimizeFormOptions {
   get(): OptimizeSteps;
@@ -84,6 +85,12 @@ export const FIELD_HELP: Record<string, string> = {
     "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
   "textures.overrides_note":
     "Per-texture overrides replace the base params for single images of this model only, and merge into the textures step on Run. Edit them per image in the Textures tab.",
+  "textures.apply_rules":
+    "First-match-wins auto rules: each image is classified by its material slot (normal, arm, occlusion, emissive, base color) and name suffix, and the first matching rule replaces the base params. Per-image overrides still win over rules.",
+  "textures.reencode_ktx2":
+    "Transcode already-KTX2 sources and re-encode them like any image. Off = KTX2 images are skipped as today.",
+  "textures.rules":
+    "Editable JSON array of auto rules (first match wins per image). Reset restores the project-derived table. Saved into settings and every JSON preset.",
 };
 
 /* ------------------------------------------------- help popover (singleton) */
@@ -654,13 +661,100 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
           return lab;
         })(),
       ),
+      field(
+        "auto",
+        check(
+          "by slot rules",
+          () => opts.get().textures.apply_rules,
+          (value) =>
+            edit((steps) => {
+              steps.textures.apply_rules = value;
+            }),
+          "textures.apply_rules",
+        ),
+      ),
+      field(
+        "ktx2",
+        check(
+          "re-encode",
+          () => opts.get().textures.reencode_ktx2,
+          (value) =>
+            edit((steps) => {
+              steps.textures.reencode_ktx2 = value;
+            }),
+          "textures.reencode_ktx2",
+        ),
+      ),
+      (() => {
+        const count = el("span", { class: "hint mono" });
+        const err = el("span", { class: "hint settings-bad" });
+        const area = el("textarea", {
+          class: "mono rules-area",
+          rows: 8,
+          spellcheck: false,
+          placeholder: '[{"slot":"normal","format":"uastc"}, …]',
+          oninput: () => {
+            const raw = (area as HTMLTextAreaElement).value;
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              err.textContent = t("opt.rulesInvalid");
+              return;
+            }
+            if (!Array.isArray(parsed)) {
+              err.textContent = t("opt.rulesInvalid");
+              return;
+            }
+            err.textContent = "";
+            edit((steps) => {
+              steps.textures.rules = parsed as TextureRule[];
+            });
+            count.textContent = t("opt.rulesCount", { n: parsed.length });
+          },
+        }) as unknown as HTMLTextAreaElement;
+        const reset = el("button", {
+          class: "small",
+          type: "button",
+          text: t("opt.rulesReset"),
+          title: t("opt.rulesResetTitle"),
+          onclick: () => {
+            const seed = JSON.parse(JSON.stringify(DEFAULT_TEXTURE_RULES)) as TextureRule[];
+            edit((steps) => {
+              steps.textures.rules = seed;
+              steps.textures.apply_rules = true;
+            });
+            // edit() only refreshes visibility: repaint the editor explicitly.
+            (area as HTMLTextAreaElement).value = JSON.stringify(seed, null, 1);
+            count.textContent = t("opt.rulesCount", { n: seed.length });
+          },
+        });
+        valueSyncers.push(() => {
+          const rules = opts.get().textures.rules;
+          const text = JSON.stringify(rules);
+          if ((area as HTMLTextAreaElement).value !== text) {
+            (area as HTMLTextAreaElement).value =
+              rules.length > 0 ? JSON.stringify(rules, null, 1) : "";
+          }
+          count.textContent = t("opt.rulesCount", { n: rules.length });
+        });
+        refreshSyncers.push(() => {
+          const on = opts.get().textures.apply_rules;
+          (area as HTMLTextAreaElement).disabled = !on;
+          reset.toggleAttribute("disabled", !on);
+        });
+        const head = el("div", { class: "row" }, count, fieldHelpButton("textures.rules"), reset);
+        return field("rules", el("div", { class: "rules-box" }, head, area, err), true);
+      })(),
     ],
     undefined,
     () => {
       const tx = opts.get().textures;
       const size = tx.max_size > 0 ? String(tx.max_size) : t("common.noResize");
       const zstd = tx.supercompression === "zstd" ? " · zstd" : "";
-      return `${tx.format} · q${tx.quality} · ${size} · ${tx.generate_mips ? t("tex.mips") : t("tex.noMips")}${zstd}`;
+      const rules = tx.apply_rules ? ` · ${t("opt.rulesShort", { n: tx.rules.length })}` : "";
+      const reenc = tx.reencode_ktx2 ? ` · ${t("opt.reencodeShort")}` : "";
+      return `${tx.format} · q${tx.quality} · ${size} · ${tx.generate_mips ? t("tex.mips") : t("tex.noMips")}${zstd}${rules}${reenc}`;
     },
   );
 

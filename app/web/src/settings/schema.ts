@@ -41,7 +41,86 @@ export interface TextureSettings {
   generate_mips: boolean;
   /** KTX2 payload supercompression (UASTC only; "none" = off). */
   supercompression: Supercompression;
+  /** First-match-wins auto rules (slot suffix table); off = legacy base params. */
+  apply_rules: boolean;
+  /** Re-encode already-KTX2 sources instead of skipping them. */
+  reencode_ktx2: boolean;
+  /** Editable auto-rule table (first match wins per image). */
+  rules: TextureRule[];
 }
+
+/** Slot class a texture auto-rule matches on. */
+export type TextureSlot = "base_color" | "normal" | "arm" | "occlusion" | "emissive";
+
+/**
+ * One texture auto-rule (backend `textures` step `rules` array, first match
+ * wins per image — unlike overrides, which are last-wins). A rule matches
+ * when every set selector agrees: `slot` is in the image's slot set,
+ * `cutout` equals the image's cutout flag, `name` is a case-insensitive
+ * SUFFIX of the image name/uri stem, and the image min side is within
+ * `[min_side, max_side]` when set (size-bounded rules never match unknown
+ * dims). Only present fields replace the base params; `skip: true` leaves
+ * the image unencoded.
+ */
+export interface TextureRule {
+  slot?: TextureSlot;
+  name?: string;
+  format?: TextureFormat;
+  quality?: number;
+  rdo_lambda?: number;
+  supercompression?: Supercompression;
+  srgb?: boolean;
+  generate_mips?: boolean;
+  max_size?: number;
+  normal_map?: boolean;
+  cutout?: boolean;
+  min_side?: number;
+  max_side?: number;
+  skip?: boolean;
+}
+
+/**
+ * Project-derived default auto-rules (Reset button seed; edit freely).
+ * Order is first-match-wins: skips, cutout alpha, normal, arm, occlusion,
+ * emissive, single-channel fallbacks, base-color fallbacks.
+ */
+export const DEFAULT_TEXTURE_RULES: TextureRule[] = [
+  { max_side: 255, skip: true },
+  { name: "height", skip: true },
+  { name: "bump", skip: true },
+  { name: "disp", skip: true },
+  { name: "lut", skip: true },
+  { name: "data", skip: true },
+  { name: "shaderarray", skip: true },
+  { slot: "base_color", cutout: true, format: "uastc", srgb: true },
+  {
+    slot: "normal",
+    format: "uastc",
+    rdo_lambda: 0.5,
+    supercompression: "zstd",
+    srgb: false,
+    normal_map: true,
+  },
+  { slot: "arm", format: "uastc", rdo_lambda: 1.0, supercompression: "zstd", srgb: false },
+  { slot: "occlusion", format: "uastc", rdo_lambda: 1.0, supercompression: "zstd", srgb: false },
+  { slot: "emissive", format: "etc1s", srgb: true },
+  { name: "_orm", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_arm", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_rm", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "occlusionroughnessmetallic", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_roughness", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_metallic", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_occlusion", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_opacity", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_mask", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_ao", format: "uastc", supercompression: "zstd", srgb: false },
+  { name: "_basecolor", format: "etc1s", srgb: true },
+  { name: "_albedo", format: "etc1s", srgb: true },
+  { name: "_diffuse", format: "etc1s", srgb: true },
+  { name: "_bc", format: "etc1s", srgb: true },
+  { name: "_color", format: "etc1s", srgb: true },
+  { name: "_d", format: "etc1s", srgb: true },
+];
 
 /**
  * One per-texture override (backend `textures` step spec, `overrides` array).
@@ -145,6 +224,9 @@ export function defaultSettings(): Settings {
           max_size: 0,
           generate_mips: true,
           supercompression: "none",
+          apply_rules: false,
+          reencode_ktx2: false,
+          rules: [],
         },
         quantize: { enabled: true, position_bits: 14, uv_bits: 12, normal_oct: true },
         simplify: {
@@ -388,6 +470,21 @@ export function mergeSettings(raw: unknown, strict = false): Settings {
       "optimize.steps.textures.supercompression",
       strict,
     ),
+    apply_rules: readBool(
+      textures,
+      "apply_rules",
+      s.textures.apply_rules,
+      "optimize.steps.textures.apply_rules",
+      strict,
+    ),
+    reencode_ktx2: readBool(
+      textures,
+      "reencode_ktx2",
+      s.textures.reencode_ktx2,
+      "optimize.steps.textures.reencode_ktx2",
+      strict,
+    ),
+    rules: readTextureRules(textures, "optimize.steps.textures.rules", strict),
   };
 
   const quantize = readObject(stepsRaw, "quantize", "optimize.steps.quantize", strict);
@@ -600,6 +697,106 @@ function readPerModel(
       if (clean) overrides.push(clean);
     }
     out[key] = { textures: { overrides } };
+  }
+  return out;
+}
+
+const TEXTURE_SLOTS: readonly TextureSlot[] = [
+  "base_color",
+  "normal",
+  "arm",
+  "occlusion",
+  "emissive",
+];
+
+/** Normalizes one auto-rule; null = empty/inapplicable, dropped. */
+function sanitizeTextureRule(raw: unknown, strict: boolean, label: string): TextureRule | null {
+  if (!isObject(raw)) return reject(strict, label, "must be an object", null);
+  const out: TextureRule = {};
+  if (raw["slot"] !== undefined) {
+    const v = raw["slot"];
+    if (typeof v !== "string" || !(TEXTURE_SLOTS as readonly string[]).includes(v)) {
+      return reject(strict, `${label}.slot`, `must be one of ${TEXTURE_SLOTS.join(", ")}`, null);
+    }
+    out.slot = v as TextureSlot;
+  }
+  if (raw["name"] !== undefined) {
+    const v = raw["name"];
+    if (typeof v !== "string") {
+      return reject(strict, `${label}.name`, "must be a string", null);
+    }
+    if (v.trim()) out.name = v;
+  }
+  if (raw["format"] !== undefined) {
+    const v = raw["format"];
+    if (typeof v !== "string" || !(TEXTURE_FORMATS as readonly string[]).includes(v)) {
+      return reject(
+        strict,
+        `${label}.format`,
+        `must be one of ${TEXTURE_FORMATS.join(", ")}`,
+        null,
+      );
+    }
+    out.format = v as TextureFormat;
+  }
+  if (raw["supercompression"] !== undefined) {
+    const v = raw["supercompression"];
+    if (typeof v !== "string" || !(SUPERCOMPRESSIONS as readonly string[]).includes(v)) {
+      return reject(
+        strict,
+        `${label}.supercompression`,
+        `must be one of ${SUPERCOMPRESSIONS.join(", ")}`,
+        null,
+      );
+    }
+    out.supercompression = v as Supercompression;
+  }
+  const num = (key: string, min: number, max: number, integer = true): number | undefined => {
+    if (raw[key] === undefined) return undefined;
+    const v = raw[key];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      return reject(strict, `${label}.${key}`, "must be a number", undefined);
+    }
+    return integer ? Math.round(Math.min(max, Math.max(min, v))) : Math.min(max, Math.max(min, v));
+  };
+  const quality = num("quality", 1, 255);
+  if (quality !== undefined) out.quality = quality;
+  const maxSize = num("max_size", 0, 8192);
+  if (maxSize !== undefined) out.max_size = maxSize;
+  const minSide = num("min_side", 0, 8192);
+  if (minSide !== undefined) out.min_side = minSide;
+  const maxSide = num("max_side", 0, 8192);
+  if (maxSide !== undefined) out.max_side = maxSide;
+  const rdo = num("rdo_lambda", 0, 100, false);
+  if (rdo !== undefined) out.rdo_lambda = rdo;
+  for (const key of ["srgb", "generate_mips", "normal_map", "cutout", "skip"] as const) {
+    if (raw[key] === undefined) continue;
+    const v = raw[key];
+    if (typeof v !== "boolean") {
+      reject(strict, `${label}.${key}`, "must be true or false", undefined);
+      continue;
+    }
+    out[key] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function readTextureRules(
+  textures: Record<string, unknown>,
+  label: string,
+  strict: boolean,
+): TextureRule[] {
+  const list = textures["rules"];
+  if (list === undefined) return [];
+  if (!Array.isArray(list)) {
+    if (strict) throw new SettingsError(`${label} must be an array`);
+    return [];
+  }
+  if (strict && list.length > 256) throw new SettingsError(`${label} is too long`);
+  const out: TextureRule[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const clean = sanitizeTextureRule(list[i], strict, `${label}[${i}]`);
+    if (clean) out.push(clean);
   }
   return out;
 }

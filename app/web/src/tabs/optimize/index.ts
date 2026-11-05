@@ -171,6 +171,15 @@ export function mountOptimize(): TabHandle {
           title: t("opt.overridesTitle"),
         }),
         " ",
+        el("span", {
+          text: (() => {
+            const tx = steps().textures;
+            if (!tx.apply_rules) return t("opt.rulesOff");
+            return t("opt.rulesOnCount", { n: tx.rules.length });
+          })(),
+          title: t("opt.rulesOnTitle"),
+        }),
+        " ",
         el("button", {
           class: "small",
           text: t("opt.editInTextures"),

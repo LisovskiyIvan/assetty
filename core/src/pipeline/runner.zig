@@ -38,6 +38,7 @@ const encode_ktx = @import("../tex/encode_ktx.zig");
 const decode = @import("../tex/decode.zig");
 const mips = @import("../tex/mips.zig");
 const formats = @import("../tex/formats.zig");
+const model = @import("../gltf/model.zig");
 const c = @import("cgltf");
 
 pub const StepStatus = struct {
@@ -296,9 +297,11 @@ pub const TextureImageOutcome = struct {
     format: []const u8 = "",
 };
 
-/// Base `TextureParams` with every matching override applied in array order
-/// (last match wins). `normal_map` is the explicit override, if any; null
-/// means "auto-detect from the image name".
+/// Base `TextureParams` with rules (first match wins, when `apply_rules`) and
+/// then every matching override applied in array order (last match wins).
+/// `normal_map` is the explicit override, if any; null means "auto-detect
+/// from the image name". `srgb` is the explicit rule/override value; null
+/// means auto (`!normal`).
 pub const EffectiveTex = struct {
     skip: bool = false,
     format: preset.TextureFormat,
@@ -307,20 +310,41 @@ pub const EffectiveTex = struct {
     generate_mips: bool,
     normal_map: ?bool = null,
     supercompression: preset.Supercompression,
+    rdo_lambda: f32,
+    srgb: ?bool = null,
+};
+
+/// Rule-matching context for one image: slot set + cutout from `parse`, and
+/// the min side (0 = unknown dims, skips the size check).
+pub const RuleCtx = struct {
+    slots: u8 = 0,
+    cutout: bool = false,
+    min_side: u32 = 0,
 };
 
 /// Resolve the effective params for image `index` with optional cgltf
-/// `name`/`uri`. A matching item's present fields replace the base params;
-/// `skip` is a plain bool so the last matching item's value wins. An item
-/// with neither `image` nor `name` matches nothing.
-pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]const u8, uri: ?[]const u8) EffectiveTex {
+/// `name`/`uri` and the rule context. An override item with neither `image`
+/// nor `name` matches nothing.
+pub fn resolveTextureFull(
+    p: preset.TextureParams,
+    index: u32,
+    name: ?[]const u8,
+    uri: ?[]const u8,
+    ctx: RuleCtx,
+) EffectiveTex {
     var eff: EffectiveTex = .{
         .format = p.format,
         .quality = p.quality,
         .max_size = p.max_size,
         .generate_mips = p.generate_mips,
         .supercompression = p.supercompression,
+        .rdo_lambda = p.rdo_lambda,
     };
+    if (p.apply_rules) {
+        if (matchRuleIndex(p, ctx, name, uri)) |ri| {
+            applyRule(&eff, p.rules[ri]);
+        }
+    }
     for (p.overrides) |o| {
         if (!overrideMatches(o, index, name, uri)) continue;
         eff.skip = o.skip;
@@ -332,6 +356,89 @@ pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]cons
         if (o.supercompression) |s| eff.supercompression = s;
     }
     return eff;
+}
+
+/// Back-compat entry: base params + overrides, no rule context.
+pub fn resolveTextureOverride(p: preset.TextureParams, index: u32, name: ?[]const u8, uri: ?[]const u8) EffectiveTex {
+    return resolveTextureFull(p, index, name, uri, .{});
+}
+
+/// Index of the first matching rule, or null. Exported so the runner can
+/// flag rule-driven runs as mixed.
+pub fn matchRuleIndex(p: preset.TextureParams, ctx: RuleCtx, name: ?[]const u8, uri: ?[]const u8) ?usize {
+    for (p.rules, 0..) |r, i| {
+        if (ruleMatches(r, ctx, name, uri)) return i;
+    }
+    return null;
+}
+
+fn applyRule(eff: *EffectiveTex, r: preset.TexRule) void {
+    eff.skip = r.skip;
+    if (r.format) |f| eff.format = f;
+    if (r.quality) |q| eff.quality = q;
+    if (r.max_size) |m| eff.max_size = m;
+    if (r.generate_mips) |g| eff.generate_mips = g;
+    if (r.normal_map) |n| eff.normal_map = n;
+    if (r.supercompression) |s| eff.supercompression = s;
+    if (r.rdo_lambda) |l| eff.rdo_lambda = l;
+    if (r.srgb) |s| eff.srgb = s;
+}
+
+fn ruleMatches(r: preset.TexRule, ctx: RuleCtx, name: ?[]const u8, uri: ?[]const u8) bool {
+    if (r.slot) |s| {
+        const bit: u8 = switch (s) {
+            .base_color => @as(u8, 1) << 0,
+            .normal => @as(u8, 1) << 1,
+            .arm => @as(u8, 1) << 2, // metallic_roughness
+            .occlusion => @as(u8, 1) << 3,
+            .emissive => @as(u8, 1) << 4,
+        };
+        if (ctx.slots & bit == 0) return false;
+    }
+    if (r.cutout) |co| {
+        if (co != ctx.cutout) return false;
+    }
+    if (r.name.len > 0) {
+        if (!nameOrUriSuffix(name, uri, r.name)) return false;
+    }
+    // Size bounds only apply when dims are known (0 = unknown): a rule with
+    // min/max_side never matches an image of unknown size.
+    if (r.min_side) |mn| if (ctx.min_side == 0 or ctx.min_side < mn) return false;
+    if (r.max_side) |mx| if (ctx.min_side == 0 or ctx.min_side > mx) return false;
+    return true;
+}
+
+/// Suffix match (case-insensitive) against the name/uri and their stems
+/// (extension stripped: "asphalt_1_BC.png" matches "_BC").
+fn nameOrUriSuffix(name: ?[]const u8, uri: ?[]const u8, needle: []const u8) bool {
+    if (name) |n| if (suffixMatch(n, needle)) return true;
+    if (uri) |u| if (suffixMatch(u, needle)) return true;
+    return false;
+}
+
+fn suffixMatch(haystack: []const u8, needle: []const u8) bool {
+    if (endsWithIgnoreCase(haystack, needle)) return true;
+    return endsWithIgnoreCase(stemOf(haystack), needle);
+}
+
+/// Basename without its extension: "a/b_C.png" -> "b_C".
+fn stemOf(s: []const u8) []const u8 {
+    var base = s;
+    if (std.mem.lastIndexOfAny(u8, s, "/\\")) |i| base = s[i + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| {
+        if (i > 0) return base[0..i];
+    }
+    return base;
+}
+
+fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    const tail = haystack[haystack.len - needle.len ..];
+    for (tail, needle) |h, n| {
+        if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
+    }
+    return true;
 }
 
 fn overrideMatches(o: preset.TextureOverride, index: u32, name: ?[]const u8, uri: ?[]const u8) bool {
@@ -413,6 +520,35 @@ fn embeddedImageBytes(data: *c.cgltf_data, im: *const c.cgltf_image) ?[]const u8
     return (base + bv.*.offset)[0..bv.*.size];
 }
 
+/// Rule context for image `idx` from the model-level asset (slots/cutout
+/// from `parse`, min side from the probed dims; 0 = unknown).
+fn ruleCtxFor(asset_images: []const model.Image, idx: usize) RuleCtx {
+    if (idx >= asset_images.len) return .{};
+    const ai = asset_images[idx];
+    return .{
+        .slots = ai.slots,
+        .cutout = ai.cutout,
+        .min_side = if (ai.has_dims) @min(ai.width, ai.height) else 0,
+    };
+}
+
+fn assetIsKtx2(asset_images: []const model.Image, idx: usize) bool {
+    if (idx >= asset_images.len) return false;
+    return asset_images[idx].has_ktx2;
+}
+
+/// Source decode for the textures step: png/jpeg/webp via stb/libwebp,
+/// KTX2 via transcode — but only when `reencode` is on (otherwise KTX2
+/// sources are skipped, the legacy outcome).
+fn decodeSource(a: std.mem.Allocator, bytes: []const u8, is_ktx2: bool, reencode: bool) ?decode.Decoded {
+    if (is_ktx2) {
+        if (!reencode) return null;
+        const rt = encode_ktx.decodeToRgba(a, bytes) catch return null;
+        return .{ .width = rt.width, .height = rt.height, .pixels = rt.pixels };
+    }
+    return decode.decodeRgba(a, bytes);
+}
+
 fn setMimeKtx2(d: *c.cgltf_data, im: *c.cgltf_image) void {
     const s = "image/ktx2";
     const mem = d.memory;
@@ -460,6 +596,9 @@ fn envInnerOverride() ?usize {
 /// One image to encode, in `cdata.images` order, with its resolved params.
 const ImageJob = struct {
     bytes: []const u8,
+    /// Transcode from KTX2 instead of decoding png/jpeg/webp.
+    is_ktx2: bool = false,
+    reencode: bool = false,
     mode: encode_ktx.Mode,
     quality: u8,
     max_size: u32,
@@ -506,7 +645,7 @@ const Worker = struct {
 /// decode -> (downscale) -> basisu encode for one image, all scratch from
 /// `scratch`. The returned KTX2 is a c_allocator copy so it outlives the arena.
 fn encodeOneJob(scratch: std.mem.Allocator, job: ImageJob) EncOutcome {
-    const dec = decode.decodeRgba(scratch, job.bytes) orelse return .{ .err = error.ImageDecode };
+    const dec = decodeSource(scratch, job.bytes, job.is_ktx2, job.reencode) orelse return .{ .err = error.ImageDecode };
 
     var px = dec.pixels;
     var w = dec.width;
@@ -594,18 +733,19 @@ fn encodeTexturesWith(
 
     var pending: std.ArrayList(PendingView) = .empty;
 
-    // Per-image report rows, only when overrides exist (the default path stays
+    // Per-image report rows, when overrides or rules exist (the default path stays
     // allocation-free and the report shape unchanged).
     var details: std.ArrayList(TextureImageOutcome) = .empty;
-    const details_ptr: ?*std.ArrayList(TextureImageOutcome) = if (p.overrides.len > 0) &details else null;
+    const details_ptr: ?*std.ArrayList(TextureImageOutcome) =
+        if (p.overrides.len > 0 or (p.apply_rules and p.rules.len > 0)) &details else null;
 
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
     var n_threads = @min(thread_cap, encodeThreadCount(images.len));
     if (envOuterOverride()) |o| n_threads = @max(1, @min(o, images.len));
     if (n_threads <= 1) {
-        try encodeImagesSequential(a, loaded.cdata, p, target, images, &gb, &pending, &res, details_ptr, prog);
+        try encodeImagesSequential(a, loaded.cdata, loaded.asset.images, p, target, images, &gb, &pending, &res, details_ptr, prog);
     } else {
-        try encodeImagesParallel(a, loaded.cdata, p, target, images, &gb, &pending, &res, n_threads, details_ptr, prog);
+        try encodeImagesParallel(a, loaded.cdata, loaded.asset.images, p, target, images, &gb, &pending, &res, n_threads, details_ptr, prog);
     }
     if (details_ptr != null) res.details = try details.toOwnedSlice(a);
 
@@ -658,6 +798,7 @@ fn emitTexProgress(prog: ?ProgScope, done: u32, total: u32) void {
 fn encodeImagesSequential(
     a: std.mem.Allocator,
     cd: *c.cgltf_data,
+    asset_images: []const model.Image,
     p: preset.TextureParams,
     target: preset.Target,
     images: []c.cgltf_image,
@@ -674,7 +815,8 @@ fn encodeImagesSequential(
     encode_ktx.setMaxThreads(8);
     for (images, 0..) |*im, idx| {
         const index: u32 = @intCast(idx);
-        const eff = resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri));
+        const ctx = ruleCtxFor(asset_images, idx);
+        const eff = resolveTextureFull(p, index, cStr(im.name), cStr(im.uri), ctx);
         if (eff.skip) {
             res.skipped += 1;
             res.mixed = true;
@@ -685,6 +827,7 @@ fn encodeImagesSequential(
             continue;
         }
         if (eff.format != p.format) res.mixed = true;
+        if (p.apply_rules and matchRuleIndex(p, ctx, cStr(im.name), cStr(im.uri)) != null) res.mixed = true;
         const bytes = embeddedImageBytes(cd, im) orelse {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
@@ -692,7 +835,8 @@ fn encodeImagesSequential(
             emitTexProgress(prog, done, total);
             continue;
         };
-        var dec = decode.decodeRgba(a, bytes) orelse {
+        const is_ktx2 = assetIsKtx2(asset_images, idx);
+        var dec = decodeSource(a, bytes, is_ktx2, p.reencode_ktx2) orelse {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
             done += 1;
@@ -716,11 +860,11 @@ fn encodeImagesSequential(
         const out = encode_ktx.encode(a, px, w, h, .{
             .mode = modeForFormat(eff.format, target),
             .quality = eff.quality,
-            .rdo_lambda = p.rdo_lambda,
+            .rdo_lambda = eff.rdo_lambda,
             .normal_map = if (eff.normal_map) |o| o else (auto_normal and p.normal_maps_renormalize),
             .generate_mips = eff.generate_mips,
             .max_size = 0, // already downscaled
-            .srgb = !eff_normal,
+            .srgb = eff.srgb orelse !eff_normal,
             .supercompression = eff.supercompression,
         }) catch {
             res.skipped += 1;
@@ -747,6 +891,7 @@ fn encodeImagesSequential(
 fn encodeImagesParallel(
     a: std.mem.Allocator,
     cd: *c.cgltf_data,
+    asset_images: []const model.Image,
     p: preset.TextureParams,
     target: preset.Target,
     images: []c.cgltf_image,
@@ -763,26 +908,32 @@ fn encodeImagesParallel(
 
     var jobs: std.ArrayList(ImageJob) = .empty;
     for (images, 0..) |*im, i| {
-        const eff = resolveTextureOverride(p, @intCast(i), cStr(im.name), cStr(im.uri));
+        const ctx = ruleCtxFor(asset_images, i);
+        const eff = resolveTextureFull(p, @intCast(i), cStr(im.name), cStr(im.uri), ctx);
         if (eff.skip) {
             res.mixed = true;
             continue; // slot stays .skip; counted in the join loop below
         }
         const bytes = embeddedImageBytes(cd, im) orelse continue;
         if (eff.format != p.format) res.mixed = true;
+        if (p.apply_rules and matchRuleIndex(p, ctx, cStr(im.name), cStr(im.uri)) != null) res.mixed = true;
+        const is_ktx2 = assetIsKtx2(asset_images, i);
+        if (is_ktx2 and !p.reencode_ktx2) continue; // legacy: KTX2 sources skipped
         const auto_normal = isNormalName(im.name);
         const eff_normal: bool = eff.normal_map orelse auto_normal;
         slots[i] = .{ .job = jobs.items.len };
         try jobs.append(a, .{
             .bytes = bytes,
+            .is_ktx2 = is_ktx2,
+            .reencode = p.reencode_ktx2,
             .mode = modeForFormat(eff.format, target),
             .quality = eff.quality,
             .max_size = eff.max_size,
             .generate_mips = eff.generate_mips,
             .normal_map = if (eff.normal_map) |o| o else (auto_normal and p.normal_maps_renormalize),
-            .srgb = !eff_normal,
+            .srgb = eff.srgb orelse !eff_normal,
             .normal = eff_normal,
-            .rdo_lambda = p.rdo_lambda,
+            .rdo_lambda = eff.rdo_lambda,
             .supercompression = eff.supercompression,
         });
     }
@@ -866,7 +1017,7 @@ fn encodeImagesParallel(
         res.ktx_bytes += out.ktx2.len;
         const vi = try gb.addView(out.ktx2, 0);
         try pending.append(a, .{ .img = im, .view_idx = vi, .normal = jobs.items[j].normal });
-        try appendDetail(a, details, index, im.name, false, @tagName(resolveTextureOverride(p, index, cStr(im.name), cStr(im.uri)).format));
+        try appendDetail(a, details, index, im.name, false, @tagName(resolveTextureFull(p, index, cStr(im.name), cStr(im.uri), ruleCtxFor(asset_images, i)).format));
         res.encoded += 1;
     }
 }
@@ -1254,6 +1405,69 @@ test "textures overrides: resolve order and matching" {
     const zp: preset.TextureParams = .{ .supercompression = .zstd, .overrides = &zovs };
     try testing.expectEqual(preset.Supercompression.none, resolveTextureOverride(zp, 1, "tex1", null).supercompression);
     try testing.expectEqual(preset.Supercompression.zstd, resolveTextureOverride(zp, 2, "other", null).supercompression);
+}
+
+test "textures rules: first match wins, suffix, slot, skip" {
+    const rules = [_]preset.TexRule{
+        .{ .max_side = 255, .skip = true },
+        .{ .name = "height", .skip = true },
+        .{ .slot = .base_color, .cutout = true, .format = .uastc, .srgb = true },
+        .{ .slot = .normal, .format = .uastc, .rdo_lambda = 0.5, .supercompression = .zstd, .srgb = false, .normal_map = true },
+        .{ .slot = .arm, .format = .uastc, .rdo_lambda = 1.0, .srgb = false },
+        .{ .name = "_BC", .format = .etc1s, .srgb = true },
+    };
+    const p: preset.TextureParams = .{ .format = .auto, .quality = 128, .apply_rules = true, .rules = &rules };
+
+    const normal_bit: u8 = @as(u8, 1) << 1;
+    const base_bit: u8 = @as(u8, 1) << 0;
+
+    // normal slot hits the normal rule even when the name screams base color
+    const e1 = resolveTextureFull(p, 0, "wall_BC", null, .{ .slots = normal_bit, .min_side = 1024 });
+    try testing.expect(!e1.skip);
+    try testing.expectEqual(preset.TextureFormat.uastc, e1.format);
+    try testing.expectEqual(@as(f32, 0.5), e1.rdo_lambda);
+    try testing.expectEqual(@as(?bool, false), e1.srgb);
+    try testing.expectEqual(@as(?bool, true), e1.normal_map);
+
+    // suffix matches the stem: "asphalt_1_BC.png" hits _BC, not a bare contains
+    const e2 = resolveTextureFull(p, 1, "asphalt_1_BC.png", null, .{ .slots = base_bit, .min_side = 1024 });
+    try testing.expectEqual(preset.TextureFormat.etc1s, e2.format);
+    try testing.expectEqual(@as(?bool, true), e2.srgb);
+
+    // tiny normal map: the skip rule is first, so size wins over slot
+    const e3 = resolveTextureFull(p, 2, "wall_NRM", null, .{ .slots = normal_bit, .min_side = 64 });
+    try testing.expect(e3.skip);
+
+    // never-compress name wins over a base-color slot
+    const e4 = resolveTextureFull(p, 3, "terrain_Height", null, .{ .slots = base_bit, .min_side = 1024 });
+    try testing.expect(e4.skip);
+
+    // cutout base color beats the plain base-color name rule
+    const e5 = resolveTextureFull(p, 4, "leaf_BC", null, .{ .slots = base_bit, .cutout = true, .min_side = 512 });
+    try testing.expectEqual(preset.TextureFormat.uastc, e5.format);
+
+    // unknown dims: size-bounded rules never match, so the name rule applies
+    const e6 = resolveTextureFull(p, 5, "wall_BC", null, .{ .slots = base_bit, .min_side = 0 });
+    try testing.expect(!e6.skip);
+    try testing.expectEqual(preset.TextureFormat.etc1s, e6.format);
+
+    // no rule matched: base params survive, rdo/srgb unset
+    const e7 = resolveTextureFull(p, 6, "mystery", null, .{ .min_side = 512 });
+    try testing.expect(!e7.skip);
+    try testing.expectEqual(preset.TextureFormat.auto, e7.format);
+    try testing.expectEqual(@as(f32, 1.0), e7.rdo_lambda);
+    try testing.expectEqual(@as(?bool, null), e7.srgb);
+
+    // rules off: identical params ignore the table (legacy byte-compat)
+    const off: preset.TextureParams = .{ .format = .auto, .quality = 128, .rules = &rules };
+    const e8 = resolveTextureFull(off, 0, "wall_BC", null, .{ .slots = normal_bit, .min_side = 1024 });
+    try testing.expectEqual(preset.TextureFormat.auto, e8.format);
+
+    // overrides still win over rules (last-wins after first-match)
+    const ovs = [_]preset.TextureOverride{.{ .image = 0, .format = .uastc }};
+    const pm: preset.TextureParams = .{ .format = .auto, .apply_rules = true, .rules = &rules, .overrides = &ovs };
+    const e9 = resolveTextureFull(pm, 0, "wall_BC", null, .{ .slots = base_bit, .min_side = 1024 });
+    try testing.expectEqual(preset.TextureFormat.uastc, e9.format);
 }
 
 test "textures overrides: skip keeps source bytes, name override changes format" {

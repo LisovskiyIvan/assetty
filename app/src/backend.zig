@@ -1835,16 +1835,26 @@ fn clonePreset(gpa: std.mem.Allocator, p: core.preset.Preset) !core.preset.Prese
     errdefer gpa.free(name);
     const steps = try gpa.dupe(core.preset.Step, p.steps);
     errdefer gpa.free(steps);
-    // Override slices (and their name strings) point into the call's arena,
-    // which dies with the call; the job outlives it, so deep-copy them.
+    // Override AND rule slices (and their name strings) point into the call's
+    // arena, which dies with the call; the job outlives it, so deep-copy them.
     for (steps) |*s| {
-        if (s.* == .textures and s.textures.overrides.len > 0) {
-            const ov = try gpa.dupe(core.preset.TextureOverride, s.textures.overrides);
-            errdefer gpa.free(ov);
-            for (ov) |*o| {
-                if (o.name.len > 0) o.name = try gpa.dupe(u8, o.name);
+        if (s.* == .textures) {
+            if (s.textures.overrides.len > 0) {
+                const ov = try gpa.dupe(core.preset.TextureOverride, s.textures.overrides);
+                errdefer gpa.free(ov);
+                for (ov) |*o| {
+                    if (o.name.len > 0) o.name = try gpa.dupe(u8, o.name);
+                }
+                s.textures.overrides = ov;
             }
-            s.textures.overrides = ov;
+            if (s.textures.rules.len > 0) {
+                const rl = try gpa.dupe(core.preset.TexRule, s.textures.rules);
+                errdefer gpa.free(rl);
+                for (rl) |*r| {
+                    if (r.name.len > 0) r.name = try gpa.dupe(u8, r.name);
+                }
+                s.textures.rules = rl;
+            }
         }
     }
     return .{ .name = name, .target = p.target, .steps = steps };
@@ -1857,6 +1867,10 @@ fn freePreset(gpa: std.mem.Allocator, p: core.preset.Preset) void {
                 if (o.name.len > 0) gpa.free(o.name);
             }
             if (s.textures.overrides.len > 0) gpa.free(s.textures.overrides);
+            for (s.textures.rules) |r| {
+                if (r.name.len > 0) gpa.free(r.name);
+            }
+            if (s.textures.rules.len > 0) gpa.free(s.textures.rules);
         }
     }
     gpa.free(p.name);
@@ -3386,6 +3400,39 @@ test "custom spec maps textures supercompression" {
         &d3,
     );
     try testing.expectEqual(@as(?core.encode_ktx.Supercompression, null), r.steps[0].textures.overrides[0].supercompression);
+}
+
+test "custom spec maps textures rules" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    const p = try customPresetFromSpec(
+        a,
+        "{\"steps\":[{\"textures\":{\"format\":\"auto\",\"apply_rules\":true,\"reencode_ktx2\":true,\"rules\":[{\"slot\":\"normal\",\"format\":\"uastc\",\"srgb\":false},{\"name\":\"_BC\",\"format\":\"etc1s\",\"skip\":true}]}}]}",
+        &detail,
+    );
+    const tex = p.steps[0].textures;
+    try testing.expect(tex.apply_rules);
+    try testing.expect(tex.reencode_ktx2);
+    try testing.expectEqual(@as(usize, 2), tex.rules.len);
+    try testing.expectEqual(@as(?core.preset.TexSlot, .normal), tex.rules[0].slot);
+    try testing.expectEqual(@as(?bool, false), tex.rules[0].srgb);
+    try testing.expectEqualStrings("_BC", tex.rules[1].name);
+    try testing.expect(tex.rules[1].skip);
+
+    // Resolution through the live path: normal slot beats the _BC name rule.
+    const normal_bit: u8 = @as(u8, 1) << 1;
+    const eff = core.runner.resolveTextureFull(tex, 0, "wall_BC", null, .{ .slots = normal_bit, .min_side = 512 });
+    try testing.expectEqual(core.preset.TextureFormat.uastc, eff.format);
+
+    // Defaults stay off (legacy byte-compat).
+    var d2: []const u8 = "";
+    const q = try customPresetFromSpec(a, "{\"steps\":[{\"textures\":{}}]}", &d2);
+    try testing.expect(!q.steps[0].textures.apply_rules);
+    try testing.expect(!q.steps[0].textures.reencode_ktx2);
+    try testing.expectEqual(@as(usize, 0), q.steps[0].textures.rules.len);
 }
 
 test "custom spec ignores malformed override items gracefully" {

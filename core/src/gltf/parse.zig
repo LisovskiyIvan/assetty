@@ -570,6 +570,35 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     }
     out.textures = textures;
 
+    // --- image slots: which material binding(s) sample each image ---------
+    // A texture shared by several bindings sets several bits; texture rules
+    // (strictest first: normal > arm > occlusion > emissive > base_color)
+    // decide the winner. Cutout marks base-color images of BLEND/MASK
+    // materials (pixel-alpha analysis is a backlog item).
+    for (materials) |mat| {
+        const bindings = [_]struct { ti: ?model.TextureInfo, slot: model.ImageSlot }{
+            .{ .ti = mat.base_color_texture, .slot = .base_color },
+            .{ .ti = mat.metallic_roughness_texture, .slot = .metallic_roughness },
+            .{ .ti = mat.normal_texture, .slot = .normal },
+            .{ .ti = mat.occlusion_texture, .slot = .occlusion },
+            .{ .ti = mat.emissive_texture, .slot = .emissive },
+        };
+        for (bindings) |b| {
+            const ti = b.ti orelse continue;
+            if (ti.texture >= textures.len) continue;
+            const img_idx = textures[ti.texture].image orelse continue;
+            if (img_idx >= images.len) continue;
+            images[img_idx].setSlot(b.slot);
+        }
+        if (mat.base_color_texture) |ti| {
+            if (mat.alpha_mode != .opaque_ and ti.texture < textures.len) {
+                if (textures[ti.texture].image) |img_idx| {
+                    if (img_idx < images.len) images[img_idx].cutout = true;
+                }
+            }
+        }
+    }
+
     // --- meshes/primitives ---
     const meshes = try a.alloc(model.Mesh, data.meshes_count);
     for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, i| {
@@ -785,6 +814,67 @@ test "webp image sniffs mime and dims" {
     try std.testing.expect(img.has_dims);
     try std.testing.expectEqual(@as(u32, 8), img.width);
     try std.testing.expectEqual(@as(u32, 8), img.height);
+}
+
+test "image slots and cutout from material bindings" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const dir = ".zig-cache/parse-slots";
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const px = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const json =
+        \\{"asset":{"version":"2.0"},"images":[
+        \\ {"name":"wall_BC","bufferView":0,"mimeType":"image/png"},
+        \\ {"name":"wall_NRM","bufferView":1,"mimeType":"image/png"},
+        \\ {"name":"lone","bufferView":2,"mimeType":"image/png"}],
+        \\"textures":[{"source":0},{"source":1}],
+        \\"materials":[{"name":"m","alphaMode":"MASK",
+        \\ "pbrMetallicRoughness":{"baseColorTexture":{"index":0},"metallicRoughnessTexture":{"index":1}},
+        \\ "normalTexture":{"index":1}}],
+        \\"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":8},{"buffer":0,"byteOffset":8,"byteLength":8},{"buffer":0,"byteOffset":16,"byteLength":8}],
+        \\"buffers":[{"byteLength":24}]}
+    ;
+    const jp = std.mem.alignForward(usize, json.len, 4);
+    const total: usize = 12 + 8 + jp + 8 + 24;
+    const glb = try a.alloc(u8, total);
+    defer a.free(glb);
+    @memset(glb, 0);
+    std.mem.writeInt(u32, glb[0..4], 0x46546C67, .little);
+    std.mem.writeInt(u32, glb[4..8], 2, .little);
+    std.mem.writeInt(u32, glb[8..12], @intCast(total), .little);
+    std.mem.writeInt(u32, glb[12..16], @intCast(jp), .little);
+    std.mem.writeInt(u32, glb[16..20], 0x4E4F534A, .little);
+    @memset(glb[20 .. 20 + jp], ' ');
+    @memcpy(glb[20 .. 20 + json.len], json);
+    const bh = 20 + jp;
+    std.mem.writeInt(u32, glb[bh..][0..4], 24, .little);
+    std.mem.writeInt(u32, glb[bh + 4 ..][0..4], 0x004E4942, .little);
+    for (0..3) |i| @memcpy(glb[bh + 8 + i * 8 ..][0..8], &px);
+
+    const path = dir ++ "/slots.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = glb });
+
+    var loaded = try loadFile(io, a, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), loaded.asset.images.len);
+
+    const M = @import("model.zig");
+    const bit = struct {
+        fn b(s: M.ImageSlot) u8 {
+            return @as(u8, 1) << @backingInt(s);
+        }
+    }.b;
+    // wall_BC: base color of a MASK material -> base bit + cutout
+    try std.testing.expectEqual(bit(.base_color), loaded.asset.images[0].slots);
+    try std.testing.expect(loaded.asset.images[0].cutout);
+    // wall_NRM: MR + normal bindings -> both bits, no cutout
+    try std.testing.expectEqual(bit(.metallic_roughness) | bit(.normal), loaded.asset.images[1].slots);
+    try std.testing.expect(!loaded.asset.images[1].cutout);
+    // lone: unbound -> no slots
+    try std.testing.expectEqual(@as(u8, 0), loaded.asset.images[2].slots);
+    try std.testing.expect(!loaded.asset.images[2].cutout);
 }
 
 test "scanGlbChunks" {

@@ -228,7 +228,79 @@ const SpecParams = struct {
     }
 };
 
-/// Parse the textures step's `overrides` array (see the pipeline contract).
+/// Parse the textures step's `rules` array (first match wins). Lenient like
+/// `overrides`: missing/non-array means no rules, non-object items are
+/// skipped, mistyped fields keep their default (unset). Unknown keys ignored.
+/// An unknown `format`/`slot` string leaves the field unset.
+fn parseTextureRules(a: Allocator, v: ?std.json.Value) SpecError![]preset.TexRule {
+    const items = switch (v orelse return &.{}) {
+        .array => |arr| arr.items,
+        else => return &.{},
+    };
+    var out: std.ArrayList(preset.TexRule) = .empty;
+    for (items) |item| {
+        const fields = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        var r: preset.TexRule = .{};
+        if (fields.get("slot")) |sv| {
+            if (sv == .string) {
+                if (std.meta.stringToEnum(preset.TexSlot, sv.string)) |s| r.slot = s;
+            }
+        }
+        if (fields.get("name")) |nv| {
+            if (nv == .string) r.name = try a.dupe(u8, nv.string);
+        }
+        if (fields.get("format")) |fv| {
+            if (fv == .string) {
+                if (std.meta.stringToEnum(preset.TextureFormat, fv.string)) |f| r.format = f;
+            }
+        }
+        if (fields.get("quality")) |qv| {
+            if (qv == .integer) r.quality = std.math.cast(u8, qv.integer);
+        }
+        if (fields.get("rdo_lambda")) |lv| {
+            switch (lv) {
+                .float => |f| r.rdo_lambda = std.math.lossyCast(f32, f),
+                .integer => |i| r.rdo_lambda = @floatFromInt(i),
+                else => {},
+            }
+        }
+        if (fields.get("supercompression")) |scv| {
+            if (scv == .string) {
+                if (std.meta.stringToEnum(preset.Supercompression, scv.string)) |s| r.supercompression = s;
+            }
+        }
+        if (fields.get("srgb")) |sv| {
+            if (sv == .bool) r.srgb = sv.bool;
+        }
+        if (fields.get("max_size")) |mv| {
+            if (mv == .integer) r.max_size = std.math.cast(u32, mv.integer);
+        }
+        if (fields.get("min_side")) |mv| {
+            if (mv == .integer) r.min_side = std.math.cast(u32, mv.integer);
+        }
+        if (fields.get("max_side")) |mv| {
+            if (mv == .integer) r.max_side = std.math.cast(u32, mv.integer);
+        }
+        if (fields.get("generate_mips")) |gv| {
+            if (gv == .bool) r.generate_mips = gv.bool;
+        }
+        if (fields.get("normal_map")) |nmv| {
+            if (nmv == .bool) r.normal_map = nmv.bool;
+        }
+        if (fields.get("cutout")) |cv| {
+            if (cv == .bool) r.cutout = cv.bool;
+        }
+        if (fields.get("skip")) |sv| {
+            if (sv == .bool) r.skip = sv.bool;
+        }
+        try out.append(a, r);
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(a);
+}
 /// Lenient on purpose: a missing/non-array value means no overrides, a
 /// non-object item is skipped, and a mistyped field keeps its default.
 /// Unknown keys are ignored, like the step params themselves. An unknown
@@ -334,6 +406,9 @@ fn stepFromSpec(
                 .generate_mips = (try r.boolField("generate_mips")) orelse d.generate_mips,
                 .max_size = (try r.intField(u32, "max_size")) orelse d.max_size,
                 .supercompression = (try r.supercompressionField("supercompression")) orelse d.supercompression,
+                .apply_rules = (try r.boolField("apply_rules")) orelse d.apply_rules,
+                .reencode_ktx2 = (try r.boolField("reencode_ktx2")) orelse d.reencode_ktx2,
+                .rules = try parseTextureRules(a, r.get("rules")),
                 .overrides = try parseTextureOverrides(a, r.get("overrides")),
             } };
         },
@@ -519,6 +594,43 @@ test "spec maps textures supercompression" {
         const q = try parseSpec(a, s, &d);
         try testing.expectEqual(preset.Supercompression.none, q.steps[0].textures.supercompression);
     }
+}
+
+test "spec maps textures rules" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const spec =
+        \\{"steps":[{
+        \\  "textures":{
+        \\    "format":"auto","apply_rules":true,"reencode_ktx2":true,
+        \\    "rules":[
+        \\      {"name":"height","skip":true},
+        \\      {"slot":"normal","format":"uastc","rdo_lambda":0.5,"supercompression":"zstd","srgb":false,"normal_map":true},
+        \\      {"slot":"base_color","cutout":true,"format":"uastc","srgb":true,"min_side":256,"max_side":4096},
+        \\      {"name":"_BC","format":"etc1s","quality":200,"max_size":1024,"generate_mips":false}
+        \\    ]
+        \\  }
+        \\}]}
+    ;
+    var detail: []const u8 = "";
+    const p = try parseSpec(a, spec, &detail);
+    const tex = p.steps[0].textures;
+    try testing.expect(tex.apply_rules);
+    try testing.expect(tex.reencode_ktx2);
+    try testing.expectEqual(@as(usize, 4), tex.rules.len);
+    try testing.expect(tex.rules[0].skip);
+    try testing.expectEqual(@as(?preset.TexSlot, .normal), tex.rules[1].slot);
+    try testing.expectEqual(@as(?f32, 0.5), tex.rules[1].rdo_lambda);
+    try testing.expectEqual(@as(?bool, true), tex.rules[2].cutout);
+    try testing.expectEqual(@as(?u32, 256), tex.rules[2].min_side);
+    try testing.expectEqualStrings("_BC", tex.rules[3].name);
+
+    // unknown slot string: field stays unset, rule kept
+    const q = try parseSpec(a, "{\"steps\":[{\"textures\":{\"rules\":[{\"slot\":\"bogus\"}]}}]}", &detail);
+    try testing.expectEqual(@as(usize, 1), q.steps[0].textures.rules.len);
+    try testing.expectEqual(@as(?preset.TexSlot, null), q.steps[0].textures.rules[0].slot);
 }
 
 test "spec rejects unknown step kinds by name" {

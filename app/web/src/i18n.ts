@@ -150,6 +150,16 @@ const en: Dict = {
   "opt.autoWebTip": "web: ETC1S q96, max 2048px, mips on — fast streaming",
   "opt.noOverrides": "no per-texture overrides",
   "opt.overridesCount": "{n} per-texture override(s) (apply to source)",
+  "opt.rulesOff": "auto rules off",
+  "opt.rulesOnCount": "auto rules on: {n}",
+  "opt.rulesOnTitle":
+    "first matching rule sets the encode params per image; per-image overrides win",
+  "opt.rulesCount": "{n} auto rule(s) — first match wins; overrides win",
+  "opt.rulesInvalid": "rules must be a JSON array",
+  "opt.rulesReset": "Reset to defaults",
+  "opt.rulesResetTitle": "Replace the rules with the project-derived table",
+  "opt.rulesShort": "{n} rules",
+  "opt.reencodeShort": "re-encode KTX2",
   "opt.overridesTitle":
     "overrides are model-scoped (per_model[sourcePath]) and merge into the textures step",
   "opt.editInTextures": "Edit in Textures tab",
@@ -496,6 +506,12 @@ const en: Dict = {
     "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
   "help.textures.overrides_note":
     "Per-texture overrides replace the base params for single images of this model only, and merge into the textures step on Run. Edit them per image in the Textures tab.",
+  "help.textures.apply_rules":
+    "First-match-wins auto rules: each image is classified by its material slot (normal, arm, occlusion, emissive, base color) and name suffix, and the first matching rule replaces the base params. Per-image overrides still win over rules.",
+  "help.textures.reencode_ktx2":
+    "Transcode already-KTX2 sources and re-encode them like any image. Off = KTX2 images are skipped as today.",
+  "help.textures.rules":
+    "Editable JSON array of auto rules (first match wins per image). Reset restores the project-derived table. Saved into settings and every JSON preset.",
 };
 
 /* ------------------------------------------------------------------ Russian */
@@ -617,6 +633,16 @@ const ru: Dict = {
   "opt.autoWebTip": "веб: ETC1S q96, макс 2048px, мипы вкл — быстрый стриминг",
   "opt.noOverrides": "нет переопределений текстур",
   "opt.overridesCount": "переопределения текстур: {n} (применяются к источнику)",
+  "opt.rulesOff": "автоправила выкл",
+  "opt.rulesOnCount": "автоправила вкл: {n}",
+  "opt.rulesOnTitle":
+    "первое подошедшее правило задаёт параметры кодирования изображения; переопределения главнее",
+  "opt.rulesCount": "автоправил: {n} — первое совпадение побеждает; переопределения главнее",
+  "opt.rulesInvalid": "правила должны быть JSON-массивом",
+  "opt.rulesReset": "Сбросить к умолчаниям",
+  "opt.rulesResetTitle": "Заменить правила таблицей проекта",
+  "opt.rulesShort": "правил: {n}",
+  "opt.reencodeShort": "перекод KTX2",
   "opt.overridesTitle":
     "переопределения привязаны к модели (per_model[sourcePath]) и подмешиваются в шаг textures",
   "opt.editInTextures": "Править во вкладке Текстуры",
@@ -954,6 +980,12 @@ const ru: Dict = {
     "«Рядом» показывает источник и результат бок о бок; «шторка» складывает их с перетаскиваемым разделителем. Камеры связаны — вращайте, оба вида двигаются.",
   "help.textures.overrides_note":
     "Переопределения текстур заменяют базовые параметры для отдельных изображений только этой модели и подмешиваются в шаг textures при запуске. Правятся по каждому изображению во вкладке «Текстуры».",
+  "help.textures.apply_rules":
+    "Автоправила «первое совпадение — побеждает»: каждое изображение классифицируется по слоту материала (normal, arm, occlusion, emissive, base color) и суффиксу имени, первое подошедшее правило заменяет базовые параметры. Переопределения изображений всё равно главнее правил.",
+  "help.textures.reencode_ktx2":
+    "Транскодировать уже-KTX2 источники и перекодировать их как обычные изображения. Выкл = KTX2 пропускаются, как раньше.",
+  "help.textures.rules":
+    "Редактируемый JSON-массив автоправил (первое совпадение побеждает для каждого изображения). Сброс возвращает таблицу проекта. Сохраняется в настройки и каждый JSON-пресет.",
 };
 
 /* ------------------------------------------------------------------ state */

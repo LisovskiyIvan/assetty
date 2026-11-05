@@ -189,6 +189,14 @@ pub const Mime = enum {
     }
 };
 
+pub const ImageSlot = enum(u3) {
+    base_color = 0,
+    normal = 1,
+    metallic_roughness = 2,
+    occlusion = 3,
+    emissive = 4,
+};
+
 pub const Image = struct {
     name: ?[]const u8 = null,
     mime: Mime = .other,
@@ -206,6 +214,22 @@ pub const Image = struct {
     mip_levels: u32 = 0,
     /// KHR_DF color model when vk_format == 0 (163 ETC1S, 166 UASTC)
     color_model: u8 = 0,
+    /// Bit per `ImageSlot` (1 << @intFromEnum(slot)): every material binding
+    /// whose texture resolves to this image. A texture shared by several
+    /// slots carries several bits; rule order decides (strictest first).
+    slots: u8 = 0,
+    /// True when a BLEND/MASK material samples this image as base color
+    /// (alpha rule). Pixel-alpha analysis is a backlog item; material
+    /// alphaMode is the signal this round.
+    cutout: bool = false,
+
+    pub fn hasSlot(self: Image, slot: ImageSlot) bool {
+        return self.slots & (@as(u8, 1) << @backingInt(slot)) != 0;
+    }
+
+    pub fn setSlot(self: *Image, slot: ImageSlot) void {
+        self.slots |= @as(u8, 1) << @backingInt(slot);
+    }
 };
 
 pub const Filter = enum {

@@ -151,9 +151,115 @@ pub const TextureParams = struct {
     max_size: u32 = 0,
     /// zstd supercompression of the UASTC KTX2 payload.
     supercompression: Supercompression = .none,
+    /// First-match-wins texture rules (slot + name suffix). Off = legacy
+    /// behavior: base params + per-image overrides (byte-compat).
+    apply_rules: bool = false,
+    rules: []const TexRule = &.{},
+    /// Re-encode already-KTX2 sources (transcode + encode like any source).
+    /// Off = KTX2 images are skipped as today.
+    reencode_ktx2: bool = false,
     /// Per-image overrides, applied in array order (last match wins).
     overrides: []const TextureOverride = &.{},
 };
+
+/// Slot class a `TexRule` matches on. `arm` covers the metallic-roughness
+/// binding (an ORM texture bound to both MR and occlusion carries both the
+/// `arm` and `occlusion` bits; rule order decides — strictest first).
+pub const TexSlot = enum { base_color, normal, arm, occlusion, emissive };
+
+/// One entry of `TextureParams.rules`. First matching rule wins (unlike
+/// `overrides`, which are last-wins). A rule matches an image when every set
+/// selector agrees: `slot` is in the image's slot set, `cutout` equals the
+/// image's cutout flag, `name` is a case-insensitive SUFFIX of the image
+/// name/uri stem (extension stripped; full string also tried), and the image
+/// min side is within `[min_side, max_side]` when those are set (a rule with
+/// size bounds never matches unknown dims). An entry with no selector matches everything — put
+/// catch-alls last. Only present fields replace the base params.
+pub const TexRule = struct {
+    slot: ?TexSlot = null,
+    /// Suffix matched case-insensitively, e.g. "_NRM" or "_BC".
+    name: []const u8 = "",
+    format: ?TextureFormat = null,
+    quality: ?u8 = null,
+    rdo_lambda: ?f32 = null,
+    supercompression: ?Supercompression = null,
+    /// sRGB transfer for the encode. Null = auto (`!normal`).
+    srgb: ?bool = null,
+    generate_mips: ?bool = null,
+    max_size: ?u32 = null,
+    /// Implies linear + renormalize (like the name auto-detect it overrides).
+    normal_map: ?bool = null,
+    cutout: ?bool = null,
+    min_side: ?u32 = null,
+    max_side: ?u32 = null,
+    /// Leave the image as-is: original bytes preserved, not encoded.
+    skip: bool = false,
+};
+
+/// Strictest slot in a `model.Image.slots` bitmask, for reports/tests:
+/// normal > arm (metallic-roughness) > occlusion > emissive > base_color.
+/// Null when the image is bound to nothing.
+pub fn strictestSlot(slots: u8) ?TexSlot {
+    const bit = struct {
+        fn b(slot: @import("../gltf/model.zig").ImageSlot) u8 {
+            return @as(u8, 1) << @backingInt(slot);
+        }
+    }.b;
+    if (slots & bit(.normal) != 0) return .normal;
+    if (slots & bit(.metallic_roughness) != 0) return .arm;
+    if (slots & bit(.occlusion) != 0) return .occlusion;
+    if (slots & bit(.emissive) != 0) return .emissive;
+    if (slots & bit(.base_color) != 0) return .base_color;
+    return null;
+}
+
+/// Project-derived default auto-rules (user-editable copy lives in the app
+/// settings; JSON presets carry their own). Order is first-match-wins:
+/// skips, cutout alpha, normal, arm, occlusion, emissive, single-channel
+/// name fallbacks, base-color name fallbacks.
+pub fn defaultTexRules() []const TexRule {
+    const defaults = struct {
+        const rules = [_]TexRule{
+            // tiny (<256px min side): never worth encoding
+            .{ .max_side = 255, .skip = true },
+            // never compress: heights, bumps, displacements, LUTs, data, shader arrays
+            .{ .name = "height", .skip = true },
+            .{ .name = "bump", .skip = true },
+            .{ .name = "disp", .skip = true },
+            .{ .name = "lut", .skip = true },
+            .{ .name = "data", .skip = true },
+            .{ .name = "shaderarray", .skip = true },
+            // alpha/cutout base color (BLEND/MASK material): UASTC sRGB
+            .{ .slot = .base_color, .cutout = true, .format = .uastc, .srgb = true },
+            // normal: UASTC linear, zstd, light RDO, renormalize
+            .{ .slot = .normal, .format = .uastc, .rdo_lambda = 0.5, .supercompression = .zstd, .srgb = false, .normal_map = true },
+            // arm/ORM: UASTC linear, zstd (pipelines disagree on RDO here; lambda 1.0)
+            .{ .slot = .arm, .format = .uastc, .rdo_lambda = 1.0, .supercompression = .zstd, .srgb = false },
+            .{ .slot = .occlusion, .format = .uastc, .rdo_lambda = 1.0, .supercompression = .zstd, .srgb = false },
+            // emissive: ETC1S sRGB
+            .{ .slot = .emissive, .format = .etc1s, .srgb = true },
+            // single-channel name fallbacks (unbound or ambiguous): UASTC linear
+            .{ .name = "_orm", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_arm", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_rm", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "occlusionroughnessmetallic", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_roughness", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_metallic", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_occlusion", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_opacity", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_mask", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            .{ .name = "_ao", .format = .uastc, .supercompression = .zstd, .srgb = false },
+            // base-color name fallbacks: ETC1S sRGB (swizzle NOT implemented — backlog)
+            .{ .name = "_basecolor", .format = .etc1s, .srgb = true },
+            .{ .name = "_albedo", .format = .etc1s, .srgb = true },
+            .{ .name = "_diffuse", .format = .etc1s, .srgb = true },
+            .{ .name = "_bc", .format = .etc1s, .srgb = true },
+            .{ .name = "_color", .format = .etc1s, .srgb = true },
+            .{ .name = "_d", .format = .etc1s, .srgb = true },
+        };
+    };
+    return &defaults.rules;
+}
 
 /// One entry of `TextureParams.overrides`. Every field is optional: only the
 /// present ones replace the step's base params for the matched image. An entry
@@ -358,6 +464,8 @@ pub fn describe(p: Preset, w: anytype) !void {
                         @tagName(v.supercompression),
                     },
                 );
+                if (v.apply_rules) try w.print(" rules={d}", .{v.rules.len});
+                if (v.reencode_ktx2) try w.writeAll(" reencode_ktx2");
                 if (v.overrides.len > 0) try w.print(" overrides={d}", .{v.overrides.len});
                 try w.writeByte('\n');
             },
@@ -683,4 +791,66 @@ test "parse textures without overrides defaults to empty" {
     defer arena.deinit();
     const p = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .textures = .{} } } }");
     try testing.expectEqual(@as(usize, 0), p.steps[0].textures.overrides.len);
+}
+
+test "parse textures rules round-trip" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const src =
+        \\.{
+        \\    .name = "rules",
+        \\    .target = .web,
+        \\    .steps = .{
+        \\        .{ .textures = .{
+        \\            .format = .etc1s,
+        \\            .apply_rules = true,
+        \\            .reencode_ktx2 = true,
+        \\            .rules = .{
+        \\                .{ .name = "height", .skip = true },
+        \\                .{ .slot = .normal, .format = .uastc, .rdo_lambda = 0.5, .supercompression = .zstd, .srgb = false, .normal_map = true },
+        \\                .{ .slot = .base_color, .cutout = true, .format = .uastc, .srgb = true },
+        \\                .{ .name = "_BC", .format = .etc1s, .srgb = true, .max_side = 4096, .min_side = 256 },
+        \\            },
+        \\        } },
+        \\    },
+        \\}
+    ;
+    const p = try parse(arena.allocator(), src);
+    const tex = p.steps[0].textures;
+    try testing.expect(tex.apply_rules);
+    try testing.expect(tex.reencode_ktx2);
+    try testing.expectEqual(@as(usize, 4), tex.rules.len);
+    try testing.expect(tex.rules[0].skip);
+    try testing.expectEqual(@as(?TexSlot, .normal), tex.rules[1].slot);
+    try testing.expectEqual(@as(?bool, true), tex.rules[2].cutout);
+    try testing.expectEqual(@as(?u32, 4096), tex.rules[3].max_side);
+
+    // defaults off: legacy byte-compat
+    const d = try parse(arena.allocator(), ".{ .name = \"n\", .target = .web, .steps = .{ .{ .textures = .{} } } }");
+    try testing.expect(!d.steps[0].textures.apply_rules);
+    try testing.expect(!d.steps[0].textures.reencode_ktx2);
+    try testing.expectEqual(@as(usize, 0), d.steps[0].textures.rules.len);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try describe(p, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "rules=4") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "reencode_ktx2") != null);
+}
+
+test "defaultTexRules order and strictestSlot" {
+    const rules = defaultTexRules();
+    try testing.expect(rules.len > 10);
+    // skips first, then cutout, then normal
+    try testing.expect(rules[0].skip);
+    try testing.expectEqual(@as(?TexSlot, .base_color), rules[7].slot);
+    try testing.expectEqual(@as(?bool, true), rules[7].cutout);
+    try testing.expectEqual(@as(?TexSlot, .normal), rules[8].slot);
+
+    const M = @import("../gltf/model.zig");
+    const both: u8 = (@as(u8, 1) << @backingInt(M.ImageSlot.base_color)) |
+        (@as(u8, 1) << @backingInt(M.ImageSlot.metallic_roughness));
+    try testing.expectEqual(@as(?TexSlot, .arm), strictestSlot(both));
+    try testing.expectEqual(@as(?TexSlot, null), strictestSlot(0));
 }

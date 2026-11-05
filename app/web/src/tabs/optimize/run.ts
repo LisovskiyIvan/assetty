@@ -7,7 +7,7 @@ import { isBusyError, notifyExportError, pickSaveTarget } from "../../guards";
 import { t } from "../../i18n";
 import { el, fmtSecs } from "../../ui";
 import { getSettings, getTextureOverrides, updateSettings } from "../../settings";
-import type { OptimizeSteps, TextureOverride } from "../../settings";
+import type { OptimizeSteps, TextureOverride, TextureRule } from "../../settings";
 import { notify, onLog } from "../../notify";
 import type { ImageInfo, Info, OptimizeResult } from "../../types";
 import type { LodsItem, PresetEntry } from "../../bridge";
@@ -163,6 +163,13 @@ function buildSpec(steps: OptimizeSteps): Array<Record<string, unknown>> {
     if (steps.textures.supercompression !== "none") {
       textures.supercompression = steps.textures.supercompression;
     }
+    if (steps.textures.apply_rules) {
+      textures.apply_rules = true;
+      if (steps.textures.rules.length > 0) {
+        textures.rules = steps.textures.rules.map((r) => ({ ...r }));
+      }
+    }
+    if (steps.textures.reencode_ktx2) textures.reencode_ktx2 = true;
     const overrides = getTextureOverrides(app.sourcePath);
     if (overrides.length > 0) textures.overrides = overrides.map((o) => ({ ...o }));
     out.push({ textures });
@@ -876,6 +883,15 @@ export function createRunFlow(deps: RunDeps): RunApi {
             if (p.supercompression === "zstd" || p.supercompression === "none") {
               steps.textures.supercompression = p.supercompression;
             }
+            steps.textures.apply_rules = flag(p.apply_rules, false);
+            steps.textures.reencode_ktx2 = flag(p.reencode_ktx2, false);
+            if (Array.isArray(p.rules)) {
+              steps.textures.rules = p.rules.filter(
+                (r): r is TextureRule => !!r && typeof r === "object" && !Array.isArray(r),
+              );
+            } else {
+              steps.textures.rules = [];
+            }
             const list = p.overrides;
             if (Array.isArray(list)) {
               for (const item of list) {
@@ -1086,7 +1102,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
   async function maybeRun(): Promise<void> {
     const path = app.sourcePath;
     if (!path || running) return;
-    if (steps().textures.enabled) {
+    if (steps().textures.enabled && !steps().textures.reencode_ktx2) {
       const images = await sourceImages();
       if (images && images.length > 0 && !images.some(isEncodableImage)) {
         showGuard(t("opt.ktx2Guard"), () => void doRun());
