@@ -44,6 +44,8 @@ jobs:
         with:
           version: 0.17.0
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
       # Fresh dist, so the GUI in the release is never stale.
       - run: bun install
         working-directory: app/web
