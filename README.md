@@ -37,16 +37,17 @@ On Linux, unpack and run `sh install.sh` to install the desktop launcher, icon a
 
 ### Build from source
 
-Requires [Zig 0.17.0](https://ziglang.org) and [bun](https://bun.sh) (frontend only):
+Requires [Zig 0.17.0](https://ziglang.org) and [bun](https://bun.sh) (frontend build runs automatically):
 
 ```sh
 git clone <repo> && cd assetty
-(cd app/web && bun install && bun run build)   # frontend → app/web/dist
-zig build                                      # zig-out/bin/assetty (CLI + app)
+(cd app/web && bun install)                    # once
+zig build                                      # zig-out/bin/assetty (CLI + app); builds frontend too
 zig build test --summary all                   # test suite
 zig build -Dapp=false                          # CLI-only binary
 zig build -Dtarget=x86_64-windows-gnu          # cross-compile: also aarch64-linux-gnu, x86_64-linux-gnu
 zig build -Dversion=0.2.0 -Drepo=owner/name    # bake release identity
+zig build -Dstrip=false                        # keep debug info (default: stripped except -Doptimize=Debug)
 ```
 
 | OS | app shell | runtime deps |

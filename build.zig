@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Files under app/web/dist served to the app's webview, relative to `dist`.
-/// Contains a placeholder when the frontend has not been built yet.
+/// Built automatically by `ensureFrontend` when missing or stale.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // The desktop app shell: nanoui is cross-platform (AppKit/WebKit on
@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
     // tests pass. Trade-off: ReleaseFast disables runtime safety (OOB/overflow
     // checks) — malformed inputs may crash instead of erroring cleanly.
     const optimize = b.option(std.builtin.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
+    // Release binaries ship stripped: no DWARF, smaller download, panic traces
+    // in optimized code are near-useless anyway. `-Dstrip=false` keeps debug
+    // info for profiling release builds.
+    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .debug);
+
+    // One-command build: refresh app/web/dist before distAssets() embeds it.
+    if (want_app) ensureFrontend(b);
 
     const cgltf_mod = b.addTranslateC(.{
         .root_source_file = b.path("vendor/cgltf/cgltf.h"),
@@ -220,6 +227,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = exe_imports,
         }),
     });
@@ -272,6 +280,72 @@ pub fn build(b: *std.Build) void {
             },
         }) });
         test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    }
+}
+
+/// Runs `bun run build` in app/web when dist is missing or older than the
+/// frontend sources, so `zig build` alone always embeds a fresh webview UI.
+/// npm is tried as a fallback. A stale-but-present dist is tolerated with a
+/// warning (e.g. no JS runtime installed); a missing dist is fatal.
+fn ensureFrontend(b: *std.Build) void {
+    const io = b.graph.io;
+    const gpa = b.allocator;
+    const web_rel = "app/web";
+    const dist_index = web_rel ++ "/dist/index.html";
+
+    const dist_mtime: ?i128 = blk: {
+        const st = std.Io.Dir.cwd().statFile(io, dist_index, .{}) catch break :blk null;
+        break :blk st.mtime.nanoseconds;
+    };
+
+    var stale = dist_mtime == null;
+    if (!stale) {
+        const limit = dist_mtime.?;
+        var web_dir = std.Io.Dir.cwd().openDir(io, web_rel, .{ .iterate = true }) catch
+            @panic("assetty: cannot open app/web");
+        defer web_dir.close(io);
+        var walker = web_dir.walk(gpa) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            // Third-party tree and the build output itself never trigger a
+            // rebuild; `leave` skips descending into them.
+            if (entry.kind == .directory and
+                (std.mem.eql(u8, entry.basename, "node_modules") or
+                    std.mem.eql(u8, entry.basename, "dist")))
+            {
+                walker.leave(io);
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            const st = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+            if (st.mtime.nanoseconds > limit) {
+                stale = true;
+                break;
+            }
+        }
+    }
+    if (!stale) return;
+
+    std.debug.print("assetty: frontend out of date, building app/web ...\n", .{});
+    const toolchains = [_][]const []const u8{
+        &.{ "bun", "run", "build" },
+        &.{ "npm", "run", "build" },
+    };
+    var result: ?std.process.RunResult = null;
+    for (toolchains) |argv| {
+        result = std.process.run(gpa, io, .{ .argv = argv, .cwd = .{ .path = web_rel } }) catch continue;
+        break;
+    }
+
+    if (result) |res| {
+        if (res.term != .exited or res.term.exited != 0) {
+            std.debug.print("{s}{s}", .{ res.stdout, res.stderr });
+            @panic("assetty: frontend build failed (bun run build in app/web)");
+        }
+    } else if (dist_mtime != null) {
+        std.debug.print("assetty: bun/npm not found — embedding possibly stale app/web/dist\n", .{});
+    } else {
+        @panic("assetty: app/web/dist missing and neither bun nor npm found — install bun (https://bun.sh) and run `bun install` in app/web");
     }
 }
 

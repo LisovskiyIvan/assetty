@@ -38,8 +38,16 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      # app/web/dist is committed, so no bun needed here.
+      # app/web/dist is untracked — build.zig auto-builds it via bun when
+      # missing/stale, so bun must be present before zig build.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install
+        working-directory: app/web
       - run: zig build test --summary all
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
   build-windows:
     runs-on: windows-latest
@@ -48,9 +56,19 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+      # app/web/dist is untracked — build.zig auto-builds it via bun when
+      # missing/stale, so install frontend deps up front.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install
+        working-directory: app/web
       # Explicit gnu target: same cross config the release matrix ships, and
       # it does not depend on the runner's MSVC environment.
+      # NODE_OPTIONS: the spawned frontend build OOMs at default node heap.
       - run: zig build -Dtarget=x86_64-windows-gnu --summary all
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       # Stage WebView2Loader.dll + license next to the GUI exe (nanoui loads
       # it dynamically; without it the GUI falls back even with the runtime
       # installed). Must run before the smoke so zig-out/bin matches the ZIP.

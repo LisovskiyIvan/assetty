@@ -16,7 +16,12 @@ import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { Material } from "@babylonjs/core/Materials/material";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
-import "@babylonjs/loaders/glTF";
+// Full 2.0 extension set (viewer previews arbitrary user GLBs: unlit,
+// texture transform, punctual lights, quantization, etc.) + the SceneLoader
+// plugin. Drops only the legacy glTF 1.0 loader and validation. Meshopt and
+// KHR_texture_basisu stay registered (meshopt also via meshopt.ts).
+import "@babylonjs/loaders/glTF/glTFFileLoader";
+import "@babylonjs/loaders/glTF/2.0";
 import { b64ToBytes } from "./bridge";
 import { t } from "./i18n";
 import { notify } from "./notify";

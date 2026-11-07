@@ -11,8 +11,8 @@ export default defineConfig({
     assetsDir: "assets",
     target: "es2022",
     sourcemap: false,
-    assetsInlineLimit: 1024 * 1024,
-    chunkSizeWarningLimit: 8000,
+    assetsInlineLimit: 4096,
+    chunkSizeWarningLimit: 1500,
     emptyOutDir: true,
   },
   server: {
