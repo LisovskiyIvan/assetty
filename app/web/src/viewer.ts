@@ -381,22 +381,29 @@ export class ViewerScene {
     this.requestRender(30);
   }
 
+  /**
+   * Scene-level textures that survive model swaps: the IBL map is set
+   * explicitly; the BRDF lookup tables are created lazily by the PBR materials
+   * and cached on the scene, so disposing them leaves the scene property
+   * pointing at a dead texture that never becomes ready again — every PBR
+   * material then waits forever and the next loaded model never renders.
+   * Also excluded from model-texture stats.
+   */
+  private keptSceneTextures(): Set<BaseTexture | null> {
+    return new Set<BaseTexture | null>([
+      this.scene.environmentTexture,
+      this.scene.environmentBRDFTexture,
+      this.scene.environmentFuzzBRDFTexture,
+    ]);
+  }
+
   clearScene(): void {
     this.loadedModel = false;
     this.highlight.removeAllMeshes();
     this.scene.animationGroups.slice().forEach((g) => g.stop());
     this.scene.meshes.slice().forEach((m) => m.dispose());
     this.scene.materials.slice().forEach((m) => m.dispose());
-    // Scene-level textures survive model swaps. The IBL map is set explicitly;
-    // the BRDF lookup tables are created lazily by the PBR materials and cached
-    // on the scene, so disposing them leaves the scene property pointing at a
-    // dead texture that never becomes ready again: every PBR material then
-    // waits forever and the next loaded model never renders.
-    const keep = new Set<BaseTexture | null>([
-      this.scene.environmentTexture,
-      this.scene.environmentBRDFTexture,
-      this.scene.environmentFuzzBRDFTexture,
-    ]);
+    const keep = this.keptSceneTextures();
     this.scene.textures
       .filter((t) => !keep.has(t))
       .slice()
@@ -468,9 +475,8 @@ export class ViewerScene {
     for (const mesh of this.scene.meshes) {
       if (mesh.material) materials.add(mesh.material);
     }
-    const env = this.scene.environmentTexture;
     const textures = this.scene.textures.filter(
-      (t) => t !== env && t.getClassName() !== "RenderTargetTexture",
+      (t) => !this.keptSceneTextures().has(t) && t.getClassName() !== "RenderTargetTexture",
     ).length;
     return {
       // No frames are being produced while the loop is stopped.
