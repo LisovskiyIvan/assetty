@@ -82,15 +82,6 @@ The installer creates ~/.local/bin/assetty; follow its PATH instruction if neede
 Settings: ~/Library/Application Support/assetty/
 Temporary results: ~/Library/Caches/assetty/results/
 EOF
-    # A familiar drag-to-Applications installer; the updater still uses ZIP.
-    if command -v hdiutil >/dev/null 2>&1; then
-      dmg_root="out/$folder-dmg"
-      mkdir -p "$dmg_root"
-      cp -R "out/$folder/assetty.app" "$dmg_root/assetty.app"
-      ln -s /Applications "$dmg_root/Applications"
-      hdiutil create -quiet -volname assetty -srcfolder "$dmg_root" -ov -format UDZO "out/assetty-$os-$arch.dmg"
-      rm -rf "$dmg_root"
-    fi
     ;;
   windows)
     cp "$bin" "out/$folder/"

@@ -26,8 +26,15 @@ jobs:
       - run: bun test src
       - run: bun install -g oxlint
       - run: oxlint src
+      # Zig jobs embed the same dist instead of rebuilding it per runner.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: app/web/dist
+          if-no-files-found: error
 
   test:
+    needs: frontend
     strategy:
       fail-fast: false
       matrix:
@@ -38,37 +45,47 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      # app/web/dist is untracked — build.zig auto-builds it via bun when
-      # missing/stale, so bun must be present before zig build.
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/cache@v4
         with:
-          bun-version: 1.4.4
-      - run: bun install
-        working-directory: app/web
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-test-${{ matrix.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/**') }}
+          restore-keys: zig-test-${{ matrix.os }}-
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: app/web/dist
+      # Artifact mtimes can predate checkout — build.zig's staleness check
+      # compares against dist/index.html, so keep it newest.
+      - run: touch app/web/dist/index.html
       - run: zig build test --summary all
-        env:
-          NODE_OPTIONS: --max-old-space-size=6144
 
   build-windows:
+    needs: frontend
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      # app/web/dist is untracked — build.zig auto-builds it via bun when
-      # missing/stale, so install frontend deps up front.
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/cache@v4
         with:
-          bun-version: 1.4.4
-      - run: bun install
-        working-directory: app/web
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-test-windows-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/**') }}
+          restore-keys: zig-test-windows-
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: app/web/dist
+      # Artifact mtimes can predate checkout — build.zig's staleness check
+      # compares against dist/index.html, so keep it newest.
+      - run: touch app/web/dist/index.html
       # Explicit gnu target: same cross config the release matrix ships, and
       # it does not depend on the runner's MSVC environment.
-      # NODE_OPTIONS: the spawned frontend build OOMs at default node heap.
       - run: zig build -Dtarget=x86_64-windows-gnu --summary all
-        env:
-          NODE_OPTIONS: --max-old-space-size=6144
       # Stage WebView2Loader.dll + license next to the GUI exe (nanoui loads
       # it dynamically; without it the GUI falls back even with the runtime
       # installed). Must run before the smoke so zig-out/bin matches the ZIP.

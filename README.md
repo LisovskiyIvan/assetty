@@ -10,13 +10,12 @@ Grab a build from [GitHub Releases](../../releases):
 
 | asset | platform | notes |
 |---|---|---|
-| `assetty-macos-arm64.dmg` | macOS 12+ (Apple Silicon) | drag `assetty.app` to Applications |
-| `assetty-macos-arm64.zip` | macOS 12+ (Apple Silicon) | same app; also used by the updater |
+| `assetty-macos-arm64.zip` | macOS 12+ (Apple Silicon) | unzip, drag `assetty.app` to Applications; also used by the updater |
 | `assetty-windows-x64.zip` | Windows 10/11 x64 | WebView2 preinstalled on Win10/11 |
 | `assetty-linux-x64.tar.gz` | Linux x64 | needs GTK 3/4 + WebKitGTK 2.40+ (`sudo apt install libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`) |
 | `assetty-linux-arm64.tar.gz` | Linux ARM64 | same |
 
-On macOS, open the DMG and drag `assetty.app` to Applications. Double-click the app for the GUI, use **Open With → assetty** on a `.glb`, or drop a model on the Dock icon. The app remains unsigned: Gatekeeper approval may still be required on the first launch.
+On macOS, unzip and drag `assetty.app` to Applications. Double-click the app for the GUI, use **Open With → assetty** on a `.glb`, or drop a model on the Dock icon. The app remains unsigned: Gatekeeper approval may still be required on the first launch.
 
 The same binary is also the CLI. To install the `assetty` command for your user (no sudo):
 
