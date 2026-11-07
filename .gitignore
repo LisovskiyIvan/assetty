@@ -3,6 +3,7 @@ out/
 .zig-cache/
 .DS_Store
 app/web/node_modules/
+app/web/dist/
 zig-pkg/
 assetty.settings.json
 test/corpus/
