@@ -143,6 +143,10 @@ pub const TextureParams = struct {
     /// Encoder quality knob, 0..255 (ETC1S/generic use it directly).
     quality: u8 = 128,
     /// Rate-distortion trade-off for ETC1S/UASTC; higher = smaller, worse.
+    /// Measured on BoomBox (BC7/UASTC q255, desktop): 0.5 vs 1.0 encode to
+    /// byte-identical outputs with wall time inside run-to-run noise, so the
+    /// desktop preset ships 0.5 (lighter RDO, same bytes). The 1.0 struct
+    /// default is kept so presets that omit the field stay byte-identical.
     rdo_lambda: f32 = 1.0,
     /// Re-normalize normal maps after compression.
     normal_maps_renormalize: bool = true,
@@ -280,6 +284,7 @@ pub const TextureOverride = struct {
     skip: bool = false,
     format: ?TextureFormat = null,
     quality: ?u8 = null,
+    rdo_lambda: ?f32 = null,
     max_size: ?u32 = null,
     generate_mips: ?bool = null,
     normal_map: ?bool = null,
@@ -418,12 +423,19 @@ const desktop_steps = [_]Step{
     .{ .dedup = .{} },
     .{ .weld = .{} },
     .{ .join = .{} },
-    .{ .textures = .{
-        .format = .bc7,
-        .quality = 255,
-        .generate_mips = true,
-    } },
-    .{ .quantize = .{} },
+    .{
+        .textures = .{
+            .format = .bc7,
+            .quality = 255,
+            // 0.5 RDO: byte-identical to 1.0 at q255 (BoomBox), less compute.
+            .rdo_lambda = 0.5,
+            .generate_mips = true,
+            // UASTC payload zstd (scheme 2): smaller disk bytes, same VRAM after
+            // GPU decode. Ignored for ETC1S.
+            .supercompression = .zstd,
+        },
+    },
+    .{ .quantize = .{ .meshopt_compression = true } },
 };
 
 const web_steps = [_]Step{
@@ -580,8 +592,15 @@ test "parse desktop preset file" {
     const tex = p.steps[4].textures;
     try testing.expectEqual(TextureFormat.bc7, tex.format);
     try testing.expectEqual(@as(u8, 255), tex.quality);
+    try testing.expectEqual(@as(f32, 0.5), tex.rdo_lambda);
     try testing.expect(tex.generate_mips);
     try testing.expectEqual(@as(u32, 0), tex.max_size);
+    try testing.expectEqual(Supercompression.zstd, tex.supercompression);
+
+    const q = p.steps[5].quantize;
+    try testing.expectEqual(@as(u5, 14), q.position_bits);
+    try testing.expectEqual(@as(u5, 12), q.uv_bits);
+    try testing.expect(q.meshopt_compression); // desktop ships meshopt (round-trip in ops tests)
 }
 
 test "parse web preset file" {
@@ -821,6 +840,7 @@ test "parse textures overrides round-trip" {
     try testing.expectEqual(@as(?u32, 2), o0.image);
     try testing.expectEqual(TextureFormat.uastc, o0.format.?);
     try testing.expectEqual(@as(?u8, 200), o0.quality);
+    try testing.expectEqual(@as(?f32, null), o0.rdo_lambda);
     try testing.expectEqual(@as(?u32, 512), o0.max_size);
     try testing.expectEqual(@as(?bool, true), o0.generate_mips);
     try testing.expectEqual(@as(?bool, true), o0.normal_map);

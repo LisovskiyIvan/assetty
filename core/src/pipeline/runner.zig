@@ -299,8 +299,13 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     // created may go; a pre-existing file at `out_path` (CLI same-path
     // reruns, deterministic LOD names) is never deleted by the runner.
     const out_preexisted: bool = if (std.Io.Dir.cwd().statFile(io, opts.out_path, .{})) |_| true else |err| err != error.FileNotFound;
-    const bytes = try write.serialize(a, loaded.cdata, loaded.map);
+    // Serialize in a scratch arena: the output buffer (tens of MiB) is freed
+    // before the after-stats reload maps + parses the file again, instead of
+    // sitting in the caller's arena next to a second copy of the model.
+    var ser_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    const bytes = try write.serialize(ser_arena.allocator(), loaded.cdata, loaded.map);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = opts.out_path, .data = bytes });
+    ser_arena.deinit();
     // A cancel that landed mid-run must not leave a half-adopted output
     // behind — unless the file predates this run (see above).
     if (isCancelled(opts)) {
@@ -411,6 +416,7 @@ pub fn resolveTextureFull(
         eff.skip = o.skip;
         if (o.format) |f| eff.format = f;
         if (o.quality) |q| eff.quality = q;
+        if (o.rdo_lambda) |l| eff.rdo_lambda = l;
         if (o.max_size) |m| eff.max_size = m;
         if (o.generate_mips) |g| eff.generate_mips = g;
         if (o.normal_map) |n| eff.normal_map = n;
@@ -660,6 +666,53 @@ fn envInnerOverride() ?usize {
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
 }
 
+/// Default cap (MiB) on the estimated concurrent texture-encode footprint.
+/// Calibrated on 10-core arm64: AntiqueCamera (6x2048px, 16 MiB RGBA each)
+/// went 898 MB MaxRSS at 4 outer workers -> ~604 MB at 2, ~538 MB at 1, so
+/// each concurrent 16 MiB-RGBA encode holds ~90-150 MiB in flight (decoded
+/// RGBA + mip pyramid + KTX2 copy + basisu scratch); 8x the RGBA size covers
+/// it with headroom. At 320 MiB a 16 MiB-max-RGBA model gets 2 workers
+/// (~600 MB peak, +14% wall vs 4 workers); a lone 4096px image (64 MiB RGBA)
+/// gets floor(320/512) = 1 worker. Override with ASSETTY_TEX_BUDGET_MB.
+pub const tex_budget_default_mib: usize = 320;
+
+/// Estimated in-flight bytes per byte of decoded RGBA for one encode worker.
+pub const tex_bytes_per_rgba_byte: usize = 8;
+
+/// Byte budget for concurrent texture encodes: ASSETTY_TEX_BUDGET_MB (MiB),
+/// or the default above when unset, unparsable, or 0.
+fn envTexBudgetBytes() usize {
+    if (std.c.getenv("ASSETTY_TEX_BUDGET_MB")) |v| {
+        const mib = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+        if (mib > 0) return mib * 1024 * 1024;
+    }
+    return tex_budget_default_mib * 1024 * 1024;
+}
+
+/// Largest decoded RGBA footprint (w*h*4) over images with known dims.
+/// 0 when no image reports dims: the budget clamp cannot estimate and yields
+/// to the default cap.
+fn maxRgbaBytes(asset_images: []const model.Image) usize {
+    var max: usize = 0;
+    for (asset_images) |im| {
+        if (!im.has_dims or im.width == 0 or im.height == 0) continue;
+        const px = @as(usize, im.width) * im.height;
+        const rgba = std.math.mul(usize, px, 4) catch std.math.maxInt(usize);
+        if (rgba > max) max = rgba;
+    }
+    return max;
+}
+
+/// Outer workers allowed by the byte budget: floor(budget / (max_rgba*8)),
+/// clamped to [1, max_parallel_encodes]. The ASSETTY_TEX_OUTER override still
+/// wins over this (applied after); unknown dims yield the default cap.
+pub fn budgetWorkers(max_rgba: usize, budget: usize) usize {
+    if (max_rgba == 0) return max_parallel_encodes;
+    const est = std.math.mul(usize, max_rgba, tex_bytes_per_rgba_byte) catch std.math.maxInt(usize);
+    if (est == 0) return max_parallel_encodes;
+    return @min(@max(budget / est, 1), max_parallel_encodes);
+}
+
 /// One image to encode, in `cdata.images` order, with its resolved params.
 const ImageJob = struct {
     bytes: []const u8,
@@ -815,6 +868,9 @@ fn encodeTexturesWith(
 
     const images = geom.sl(c.cgltf_image, loaded.cdata.images, loaded.cdata.images_count);
     var n_threads = @min(thread_cap, encodeThreadCount(images.len));
+    // Budget clamp: never run more concurrent encodes than the byte budget
+    // allows for the largest image. Explicit ASSETTY_TEX_OUTER still wins.
+    n_threads = @min(n_threads, budgetWorkers(maxRgbaBytes(loaded.asset.images), envTexBudgetBytes()));
     if (envOuterOverride()) |o| n_threads = @max(1, @min(o, images.len));
     if (n_threads <= 1) {
         try encodeImagesSequential(a, loaded.cdata, loaded.asset.images, p, target, images, &gb, &pending, &res, details_ptr, prog);
@@ -1564,6 +1620,41 @@ test "textures overrides: resolve order and matching" {
     const zp: preset.TextureParams = .{ .supercompression = .zstd, .overrides = &zovs };
     try testing.expectEqual(preset.Supercompression.none, resolveTextureOverride(zp, 1, "tex1", null).supercompression);
     try testing.expectEqual(preset.Supercompression.zstd, resolveTextureOverride(zp, 2, "other", null).supercompression);
+
+    // rdo_lambda: base 1.0, rule/override replace it, override wins over rule.
+    const lovs = [_]preset.TextureOverride{
+        .{ .image = 3, .rdo_lambda = 0.25 },
+    };
+    const lrules = [_]preset.TexRule{
+        .{ .name = "wall", .rdo_lambda = 0.5 },
+    };
+    const lp: preset.TextureParams = .{ .apply_rules = true, .rules = &lrules, .overrides = &lovs };
+    try testing.expectEqual(@as(f32, 0.5), resolveTextureFull(lp, 0, "wall", null, .{ .min_side = 512 }).rdo_lambda);
+    try testing.expectEqual(@as(f32, 0.25), resolveTextureFull(lp, 3, "wall", null, .{ .min_side = 512 }).rdo_lambda);
+    try testing.expectEqual(@as(f32, 1.0), resolveTextureFull(lp, 4, "other", null, .{ .min_side = 512 }).rdo_lambda);
+}
+
+test "budgetWorkers clamps outer workers to the byte budget" {
+    const mib: usize = 1024 * 1024;
+    // Unknown dims: no estimate, default cap.
+    try testing.expectEqual(max_parallel_encodes, budgetWorkers(0, 320 * mib));
+    // 16 MiB RGBA (2048px): est 128 MiB/worker.
+    try testing.expectEqual(@as(usize, 2), budgetWorkers(16 * mib, 320 * mib));
+    try testing.expectEqual(@as(usize, 4), budgetWorkers(16 * mib, 8 * 1024 * mib));
+    // 64 MiB RGBA (4096px): est 512 MiB > budget -> single worker, never 0.
+    try testing.expectEqual(@as(usize, 1), budgetWorkers(64 * mib, 320 * mib));
+    try testing.expectEqual(@as(usize, 1), budgetWorkers(64 * mib, 1 * mib));
+    // Tiny images never exceed the default cap.
+    try testing.expectEqual(max_parallel_encodes, budgetWorkers(64 * 1024, 320 * mib));
+
+    // maxRgbaBytes: largest w*h*4 with known dims, 0 when all unknown.
+    const no_dims = [_]model.Image{ .{}, .{} };
+    try testing.expectEqual(@as(usize, 0), maxRgbaBytes(&no_dims));
+    const some = [_]model.Image{
+        .{ .width = 2048, .height = 2048, .has_dims = true },
+        .{ .width = 512, .height = 256, .has_dims = true },
+    };
+    try testing.expectEqual(@as(usize, 2048 * 2048 * 4), maxRgbaBytes(&some));
 }
 
 test "textures rules: first match wins, suffix, slot, skip" {

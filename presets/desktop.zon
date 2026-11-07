@@ -15,19 +15,24 @@
         } },
         .{ .weld = .{ .tolerance = 0.0 } },
         .{ .join = .{} },
-        .{ .textures = .{
-            .format = .bc7,
-            .quality = 255,
-            .rdo_lambda = 1.0,
-            .normal_maps_renormalize = true,
-            .generate_mips = true,
-            .max_size = 0,
-        } },
+        .{
+            .textures = .{
+                .format = .bc7,
+                .quality = 255,
+                // 0.5 RDO: byte-identical to 1.0 at q255 (BoomBox bench), less compute.
+                .rdo_lambda = 0.5,
+                .normal_maps_renormalize = true,
+                .generate_mips = true,
+                .max_size = 0,
+                // UASTC payload zstd (scheme 2): smaller disk bytes, VRAM unchanged.
+                .supercompression = .zstd,
+            },
+        },
         .{ .quantize = .{
             .position_bits = 14,
             .normal_oct = true,
             .uv_bits = 12,
-            .meshopt_compression = false,
+            .meshopt_compression = true,
         } },
     },
 }

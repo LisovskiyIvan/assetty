@@ -340,6 +340,13 @@ fn parseTextureOverrides(a: Allocator, v: ?std.json.Value) SpecError![]preset.Te
         if (fields.get("quality")) |qv| {
             if (qv == .integer) o.quality = std.math.cast(u8, qv.integer);
         }
+        if (fields.get("rdo_lambda")) |lv| {
+            o.rdo_lambda = switch (lv) {
+                .float => |f| std.math.lossyCast(f32, f),
+                .integer => |i| @floatFromInt(i),
+                else => null,
+            };
+        }
         if (fields.get("max_size")) |mv| {
             if (mv == .integer) o.max_size = std.math.cast(u32, mv.integer);
         }
@@ -565,8 +572,15 @@ test "spec maps textures overrides" {
     try testing.expectEqual(@as(?u32, 2), tex.overrides[0].image);
     try testing.expectEqual(preset.TextureFormat.uastc, tex.overrides[0].format.?);
     try testing.expectEqual(@as(?u8, 200), tex.overrides[0].quality);
+    try testing.expectEqual(@as(?f32, null), tex.overrides[0].rdo_lambda);
     try testing.expectEqualStrings("basecolor", tex.overrides[1].name);
     try testing.expect(tex.overrides[2].skip);
+
+    // rdo_lambda parses from float and integer JSON numbers; others stay null.
+    var d2: []const u8 = "";
+    const q = try parseSpec(a, "{\"steps\":[{\"textures\":{\"overrides\":[{\"image\":0,\"rdo_lambda\":0.5},{\"image\":1,\"rdo_lambda\":2}]}}]}", &d2);
+    try testing.expectEqual(@as(?f32, 0.5), q.steps[0].textures.overrides[0].rdo_lambda);
+    try testing.expectEqual(@as(?f32, 2.0), q.steps[0].textures.overrides[1].rdo_lambda);
 }
 
 test "spec maps quantize meshopt_compression" {

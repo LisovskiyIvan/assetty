@@ -109,6 +109,10 @@ extern "C" int basset_basisu_encode(const uint8_t* rgba, int32_t w, int32_t h,
     cp.m_pack_uastc_ldr_4x4_flags = static_cast<uint32_t>(uastc_level);
     cp.m_rdo_uastc_ldr_4x4 = rdo_lambda > 0.0f;
     cp.m_rdo_uastc_ldr_4x4_quality_scalar = rdo_lambda > 0.0f ? rdo_lambda : 1.0f;
+    // UASTC RDO post-process parallelizes over the same job pool as the
+    // encode (basisU caps it at 4 RDO threads internally). The param defaults
+    // to true upstream, but set it explicitly: same blocks out, N threads in.
+    cp.m_rdo_uastc_ldr_4x4_multithreading = true;
 
     cp.m_create_ktx2_file = true;
     cp.m_ktx2_srgb_transfer_func = srgb && !normal_map;
