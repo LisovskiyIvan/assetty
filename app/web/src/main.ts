@@ -647,7 +647,12 @@ const updateStatusBar = (): void => {
   set(status.disk, info ? fmtBytes(info.disk.total) : "—");
 };
 
-setInterval(updateStatusBar, 500);
+setInterval(() => {
+  // A hidden page produces no frames; skip the stat sweep so the JS thread
+  // can sleep (status bar repaints on the next visible tick anyway).
+  if (document.hidden) return;
+  updateStatusBar();
+}, 500);
 updateStatusBar();
 
 app.on("source", () => updateStatusBar());
@@ -685,7 +690,15 @@ if (app.bridge.live) {
     }
   };
   void readOpenFiles();
-  const openFilesTimer = window.setInterval(() => void readOpenFiles(), 750);
+  const openFilesTimer = window.setInterval(() => {
+    // Dock/menu opens queue on the host; no need to poll while hidden — the
+    // visibility listener below drains the queue as soon as we show again.
+    if (document.hidden) return;
+    void readOpenFiles();
+  }, 750);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void readOpenFiles();
+  });
   window.addEventListener("pagehide", () => window.clearInterval(openFilesTimer), { once: true });
 }
 

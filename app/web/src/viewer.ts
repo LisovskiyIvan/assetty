@@ -61,6 +61,7 @@ export class ViewerScene {
   readonly camera: ArcRotateCamera;
   readonly highlight: HighlightLayer;
   private resizeObserver: ResizeObserver;
+  private inputAbort = new AbortController();
   private disposed = false;
   private envWatchdog: ReturnType<typeof setTimeout> | null = null;
 
@@ -120,7 +121,22 @@ export class ViewerScene {
     });
     this.highlight.innerGlow = false;
 
-    this.engine.runRenderLoop(this.renderLoop);
+    // Render-on-demand: anything that changes the picture re-arms a short
+    // burst of frames; the loop stops itself once the scene settles, so an
+    // idle tab costs no GPU. Camera inertia keeps firing view-matrix changes
+    // from inside the loop, which re-arms it until the camera rests.
+    this.camera.onViewMatrixChangedObservable.add(() => this.requestRender());
+    this.scene.onNewMeshAddedObservable.add(() => this.requestRender());
+    this.scene.onDataLoadedObservable.add(() => this.requestRender());
+    this.scene.onEnvironmentTextureChangedObservable.add(() => this.requestRender());
+    // Input arrives while the loop is stopped (nothing to fire the hooks
+    // above until a frame runs): wake the loop explicitly. Camera inertia
+    // then keeps it awake via the view-matrix hook until the camera rests.
+    this.scene.onPointerObservable.add(() => this.requestRender());
+    const { signal } = this.inputAbort;
+    canvas.addEventListener("wheel", () => this.requestRender(), { passive: true, signal });
+    canvas.addEventListener("keydown", () => this.requestRender(), { signal });
+    this.requestRender(30);
 
     // Snapshot the engine's per-frame draw call counter (otherwise it accumulates).
     const drawCounter = (this.engine as unknown as { _drawCalls?: { fetchNewFrame?: () => void } })
@@ -216,24 +232,47 @@ export class ViewerScene {
   };
 
   private renderLoop = (): void => {
-    if (!this.disposed) this.scene.render();
+    if (this.disposed) return;
+    this.scene.render();
+    if (this.settleLeft > 0 && --this.settleLeft === 0) {
+      this.engine.stopRenderLoop();
+      this.running = false;
+    }
   };
 
-  private running = true;
+  private running = false;
+  /** Frames left in the current burst (lets uploads/post settle). */
+  private settleLeft = 0;
+  /** Burst length re-armed by every dirty signal. */
+  private static readonly SETTLE_FRAMES = 8;
+
+  /**
+   * Schedules `frames` of rendering, starting the loop if it stopped. The
+   * loop stops itself once the scene settles — call this after any change
+   * that needs painting (loads, selection, camera writes from outside).
+   */
+  requestRender(frames: number = ViewerScene.SETTLE_FRAMES): void {
+    if (this.disposed) return;
+    this.settleLeft = Math.max(this.settleLeft, frames);
+    if (!this.running) {
+      this.running = true;
+      this.engine.runRenderLoop(this.renderLoop);
+    }
+  }
 
   /** Stops rendering while the tab is hidden (saves GPU on background tabs). */
   pause(): void {
     if (this.disposed || !this.running) return;
     this.engine.stopRenderLoop();
     this.running = false;
+    this.settleLeft = 0;
   }
 
   resume(): void {
     if (this.disposed) return;
     this.resize();
-    if (this.running) return;
-    this.engine.runRenderLoop(this.renderLoop);
-    this.running = true;
+    // Repaint once; further frames only if something is still dirty.
+    this.requestRender();
   }
 
   /** Loads a GLB from a base64 payload (what `loadBytes` returns). */
@@ -252,6 +291,7 @@ export class ViewerScene {
     this.frameAll();
     this.forceResize();
     this.onProgress?.(undefined as unknown as string);
+    this.requestRender(30);
     this.scheduleTextureAudit();
   }
 
@@ -330,6 +370,7 @@ export class ViewerScene {
 
     this.frameAll();
     this.forceResize();
+    this.requestRender(30);
   }
 
   clearScene(): void {
@@ -423,7 +464,8 @@ export class ViewerScene {
       (t) => t !== env && t.getClassName() !== "RenderTargetTexture",
     ).length;
     return {
-      fps: this.engine.getFps(),
+      // No frames are being produced while the loop is stopped.
+      fps: this.running ? this.engine.getFps() : 0,
       meshes: this.scene.meshes.length,
       triangles: Math.round(indices / 3),
       drawCalls,
@@ -446,7 +488,10 @@ export class ViewerScene {
   selectMesh(mesh: AbstractMesh | null): void {
     this.highlight.removeAllMeshes();
     this.highlighted = null;
-    if (!mesh) return;
+    if (!mesh) {
+      this.requestRender();
+      return;
+    }
     const color = new Color3(0.31, 0.64, 1);
     // HighlightLayer only accepts concrete meshes; instanced/abstract nodes are skipped.
     const asMesh = (m: AbstractMesh) => (m.getTotalVertices() > 0 ? (m as unknown as Mesh) : null);
@@ -457,6 +502,7 @@ export class ViewerScene {
       if (childMesh) this.highlight.addMesh(childMesh, color);
     }
     this.highlighted = mesh;
+    this.requestRender();
   }
 
   get selectedMesh(): AbstractMesh | null {
@@ -471,6 +517,7 @@ export class ViewerScene {
     if (Math.abs(this.camera.radius - src.radius) > eps) this.camera.radius = src.radius;
     const t = src.target;
     if (Vector3.DistanceSquared(this.camera.target, t) > eps) this.camera.setTarget(t.clone());
+    this.requestRender();
   }
 
   dispose(): void {
@@ -478,6 +525,7 @@ export class ViewerScene {
     this.disposed = true;
     if (this.envWatchdog) clearTimeout(this.envWatchdog);
     this.envWatchdog = null;
+    this.inputAbort.abort();
     window.removeEventListener("resize", this.resize);
     this.resizeObserver.disconnect();
     this.engine.stopRenderLoop();
