@@ -6,6 +6,8 @@ const METHOD_NAMES = [
   "openDialog",
   "pickSavePath",
   "exportTo",
+  "cancelJob",
+  "pendingOpenFiles",
   "info",
   "loadBytes",
   "optimize",
@@ -104,7 +106,7 @@ export function findNative(): NativeBackend | null {
   const groups = new Map<string, Map<string, AnyFn>>();
   for (const key of Object.getOwnPropertyNames(w)) {
     const m =
-      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|discardFile|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
+      /^(.+?)_(openDialog|info|loadBytes|optimize|optimizeCustom|textures|texturePreview|textureEncode|pendingOpenFiles|cancelJob|discardFile|presets|presetLoad|presetSave|settingsLoad|settingsSave)$/.exec(
         key,
       );
     if (!m) continue;

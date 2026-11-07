@@ -404,6 +404,15 @@ export class Bridge {
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
   }
 
+  /** Paths supplied by Finder, the Dock, or a desktop launcher. */
+  async pendingOpenFiles(): Promise<string[]> {
+    if (!this.native?.methods.includes("pendingOpenFiles")) return [];
+    const result = parseMaybeJson<{ paths?: unknown }>(await this.raw("pendingOpenFiles", []));
+    return Array.isArray(result?.paths)
+      ? result.paths.filter((path): path is string => typeof path === "string")
+      : [];
+  }
+
   async openDialogAt(dir?: string | null): Promise<OpenDialogResult> {
     if (!this.live) {
       toast(t("toast.runViaBinary"), "error");
@@ -492,6 +501,24 @@ export class Bridge {
     const res = parseMaybeJson<unknown>(await this.raw("exportTo", [src, dst]));
     if (isStartedAck(res)) return { started: true };
     throw new Error("export not acknowledged by the host");
+  }
+
+  /**
+   * Asks the host to stop the in-flight pipeline job. The gate stays busy
+   * until the primary job reports its terminal event (`optimizeDone` /
+   * `lodsDone` / `textureEncodeDone` with `ok: false, error: "Cancelled"`),
+   * so callers keep everything disabled until then. Resolves
+   * `{ cancelled: false }` without a host or when the host predates the
+   * method (nothing to cancel).
+   */
+  async cancelJob(): Promise<{ cancelled: boolean }> {
+    if (!this.live) return { cancelled: false };
+    if (!this.native?.methods.includes("cancelJob")) return { cancelled: false };
+    const res = parseMaybeJson<unknown>(await this.raw("cancelJob", []));
+    if (res && typeof res === "object" && !Array.isArray(res)) {
+      return { cancelled: (res as Record<string, unknown>).cancelled === true };
+    }
+    return { cancelled: false };
   }
 
   /**

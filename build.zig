@@ -118,7 +118,6 @@ pub fn build(b: *std.Build) void {
             .root = b.path("vendor/webp"),
             .files = &.{
                 "src/dsp/dec_sse41.c",
-                "src/dsp/lossless_enc_sse41.c",
                 "src/dsp/upsampling_sse41.c",
                 "src/dsp/yuv_sse41.c",
             },
@@ -231,6 +230,15 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .windows) {
         for ([_][]const u8{ "comdlg32", "shell32", "ole32" }) |lib| {
             exe.root_module.linkSystemLibrary(lib, .{});
+        }
+        // The app never creates a console; CLI calls retain inherited streams
+        // and attach the parent's console only when one is available.
+        if (want_app) {
+            exe.subsystem = .windows;
+            exe.root_module.addWin32ResourceFile(.{
+                .file = b.path("app/resources/assetty.rc"),
+                .include_paths = &.{b.path("app/resources")},
+            });
         }
     }
 

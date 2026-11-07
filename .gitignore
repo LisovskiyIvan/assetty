@@ -1,4 +1,5 @@
 zig-out/
+out/
 .zig-cache/
 .DS_Store
 app/web/node_modules/

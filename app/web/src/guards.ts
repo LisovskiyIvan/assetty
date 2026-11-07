@@ -12,6 +12,9 @@ export function isBusyError(err: unknown): boolean {
   return /\bbusy\b|already running|job in progress/i.test(text);
 }
 
+/** Re-exported from jobs.ts (DOM-free, unit-testable); guards.ts keeps the import path. */
+export { isCancelledError } from "./jobs";
+
 /**
  * Monotonic token that invalidates late async replies (preview/encode/apply
  * races). `next()` starts a new generation; `check(token)` is true only for
@@ -41,6 +44,38 @@ export function notifyJobError(
   failText: (message: string) => string,
 ): void {
   notify(isBusyError(err) ? busyText : failText((err as Error).message), "error");
+}
+
+/**
+ * True when a key event lands in an editable field — Escape there belongs to
+ * the field (presets name, override inputs), never to job cancellation.
+ */
+export function isFormTarget(target: EventTarget | null): boolean {
+  if (!target || !(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+/**
+ * True when a menu or popover owns Escape (topbar recent-dirs / log popover,
+ * the presets dropdown, the "?" help pop). Tabs must not cancel jobs then —
+ * the open surface closes first.
+ */
+export function isOverlayOpen(): boolean {
+  return (
+    document.querySelector(
+      ".field-help-pop,.recent-menu:not([hidden]),.status-popover:not([hidden]),.preset-menu:not([hidden])",
+    ) !== null
+  );
+}
+
+/**
+ * True when the tab owning `node` is the visible one (main.ts hides inactive
+ * tabs with `display: none`). Document-level Escape handlers must ignore
+ * hidden tabs — Esc cancels only the active tab's work, never a hidden one.
+ */
+export function isTabVisible(node: HTMLElement): boolean {
+  return node.isConnected && node.offsetParent !== null;
 }
 
 /**

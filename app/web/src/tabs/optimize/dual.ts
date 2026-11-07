@@ -96,6 +96,12 @@ export function createDualView(main: HTMLElement): DualApi {
     { class: "split-grip", title: t("opt.splitDragTitle") },
     el("span", { class: "split-knob", text: "⟷" }),
   );
+  splitGrip.setAttribute("role", "slider");
+  splitGrip.setAttribute("aria-label", t("opt.splitSlider"));
+  splitGrip.setAttribute("aria-valuemin", "0");
+  splitGrip.setAttribute("aria-valuemax", "100");
+  splitGrip.setAttribute("aria-valuenow", "50");
+  splitGrip.setAttribute("aria-orientation", "horizontal");
   const splitChipLeft = el("div", { class: "split-chip left", text: t("opt.chipSource") });
   const splitChipRight = el("div", { class: "split-chip right", text: t("opt.chipOptimized") });
   const splitUi = el(
@@ -143,6 +149,7 @@ export function createDualView(main: HTMLElement): DualApi {
     rightPane.wrap.style.clipPath = `inset(0 0 0 ${x}%)`;
     splitLine.style.left = `${x}%`;
     splitGrip.style.left = `${x}%`;
+    splitGrip.setAttribute("aria-valuenow", String(Math.round(x)));
   }
 
   /**
@@ -197,6 +204,9 @@ export function createDualView(main: HTMLElement): DualApi {
     splitBtn.title = lastResult ? t("opt.splitWipeTitle") : t("opt.splitNeedResult");
     splitHint.textContent = split ? t("opt.splitHint") : t("opt.syncHint");
     splitGrip.title = t("opt.splitDragTitle");
+    splitGrip.setAttribute("aria-label", t("opt.splitSlider"));
+    splitGrip.setAttribute("aria-valuenow", String(Math.round(splitPos)));
+    splitGrip.setAttribute("aria-disabled", split ? "false" : "true");
     splitChipLeft.textContent = t("opt.chipSource");
     splitChipRight.textContent = t("opt.chipOptimized");
     leftPane.paneLabel.textContent = t("opt.original");
@@ -221,7 +231,41 @@ export function createDualView(main: HTMLElement): DualApi {
    * container (not the grip): with pointer capture they retarget to the grip
    * and bubble up here; without capture (or when the cursor outruns the
    * strip) the container still sees them. The strip sits above both canvases,
-   * so these pointerdowns never reach the master camera. */
+   * so these pointerdowns never reach the master camera. Arrow keys nudge the
+   * divider without a pointer (Home/End jump to the edges). */
+  function nudgeSplit(delta: number): void {
+    if (compareMode !== "split" || lastResult === null) return;
+    splitPos = Math.max(0, Math.min(100, splitPos + delta));
+    applySplit();
+  }
+  splitGrip.addEventListener("keydown", (ev) => {
+    switch (ev.key) {
+      case "ArrowLeft":
+      case "ArrowDown":
+        ev.preventDefault();
+        nudgeSplit(-2);
+        break;
+      case "ArrowRight":
+      case "ArrowUp":
+        ev.preventDefault();
+        nudgeSplit(2);
+        break;
+      case "Home":
+        ev.preventDefault();
+        if (compareMode === "split" && lastResult !== null) {
+          splitPos = 0;
+          applySplit();
+        }
+        break;
+      case "End":
+        ev.preventDefault();
+        if (compareMode === "split" && lastResult !== null) {
+          splitPos = 100;
+          applySplit();
+        }
+        break;
+    }
+  });
   let splitDragging = false;
   let splitRect: DOMRect | null = null;
   splitGrip.addEventListener("pointerdown", (ev) => {

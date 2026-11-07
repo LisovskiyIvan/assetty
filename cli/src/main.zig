@@ -81,7 +81,10 @@ pub fn run(init: std.process.Init) !u8 {
             break :blk 0;
         },
         .help => blk: {
-            std.debug.print("{s}\n", .{usage});
+            var buffer: [4096]u8 = undefined;
+            var output = std.Io.File.stdout().writer(init.io, &buffer);
+            try output.interface.print("{s}\n", .{usage});
+            try output.interface.flush();
             break :blk 0;
         },
         .unknown => blk: {

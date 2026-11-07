@@ -88,7 +88,25 @@ pub const Options = struct {
     out_path: []const u8,
     progress_ctx: ?*anyopaque = null,
     progress: ?ProgressFn = null,
+    /// Cooperative cancellation: when non-null, the run checks it at step
+    /// boundaries, between LOD rungs (via the caller's loop) and between
+    /// texture images, and aborts with `error.Cancelled` at the nearest
+    /// safe boundary. A single basisu encode already in flight is never
+    /// force-stopped; it finishes and the run stops right after.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
+
+fn isCancelled(opts: Options) bool {
+    const cancel = opts.cancel orelse return false;
+    return cancel.load(.acquire);
+}
+
+/// Same check for a bare flag (parallel-context plumbing passes the flag, not
+/// the whole `Options`).
+fn flagCancelled(flag: ?*const std.atomic.Value(bool)) bool {
+    const cancel = flag orelse return false;
+    return cancel.load(.acquire);
+}
 
 /// Load -> execute preset steps -> write out_path -> stats before/after.
 pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options) !Report {
@@ -110,6 +128,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     var tex_images: []const TextureImageOutcome = &.{};
 
     for (opts.preset.steps, 0..) |step, i| {
+        if (isCancelled(opts)) return error.Cancelled;
         const kind: []const u8 = @tagName(std.meta.activeTag(step));
         notify(opts, kind, if (n_steps == 0) 0.0 else @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_steps)));
 
@@ -276,8 +295,18 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
 
     // ---- 3. serialize + write --------------------------------------------
     // cgltf data (and its mmapped bytes) must outlive the serialization call.
+    // Snapshot existence first: on cancellation only an output THIS run
+    // created may go; a pre-existing file at `out_path` (CLI same-path
+    // reruns, deterministic LOD names) is never deleted by the runner.
+    const out_preexisted: bool = if (std.Io.Dir.cwd().statFile(io, opts.out_path, .{})) |_| true else |err| err != error.FileNotFound;
     const bytes = try write.serialize(a, loaded.cdata, loaded.map);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = opts.out_path, .data = bytes });
+    // A cancel that landed mid-run must not leave a half-adopted output
+    // behind — unless the file predates this run (see above).
+    if (isCancelled(opts)) {
+        if (!out_preexisted) std.Io.Dir.cwd().deleteFile(io, opts.out_path) catch {};
+        return error.Cancelled;
+    }
     notify(opts, "write", 1.0);
     const t_end = nowNs(io);
 
@@ -669,6 +698,10 @@ const ParCtx = struct {
     /// Images disposed so far (pre-skipped slots start the count; workers add
     /// each finished encode). Only touched via atomics: workers race here.
     done: std.atomic.Value(u32) = .init(0),
+    /// Cooperative cancellation source (from `ProgScope.opts.cancel`); workers
+    /// stop claiming new images once set, and the join loop reports
+    /// `error.Cancelled` instead of adopting partial results.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 const Worker = struct {
@@ -714,6 +747,9 @@ fn workerMain(w: *Worker) void {
     const ctx = w.ctx;
     const scratch = w.arena.allocator();
     while (true) {
+        // Nearest safe boundary for a parallel encode: an in-flight basisu
+        // call finishes, but no new image is claimed once cancelled.
+        if (flagCancelled(ctx.cancel)) return;
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.jobs.len) return;
         ctx.outs[i] = encodeOneJob(scratch, ctx.jobs[i]);
@@ -852,6 +888,10 @@ fn encodeImagesSequential(
     // reference is independent of whatever a previous parallel call set.
     encode_ktx.setMaxThreads(8);
     for (images, 0..) |*im, idx| {
+        // Nearest safe boundary for the sequential path: one image at a time.
+        if (prog) |ps| {
+            if (flagCancelled(ps.opts.cancel)) return error.Cancelled;
+        }
         const index: u32 = @intCast(idx);
         const ctx = ruleCtxFor(asset_images, idx);
         const eff = resolveTextureFull(p, index, cStr(im.name), cStr(im.uri), ctx);
@@ -991,6 +1031,7 @@ fn encodeImagesParallel(
         .outs = try a.alloc(EncOutcome, jobs.items.len),
         .prog = prog,
         .total = @intCast(images.len),
+        .cancel = if (prog) |ps| ps.opts.cancel else null,
     };
     @memset(ctx.outs, .{});
     // Slots skipped up front (no embedded bytes, explicit skip) count as
@@ -1026,6 +1067,14 @@ fn encodeImagesParallel(
     // Every worker is done and its KTX2 bytes already live in c_allocator, so
     // the scratch arenas can go before the views are appended.
     for (workers) |*w| w.arena.deinit();
+    // Cancelled mid-run: drop the partial encodes (their KTX2 bytes die
+    // with the arenas' copies below) instead of adopting them into the graph.
+    if (flagCancelled(ctx.cancel)) {
+        for (ctx.outs) |o| {
+            if (o.ktx2.len > 0) std.heap.c_allocator.free(o.ktx2);
+        }
+        return error.Cancelled;
+    }
     defer for (ctx.outs) |o| {
         if (o.ktx2.len > 0) std.heap.c_allocator.free(o.ktx2);
     };
@@ -1125,6 +1174,21 @@ fn progressCb(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?ProgressSub) v
     if (std.mem.eql(u8, step, "write")) log.saw_write = true;
 }
 
+/// Progress sink that requests cancellation on the first update it sees.
+const CancelSink = struct {
+    flag: *std.atomic.Value(bool),
+    calls: usize = 0,
+
+    fn cb(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?ProgressSub) void {
+        _ = step;
+        _ = pct;
+        _ = sub;
+        const self: *CancelSink = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        self.flag.store(true, .release);
+    }
+};
+
 test "run noop preset on box fixture" {
     const io = testing.io;
     const out_path = ".zig-cache/pipeline_runner_test_box.opt.glb";
@@ -1194,6 +1258,63 @@ test "run noop preset on box fixture" {
     }
 
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+}
+
+test "cancelled run never deletes a pre-existing output" {
+    const io = testing.io;
+    const out_path = ".zig-cache/pipeline_runner_test_cancel_pre.opt.glb";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = "previous-result" });
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try preset.loadFile(io, a, "test/noop.zon");
+
+    var flag: std.atomic.Value(bool) = .init(true);
+    if (run(io, a, "test/fixtures/box.glb", .{
+        .preset = p,
+        .out_path = out_path,
+        .cancel = &flag,
+    })) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expect(err == error.Cancelled);
+    }
+    // Nothing was written or removed: the foreign file is byte-identical.
+    const back = try std.Io.Dir.cwd().readFileAlloc(io, out_path, a, .limited(1024));
+    try testing.expectEqualStrings("previous-result", back);
+}
+
+test "run stops at a step boundary when cancelled mid-run" {
+    const io = testing.io;
+    const out_path = ".zig-cache/pipeline_runner_test_cancel.opt.glb";
+    std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const p = try preset.loadFile(io, a, "test/noop.zon");
+
+    // The sink cancels on the "load" update; the first step boundary after
+    // that must abort the run — no "write" update, no output file.
+    var flag: std.atomic.Value(bool) = .init(false);
+    var sink = CancelSink{ .flag = &flag };
+    if (run(io, a, "test/fixtures/box.glb", .{
+        .preset = p,
+        .out_path = out_path,
+        .progress_ctx = &sink,
+        .progress = CancelSink.cb,
+        .cancel = &flag,
+    })) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try testing.expect(err == error.Cancelled);
+    }
+    try testing.expect(sink.calls > 0);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, out_path, .{}));
 }
 
 test "run: prune strips animations end to end" {

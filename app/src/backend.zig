@@ -54,16 +54,15 @@ const job_gpa: std.mem.Allocator = std.heap.c_allocator;
 /// for photos, which is what the preview pane shows anyway.
 const preview_max_dim: u32 = 1024;
 
-/// Where the app drops its outputs, relative to the working directory.
-const out_dir = ".zig-cache/assetty-app";
+/// Output and settings locations live in `paths.zig` (`pub var`, set by
+/// `app.main` for the bundle before workers start): `paths.output_dir`
+/// (where the app drops its outputs, relative to the working directory) and
+/// `paths.settings_file` (the opaque, frontend-owned settings file the
+/// backend never interprets). Tests keep asserting the default values.
+const paths = @import("paths.zig");
 
 /// File name the save panel starts with when the caller suggests none.
 const default_save_name = "model.opt.glb";
-
-/// Opaque, frontend-owned settings file. The backend never interprets the
-/// JSON inside: any object the UI wants (theme, optimize defaults, ...) goes
-/// here, and loading/saving is all this file does.
-const settings_file = "assetty.settings.json";
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -81,6 +80,7 @@ pub const Backend = struct {
     pub const nanoui_params = .{
         .openDialog = .{},
         .openDialogAt = .{"dir"},
+        .pendingOpenFiles = .{},
         .dropFile = .{ "name", "b64" },
         .pickSavePath = .{"name"},
         .exportTo = .{ "src", "dst" },
@@ -93,6 +93,7 @@ pub const Backend = struct {
         .textures = .{"path"},
         .textureEncode = .{ "path", "index", "settings" },
         .texturePreview = .{ "path", "index", "settings" },
+        .cancelJob = .{},
         .discardFile = .{"path"},
         .presetLoad = .{"name"},
         .presetSave = .{ "name", "zon" },
@@ -118,6 +119,24 @@ pub const Backend = struct {
     /// back to the default location silently.
     pub fn openDialogAt(self: *Backend, call: *Call, dir: ?[]const u8) !json.Raw {
         return self.openDialogImpl(call.arena, dir);
+    }
+
+    /// Drains OS document-open requests only after the page is ready.
+    pub fn pendingOpenFiles(self: *Backend, call: *Call) !json.Raw {
+        return self.pendingOpenFilesImpl(call.arena);
+    }
+
+    fn pendingOpenFilesImpl(self: *Backend, a: std.mem.Allocator) !json.Raw {
+        _ = self;
+        const opened = try @import("native_open.zig").take(a);
+        var result: std.Io.Writer.Allocating = .init(a);
+        try result.writer.writeAll("{\"paths\":[");
+        for (opened, 0..) |path, i| {
+            if (i != 0) try result.writer.writeByte(',');
+            try json.jsonStr(&result.writer, path);
+        }
+        try result.writer.writeAll("]}");
+        return json.raw(result.written());
     }
 
     /// Saves a dropped file (the page holds only its bytes, not a path) into
@@ -278,6 +297,47 @@ pub const Backend = struct {
         return self.launch(call.arena, Target.of(call.window), .texture_preview, path, null, index, null);
     }
 
+    /// Requests cancellation of the pipeline job in flight (`optimize` /
+    /// `optimizeCustom` / `optimizeLODs` / `textureEncode` / `exportTo`):
+    /// `{"cancelled":true}` when a job was running and will now stop at the
+    /// nearest safe boundary, `{"cancelled":false}` when there is nothing to
+    /// cancel. Synchronous on the main thread — it only sets a flag; the
+    /// worker stops at a step/texture/LOD boundary, publishes no success
+    /// result, deletes only its own unfinished outputs, and the busy gate is
+    /// released exactly once by the normal delivery when the worker is really
+    /// done (so a terminal `ok:false,error:"Cancelled"` event still arrives).
+    /// Previews (`texturePreview`) have their own gate and are not cancelled.
+    pub fn cancelJob(self: *Backend, call: *Call) !json.Raw {
+        _ = call;
+        return json.raw(if (self.requestCancel()) cancelled_reply_yes else cancelled_reply_no);
+    }
+
+    /// Flags the pipeline job in flight for cooperative cancellation. True
+    /// when a job was running (it stops at the next safe boundary), false
+    /// when there was nothing to cancel. Split out so tests cover it without
+    /// a page `Call`.
+    fn requestCancel(self: *Backend) bool {
+        self.job_lock.lock();
+        defer self.job_lock.unlock();
+        const job = self.job orelse return false;
+        // A finished worker owns a fixed outcome (success or failure) that
+        // `delivered` is about to publish: too late to cancel, report false
+        // so the UI never shows "cancelling" for a decided run. The flag is
+        // atomic, and `finish` claims completion under this same lock, so the
+        // true/false pairing below is race-free: `true` means the worker will
+        // still observe the request and report `Cancelled`.
+        if (job.finished.load(.acquire)) return false;
+        job.cancel_requested.store(true, .release);
+        return true;
+    }
+
+    /// Reads a cooperative-cancellation flag: set means stop at the next safe
+    /// boundary. Split out so call sites stay one-liners.
+    fn isCancel(cancel: ?*const std.atomic.Value(bool)) bool {
+        const c = cancel orelse return false;
+        return c.load(.acquire);
+    }
+
     /// Deletes a finished result file and forgets it: `{"ok":true}`. Only
     /// files strictly under `out_dir` may go (see `discardFileImpl`); anything
     /// else is refused, and a file that is already gone counts as discarded.
@@ -328,13 +388,13 @@ pub const Backend = struct {
     /// when the file is absent or does not hold valid JSON. The schema is the
     /// frontend's business.
     pub fn settingsLoad(self: *Backend, call: *Call) !json.Raw {
-        return self.settingsLoadFrom(call.arena, settings_file);
+        return self.settingsLoadFrom(call.arena, paths.settings_file);
     }
 
     /// Validates `text` as JSON and replaces the settings file atomically:
     /// `{"ok":true}` or `{"error":".."}`.
     pub fn settingsSave(self: *Backend, call: *Call, text: []const u8) !json.Raw {
-        return self.settingsSaveTo(call.arena, settings_file, text);
+        return self.settingsSaveTo(call.arena, paths.settings_file, text);
     }
 
     // ---- update -----------------------------------------------------------
@@ -374,15 +434,15 @@ pub const Backend = struct {
         // is documented for use from a bound method (main thread, runModal).
         // `directory` seeds the panel's starting folder when non-empty.
         const start = self.resolveOpenDir(dir);
-        const paths = nanoui.dialog.open(self.gpa, .{
+        const selected = nanoui.dialog.open(self.gpa, .{
             .title = "Open model",
             .directory = start orelse "",
             .extensions = &.{ "glb", "gltf" },
         }) catch null;
         defer {
-            if (paths) |p| nanoui.dialog.freePaths(self.gpa, p);
+            if (selected) |p| nanoui.dialog.freePaths(self.gpa, p);
         }
-        const picked: ?[]const u8 = if (paths) |p| (if (p.len > 0) p[0] else null) else null;
+        const picked: ?[]const u8 = if (selected) |p| (if (p.len > 0) p[0] else null) else null;
         return pathResultRaw(a, picked);
     }
 
@@ -415,7 +475,7 @@ pub const Backend = struct {
         const rel = try std.fmt.allocPrint(
             a,
             "{s}/drops/{d}_{s}",
-            .{ out_dir, @divTrunc(nanos, std.time.ns_per_ms), safe },
+            .{ paths.output_dir, @divTrunc(nanos, std.time.ns_per_ms), safe },
         );
         const parent = std.fs.path.dirname(rel) orelse return json.errorRaw(a, "bad drop path", .{});
         std.Io.Dir.cwd().createDirPath(self.io, parent) catch |err|
@@ -553,9 +613,10 @@ pub const Backend = struct {
             sink = .{ .window = w };
             break :blk sink.sinks();
         } else .{};
-        return switch (self.runPipeline(a, path, p, sinks)) {
+        return switch (self.runPipeline(a, path, p, sinks, null)) {
             .done => |d| d.report,
             .failed => |msg| json.errorRaw(a, "{s}", .{msg}),
+            .cancelled => json.errorRaw(a, "Cancelled", .{}),
             .out_of_memory => error.OutOfMemory,
         };
     }
@@ -569,16 +630,17 @@ pub const Backend = struct {
         path: []const u8,
         p: core.preset.Preset,
         sinks: Sinks,
+        cancel: ?*const std.atomic.Value(bool),
     ) PipelineOutcome {
         const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
-        const out_path = std.fmt.allocPrint(a, "{s}/opt_{d}.glb", .{ out_dir, nanos }) catch
+        const out_path = std.fmt.allocPrint(a, "{s}/opt_{d}.glb", .{ paths.output_dir, nanos }) catch
             return .out_of_memory;
-        std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(self.io, paths.output_dir) catch |err| {
             const msg = std.fmt.allocPrint(a, "out dir: {s}", .{@errorName(err)}) catch return .out_of_memory;
             sinks.logFmt("optimize failed: {s}", .{msg});
             return .{ .failed = msg };
         };
-        return self.runPipelineTo(a, path, p, out_path, sinks);
+        return self.runPipelineTo(a, path, p, out_path, sinks, cancel);
     }
 
     /// Same as `runPipeline` but into the caller's `out_path` (the LOD ladder
@@ -590,9 +652,11 @@ pub const Backend = struct {
         p: core.preset.Preset,
         out_path: []const u8,
         sinks: Sinks,
+        cancel: ?*const std.atomic.Value(bool),
     ) PipelineOutcome {
-        const rep = switch (self.execPipeline(a, path, p, out_path, sinks)) {
+        const rep = switch (self.execPipeline(a, path, p, out_path, sinks, cancel)) {
             .done => |r| r,
+            .cancelled => return .cancelled,
             .failed => |msg| {
                 sinks.logFmt("optimize failed: {s}", .{msg});
                 return .{ .failed = msg };
@@ -618,13 +682,16 @@ pub const Backend = struct {
         p: core.preset.Preset,
         out_path: []const u8,
         sinks: Sinks,
+        cancel: ?*const std.atomic.Value(bool),
     ) ExecOutcome {
         const rep = core.runner.run(self.io, a, path, .{
             .preset = p,
             .out_path = out_path,
             .progress = sinks.progress,
             .progress_ctx = sinks.progress_ctx,
+            .cancel = cancel,
         }) catch |err| {
+            if (err == error.Cancelled) return .cancelled;
             const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) catch return .out_of_memory;
             return .{ .failed = msg };
         };
@@ -1091,6 +1158,10 @@ pub const Backend = struct {
 /// The `{"started":true}` reply of every background method.
 const started_reply = "{\"started\":true}";
 
+/// The `cancelJob` replies: accepted (a job was running) or nothing to cancel.
+const cancelled_reply_yes = "{\"cancelled\":true}";
+const cancelled_reply_no = "{\"cancelled\":false}";
+
 const JobKind = enum { optimize, optimize_lods, texture_encode, texture_preview, export_file };
 
 /// Guards `Backend.job`. Critical sections are a pointer compare, so a spin
@@ -1124,6 +1195,13 @@ const Target = struct {
 /// Set by `Backend.shutdown` before the windows are torn down: a delivery that
 /// runs after it must not touch the app any more.
 var shutting_down: std.atomic.Value(bool) = .init(false);
+
+/// Sequence for unique run-owned LOD staging dirs (`lods_<nanos>_<seq>`).
+var lod_stage_seq: std.atomic.Value(u64) = .init(0);
+
+fn isCancel(flag: ?*const std.atomic.Value(bool)) bool {
+    return if (flag) |cancel| cancel.load(.acquire) else false;
+}
 
 /// Progress and log sinks for one pipeline run. The sync entry points emit
 /// straight to the page; the worker copies into the main thread's queue.
@@ -1176,6 +1254,9 @@ const PipelineOutcome = union(enum) {
     /// Human-readable reason, already formatted the way replies want it.
     failed: []const u8,
     out_of_memory,
+    /// Cooperative cancellation won: the caller reports `error:"Cancelled"`
+    /// and deletes only this run's own unfinished outputs.
+    cancelled,
 };
 
 /// How one pipeline execution ended. The report is arena-owned.
@@ -1184,6 +1265,8 @@ const ExecOutcome = union(enum) {
     /// Human-readable reason, already formatted the way replies want it.
     failed: []const u8,
     out_of_memory,
+    /// Cooperative cancellation won at a safe boundary.
+    cancelled,
 };
 
 /// A resolved preset, or the text of the error reply.
@@ -1216,6 +1299,8 @@ fn specPresetOrMessage(a: std.mem.Allocator, spec: []const u8) Resolved {
 // ---- LOD ladders ------------------------------------------------------------
 
 // One finished ladder rung, owned by the job (`Job.destroy` frees `out_path`).
+// After the commit `out_path` is the deterministic final name; before it,
+// the run-owned staging path.
 const LodOwned = struct {
     ratio: f32,
     out_path: []u8,
@@ -1300,34 +1385,48 @@ fn lodPresetFor(a: std.mem.Allocator, base: core.preset.Preset, ratio: f32) !cor
 
 /// `<out_dir>/<stem>_lod<NN>.glb`: `stem` is the source's file stem,
 /// `NN` is `round(ratio*100)` (`box_lod50.glb`).
-fn lodOutName(a: std.mem.Allocator, src_path: []const u8, ratio: f32) ![]u8 {
+/// `<stem>_lod<NN>.glb` file name for one rung: `stem` is the source's file
+/// stem, `NN` is `round(ratio*100)` (`box_lod50.glb`).
+fn lodFileName(a: std.mem.Allocator, src_path: []const u8, ratio: f32) ![]u8 {
     const base = std.fs.path.basename(src_path);
     const stem = std.fs.path.stem(base);
     const clean = if (stem.len == 0) "model" else stem;
     const pct: u32 = @intFromFloat(@round(ratio * 100));
-    return try std.fmt.allocPrint(a, "{s}/{s}_lod{d}.glb", .{ out_dir, clean, pct });
+    return try std.fmt.allocPrint(a, "{s}_lod{d}.glb", .{ clean, pct });
+}
+
+/// `<out_dir>/<stem>_lod<NN>.glb`: the deterministic final name of one rung.
+fn lodOutName(a: std.mem.Allocator, src_path: []const u8, ratio: f32) ![]u8 {
+    const tail = try lodFileName(a, src_path, ratio);
+    return try std.fmt.allocPrint(a, "{s}/{s}", .{ paths.output_dir, tail });
 }
 
 /// One finished ladder rung with arena-owned paths (the sync entry point the
-/// tests use: same semantics as the worker's loop, minus progress).
+/// tests use: same semantics as the worker's loop, minus progress). `fresh`
+/// marks files this run created: cancel cleanup deletes only fresh ones.
 const LodItem = struct {
     ratio: f32,
     out_path: []const u8,
     disk_bytes: u64,
     triangles: u64,
     secs: f64,
+    fresh: bool = false,
 };
 
 const LodSyncOutcome = union(enum) {
     done: []LodItem,
     failed: []const u8,
     out_of_memory,
+    /// Cooperative cancellation won at a rung boundary; rung files written
+    /// so far in this ladder were deleted.
+    cancelled,
 };
 
 /// Runs the whole ladder synchronously, on the calling thread: the entry
 /// point the tests (and any non-UI caller) use. Every rung starts from `path`
 /// (the source is never modified); `ratios` must already be parsed, filtered
-/// and sorted (see `parseLodRatios`).
+/// and sorted (see `parseLodRatios`). `cancel` stops the ladder at the next
+/// rung boundary with `.cancelled` and deletes this ladder's own rung files.
 fn lodRunSync(
     self: *Backend,
     a: std.mem.Allocator,
@@ -1335,18 +1434,37 @@ fn lodRunSync(
     base: core.preset.Preset,
     ratios: []const f32,
     sinks: Sinks,
+    cancel: ?*const std.atomic.Value(bool),
 ) LodSyncOutcome {
-    std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |err| {
+    if (isCancel(cancel)) return .cancelled;
+    std.Io.Dir.cwd().createDirPath(self.io, paths.output_dir) catch |err| {
         const msg = std.fmt.allocPrint(a, "out dir: {s}", .{@errorName(err)}) catch return .out_of_memory;
         return .{ .failed = msg };
     };
     var out: std.ArrayList(LodItem) = .empty;
     errdefer out.deinit(a);
     for (ratios) |ratio| {
+        if (isCancel(cancel)) {
+            // Only rungs this run created go; previous finished files at
+            // deterministic names survive the cancellation.
+            for (out.items) |item| {
+                if (item.fresh) std.Io.Dir.cwd().deleteFile(self.io, item.out_path) catch {};
+            }
+            return .cancelled;
+        }
         const preset = lodPresetFor(a, base, ratio) catch return .out_of_memory;
         const out_path = lodOutName(a, path, ratio) catch return .out_of_memory;
-        const rep = switch (self.execPipeline(a, path, preset, out_path, sinks)) {
+        const fresh: bool = if (std.Io.Dir.cwd().statFile(self.io, out_path, .{})) |_| false else |err| err == error.FileNotFound;
+        const rep = switch (self.execPipeline(a, path, preset, out_path, sinks, cancel)) {
             .done => |r| r,
+            .cancelled => {
+                // The runner already removed this rung's file when it was
+                // fresh; earlier rungs go only when this run created them.
+                for (out.items) |item| {
+                    if (item.fresh) std.Io.Dir.cwd().deleteFile(self.io, item.out_path) catch {};
+                }
+                return .cancelled;
+            },
             .failed => |msg| return .{ .failed = msg },
             .out_of_memory => return .out_of_memory,
         };
@@ -1360,6 +1478,7 @@ fn lodRunSync(
             .disk_bytes = st.size,
             .triangles = rep.after.triangles,
             .secs = rep.total_secs,
+            .fresh = fresh,
         }) catch return .out_of_memory;
     }
     return .{ .done = out.toOwnedSlice(a) catch return .out_of_memory };
@@ -1387,6 +1506,12 @@ const Job = struct {
     arg: ?[]u8 = null,
     /// The LOD ladder for `optimize_lods` (job-owned copy); null otherwise.
     ratios: ?[]f32 = null,
+    /// Set by `Backend.cancelJob` (main thread), read by the worker at step /
+    /// texture / LOD boundaries. Never freed or moved: the job owns it until
+    /// `destroy`, so the flag outlives the whole run and there is no
+    /// use-after-free. The busy gate is NOT released here — only `delivered`
+    /// releases it, after the worker really finished.
+    cancel_requested: std.atomic.Value(bool) = .init(false),
     /// LOD progress frame: `lod_done` rungs of `lod_total` finished. Step
     /// progress without its own sub (everything but the textures step) is
     /// forwarded with `sub = {label:"lods", done, total}`; the textures
@@ -1395,6 +1520,9 @@ const Job = struct {
     lod_total: u32 = 0,
     /// Set by the worker before it posts: null means it failed, see `err`.
     result: ?Result = null,
+    /// Claimed by the worker once its outcome is fixed (success or failure),
+    /// under the same `job_lock` `requestCancel` uses (see `finish`).
+    finished: std.atomic.Value(bool) = .init(false),
     /// Failure message, formatted in place: the error path never allocates.
     err_buf: [512]u8 = undefined,
     err_len: usize = 0,
@@ -1412,7 +1540,9 @@ const Job = struct {
         preview: Preview,
     };
 
-    /// Thread entry.
+    /// Thread entry. `finish` runs before the delivery is queued, so a late
+    /// cancel either still converts the outcome (request accepted) or sees
+    /// `finished` and is refused — never a silent success-after-cancelling.
     fn run(self: *Job) void {
         switch (self.kind) {
             .optimize => self.runOptimize(),
@@ -1421,16 +1551,72 @@ const Job = struct {
             .texture_preview => self.runTexturePreview(),
             .export_file => self.runExport(),
         }
+        self.finish();
         self.backend.deliver(self);
+    }
+
+    /// Terminal accounting, under the same lock `requestCancel` uses. If the
+    /// flag landed any time before this point, the adopted result (if any) is
+    /// discarded — deleting only this run's own outputs — and the outcome
+    /// becomes `Cancelled`; otherwise completion is claimed and a later
+    /// cancel is refused with `false`. Either way the (single) delivery that
+    /// follows publishes exactly what was decided here.
+    fn finish(self: *Job) void {
+        self.backend.job_lock.lock();
+        defer self.backend.job_lock.unlock();
+        if (self.cancel_requested.load(.acquire)) {
+            self.discardResult();
+            self.fail("Cancelled", .{});
+        }
+        self.finished.store(true, .release);
+    }
+
+    /// Drops an adopted success result: frees it and deletes only this run's
+    /// own staging outputs. Previous results, the source and the user's own
+    /// paths (`exportTo` destination) are never touched. Pipeline outputs and
+    /// LOD directories are unique to this run.
+    fn discardResult(self: *Job) void {
+        const res = self.result orelse return;
+        switch (res) {
+            .optimize => |o| {
+                std.Io.Dir.cwd().deleteFile(self.io, o.out_path) catch {};
+                self.gpa.free(o.out_path);
+                self.gpa.free(o.report);
+            },
+            .lods => |items| {
+                for (items) |item| {
+                    std.Io.Dir.cwd().deleteFile(self.io, item.out_path) catch {};
+                    if (std.fs.path.dirname(item.out_path)) |dir|
+                        std.Io.Dir.cwd().deleteDir(self.io, dir) catch {};
+                    self.gpa.free(item.out_path);
+                }
+                self.gpa.free(items);
+            },
+            .exported => |e| {
+                self.gpa.free(e.src);
+                self.gpa.free(e.dst);
+            },
+            .texture => |t| {
+                std.Io.Dir.cwd().deleteFile(self.io, t.before_png) catch {};
+                std.Io.Dir.cwd().deleteFile(self.io, t.after_png) catch {};
+                self.gpa.free(t.before_png);
+                self.gpa.free(t.after_png);
+            },
+            .preview => |p| self.gpa.free(p.b64),
+        }
+        self.result = null;
     }
 
     /// The whole pipeline, on this thread, with an arena of its own: the
     /// report is copied into `gpa` before it is torn down.
     fn runOptimize(self: *Job) void {
+        // Check before anything else: a cancel that landed while the thread
+        // was spawning must not do any work at all.
+        if (self.cancel_requested.load(.acquire)) return self.fail("Cancelled", .{});
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const p = self.preset orelse return self.fail("no preset", .{});
-        switch (self.backend.runPipeline(arena.allocator(), self.path, p, self.sinks())) {
+        switch (self.backend.runPipeline(arena.allocator(), self.path, p, self.sinks(), &self.cancel_requested)) {
             .done => |d| {
                 const out_path = self.gpa.dupe(u8, d.out_path) catch return self.fail("out of memory", .{});
                 const report = self.gpa.dupe(u8, d.report.text) catch {
@@ -1439,48 +1625,92 @@ const Job = struct {
                 };
                 self.result = .{ .optimize = .{ .out_path = out_path, .report = report } };
             },
+            // The runner already removed this run's own unfinished output, if
+            // any; previous results and the source are never touched.
+            .cancelled => self.fail("Cancelled", .{}),
             .failed => |msg| self.fail("{s}", .{msg}),
             .out_of_memory => self.fail("out of memory", .{}),
         }
     }
 
     /// The whole LOD ladder, on this thread: one pipeline run per ratio, every
-    /// run from the SOURCE file. Files land in `out_dir` as `<stem>_lod<NN>.glb`.
+    /// run from the SOURCE file. A unique directory holds this run's rungs:
+    /// cancellation cannot overwrite or delete previous finished results.
     fn runOptimizeLods(self: *Job) void {
+        if (self.cancel_requested.load(.acquire)) return self.fail("Cancelled", .{});
         const base = self.preset orelse return self.fail("no preset", .{});
         const ratios = self.ratios orelse return self.fail("no ratios", .{});
-        std.Io.Dir.cwd().createDirPath(self.io, out_dir) catch |e|
+        std.Io.Dir.cwd().createDirPath(self.io, paths.output_dir) catch |e|
             return self.fail("out dir: {s}", .{@errorName(e)});
         self.lod_total = @intCast(ratios.len);
 
+        // Unique per run (the gate runs one pipeline job at a time; the
+        // sequence number closes the same-nanosecond gap).
+        const stage_seq = lod_stage_seq.fetchAdd(1, .monotonic);
+        const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(self.io).nanoseconds));
+        const stage = std.fmt.allocPrint(
+            self.gpa,
+            "{s}/lods_{d}_{d}",
+            .{ paths.output_dir, nanos, stage_seq },
+        ) catch return self.fail("out of memory", .{});
+        defer self.gpa.free(stage);
+        std.Io.Dir.cwd().createDirPath(self.io, stage) catch |e|
+            return self.fail("out dir: {s}", .{@errorName(e)});
+        var completed = false;
+        defer if (!completed) std.Io.Dir.cwd().deleteTree(self.io, stage) catch {};
+
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const sa = arena.allocator();
+
         var owned: std.ArrayList(LodOwned) = .empty;
-        errdefer {
-            for (owned.items) |item| self.gpa.free(item.out_path);
-            owned.deinit(self.gpa);
+        // `errdefer` never fires in a void function: every early return below
+        // must free through here instead.
+        var committed = false;
+        defer {
+            if (!committed) {
+                for (owned.items) |item| self.gpa.free(item.out_path);
+                owned.deinit(self.gpa);
+            }
         }
         for (ratios, 0..) |ratio, i| {
+            // Nearest safe boundary for the ladder: between rungs, while the
+            // finals are still untouched in their deterministic names.
+            if (isCancel(&self.cancel_requested)) return self.fail("Cancelled", .{});
             self.lod_done = @intCast(i);
-            const rung = self.runSingleLod(base, ratio) orelse return; // fail() already recorded
+            const tail = lodFileName(sa, self.path, ratio) catch return self.fail("out of memory", .{});
+            const stage_path = std.fmt.allocPrint(sa, "{s}/{s}", .{ stage, tail }) catch
+                return self.fail("out of memory", .{});
+            const rung = self.runSingleLod(base, ratio, stage_path) orelse return; // fail() already recorded
             owned.append(self.gpa, rung) catch {
                 self.gpa.free(rung.out_path);
                 return self.fail("out of memory", .{});
             };
         }
+        if (isCancel(&self.cancel_requested)) return self.fail("Cancelled", .{});
+
         self.result = .{ .lods = owned.toOwnedSlice(self.gpa) catch
             return self.fail("out of memory", .{}) };
+        committed = true;
+        completed = true;
     }
 
     /// One ladder rung: clone `base` with `simplify.target_ratio = ratio` (or
-    /// gain a default simplify step), run it from the source, adopt the file
-    /// path into `gpa`. Null when the rung failed (the reason is recorded).
-    fn runSingleLod(self: *Job, base: core.preset.Preset, ratio: f32) ?LodOwned {
+    /// gain a default simplify step), run it from the source into `out_path`
+    /// (the run-owned staging file), adopt the path into `gpa`. Null when the
+    /// rung failed (the reason is recorded).
+    fn runSingleLod(self: *Job, base: core.preset.Preset, ratio: f32, out_path: []const u8) ?LodOwned {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const preset = lodPresetFor(a, base, ratio) catch return self.failOOM();
-        const out_path = lodOutName(a, self.path, ratio) catch return self.failOOM();
-        const rep = switch (self.backend.execPipeline(a, self.path, preset, out_path, self.sinks())) {
+        const rep = switch (self.backend.execPipeline(a, self.path, preset, out_path, self.sinks(), &self.cancel_requested)) {
             .done => |r| r,
+            // The runner already removed this rung's own staging file.
+            .cancelled => {
+                self.fail("Cancelled", .{});
+                return null;
+            },
             .failed => |msg| {
                 self.sinks().logFmt("lods failed: {s}", .{msg});
                 return self.failMsg(msg);
@@ -1512,9 +1742,10 @@ const Job = struct {
     }
 
     fn runTextureEncode(self: *Job) void {
+        if (self.cancel_requested.load(.acquire)) return self.fail("Cancelled", .{});
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index, self.arg) catch
+        const outcome = encodeTexture(self.io, arena.allocator(), self.path, self.index, self.arg, &self.cancel_requested) catch
             return self.fail("out of memory", .{});
         switch (outcome) {
             // The two paths point into the arena, which dies here: the job's
@@ -1523,6 +1754,7 @@ const Job = struct {
                 const owned = self.adoptEncoded(d) orelse return self.fail("out of memory", .{});
                 self.result = .{ .texture = owned };
             },
+            .cancelled => self.fail("Cancelled", .{}),
             .skipped => self.fail("image {d} is not encodable (external or unsupported format)", .{self.index}),
             .failed => |msg| self.fail("{s}", .{msg}),
         }
@@ -1562,6 +1794,9 @@ const Job = struct {
     /// model cannot stall the page, and behind the pipeline gate so an export
     /// cannot race a run writing the same cache file.
     fn runExport(self: *Job) void {
+        // Nearest safe boundary: before the copy starts. An in-flight copy is
+        // short and `dst` is the user's own path, so it is never deleted.
+        if (self.cancel_requested.load(.acquire)) return self.fail("Cancelled", .{});
         const dst = self.arg orelse return self.fail("no destination", .{});
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
@@ -1597,8 +1832,11 @@ const Job = struct {
     /// `step` points into this job's arena, which ends with the run: copy it
     /// and hand it to the main thread. `sub` is plain counters (the label is
     /// a static token), so it copies by value. LOD rungs without their own
-    /// sub travel with `{label:"lods"}` so the page can frame them.
+    /// sub travel with `{label:"lods"}` so the page can frame them. After a
+    /// cancel nothing is posted any more: the UI already knows the run is
+    /// going away, and late progress would lie about it.
     fn postProgress(self: *Job, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
+        if (self.cancel_requested.load(.acquire)) return;
         const app = self.target.app orelse return;
         const window = self.target.window orelse return;
         const copy = self.gpa.dupe(u8, step) catch return;
@@ -1618,6 +1856,7 @@ const Job = struct {
     }
 
     fn postLog(self: *Job, line: []const u8) void {
+        if (self.cancel_requested.load(.acquire)) return;
         const app = self.target.app orelse return;
         const window = self.target.window orelse return;
         const copy = self.gpa.dupe(u8, line) catch return;
@@ -1883,6 +2122,8 @@ const EncodeOutcome = union(enum) {
     done: Encoded,
     /// Not encodable: an external image or an unsupported pixel format.
     skipped,
+    /// Cooperative cancellation won at a safe boundary.
+    cancelled,
     /// Human-readable reason (arena-owned).
     failed: []const u8,
 };
@@ -1921,7 +2162,10 @@ fn encodeTexture(
     path: []const u8,
     index: u32,
     settings_text: ?[]const u8,
+    cancel: ?*const std.atomic.Value(bool),
 ) error{OutOfMemory}!EncodeOutcome {
+    const cancelled = isCancel(cancel);
+    if (cancelled) return .cancelled;
     var loaded = core.parse.loadFile(io, a, path) catch |err|
         return .{ .failed = try std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) };
     defer loaded.deinit();
@@ -1935,11 +2179,23 @@ fn encodeTexture(
     };
     const e = enc orelse return .skipped;
 
+    // The basisu call above cannot be interrupted; stop here instead, before
+    // any output file exists — so there is nothing to clean up.
+    if (cancel) |c| if (c.load(.acquire)) return .cancelled;
+
     const nanos: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
     const before_png = writePngFile(io, a, "before", nanos, e.before) catch |err|
         return .{ .failed = try std.fmt.allocPrint(a, "write before png: {s}", .{@errorName(err)}) };
     const after_png = writePngFile(io, a, "after", nanos, e.after) catch |err|
         return .{ .failed = try std.fmt.allocPrint(a, "write after png: {s}", .{@errorName(err)}) };
+
+    // A cancel that landed during the PNG writes: both files are this task's
+    // own, so they go — previous results and the source stay.
+    if (isCancel(cancel)) {
+        std.Io.Dir.cwd().deleteFile(io, before_png) catch {};
+        std.Io.Dir.cwd().deleteFile(io, after_png) catch {};
+        return .cancelled;
+    }
 
     return .{ .done = .{
         .index = e.result.index,
@@ -2030,8 +2286,8 @@ fn writePngFile(
     nanos: u64,
     px: Pixels,
 ) ![]const u8 {
-    std.Io.Dir.cwd().createDirPath(io, out_dir) catch {};
-    const rel = try std.fmt.allocPrint(a, "{s}/tex_{d}_{s}.png", .{ out_dir, nanos, tag });
+    std.Io.Dir.cwd().createDirPath(io, paths.output_dir) catch {};
+    const rel = try std.fmt.allocPrint(a, "{s}/tex_{d}_{s}.png", .{ paths.output_dir, nanos, tag });
     const png = try core.decode.encodePngRgba(a, px.rgba, px.width, px.height);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rel, .data = png });
     return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a);
@@ -2154,7 +2410,7 @@ fn copyExport(io: std.Io, a: std.mem.Allocator, src: []const u8, dst: []const u8
 fn discardFileImpl(io: std.Io, a: std.mem.Allocator, path: []const u8) !json.Raw {
     const trimmed = std.mem.trim(u8, path, " \t\r\n");
     if (trimmed.len == 0) return json.errorRaw(a, "empty path", .{});
-    const out_abs = std.Io.Dir.cwd().realPathFileAlloc(io, out_dir, a) catch
+    const out_abs = std.Io.Dir.cwd().realPathFileAlloc(io, paths.output_dir, a) catch
         return json.errorRaw(a, "only results in .zig-cache/assetty-app can be discarded", .{});
     const target_abs = std.Io.Dir.cwd().realPathFileAlloc(io, trimmed, a) catch
         return json.raw("{\"ok\":true}");
@@ -3160,8 +3416,9 @@ test "discardFile deletes a result inside out_dir and is idempotent" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    try std.Io.Dir.cwd().createDirPath(testing.io, out_dir);
-    const rel = out_dir ++ "/discard_test_tmp.glb";
+    try std.Io.Dir.cwd().createDirPath(testing.io, paths.output_dir);
+    try testing.expectEqualStrings(".zig-cache/assetty-app", paths.output_dir);
+    const rel = try std.fmt.allocPrint(a, "{s}/discard_test_tmp.glb", .{paths.output_dir});
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = rel, .data = "opt-bytes" });
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, rel, a);
 
@@ -3184,7 +3441,7 @@ test "discardFile refuses paths outside out_dir" {
     const a = arena.allocator();
 
     const refused = "only results in .zig-cache/assetty-app can be discarded";
-    for ([_][]const u8{ "test/fixtures/box.glb", "/etc", out_dir }) |p| {
+    for ([_][]const u8{ "test/fixtures/box.glb", "/etc", paths.output_dir }) |p| {
         const r = try discardFileImpl(testing.io, a, p);
         try testing.expect(std.mem.indexOf(u8, r.text, refused) != null);
     }
@@ -3666,13 +3923,14 @@ test "lod ladder on box.glb writes two files with descending triangles" {
     );
     const ladder = try parseLodRatios(a, "[0.5,0.25]");
 
-    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{});
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{}, null);
     const items = switch (outcome) {
         .done => |items| items,
         .failed => |msg| {
             std.debug.print("lod run failed: {s}\n", .{msg});
             return error.TestUnexpectedResult;
         },
+        .cancelled => return error.TestUnexpectedResult,
         .out_of_memory => return error.OutOfMemory,
     };
     try testing.expectEqual(@as(usize, 2), items.len);
@@ -3714,13 +3972,14 @@ test "lod ladder on the helmet decimates strictly per rung" {
     );
     const ladder = try parseLodRatios(a, "[0.5,0.25]");
 
-    const outcome = lodRunSync(&b, a, "test/fixtures/real/DamagedHelmet.glb", base, ladder, .{});
+    const outcome = lodRunSync(&b, a, "test/fixtures/real/DamagedHelmet.glb", base, ladder, .{}, null);
     const items = switch (outcome) {
         .done => |items| items,
         .failed => |msg| {
             std.debug.print("lod run failed: {s}\n", .{msg});
             return error.TestUnexpectedResult;
         },
+        .cancelled => return error.TestUnexpectedResult,
         .out_of_memory => return error.OutOfMemory,
     };
     try testing.expectEqual(@as(usize, 2), items.len);
@@ -3740,13 +3999,14 @@ test "lod ladder forces a simplify step when the spec has none" {
     const base = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
     const ladder = try parseLodRatios(a, "[0.5,0.25]");
 
-    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{});
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{}, null);
     const items = switch (outcome) {
         .done => |items| items,
         .failed => |msg| {
             std.debug.print("lod run failed: {s}\n", .{msg});
             return error.TestUnexpectedResult;
         },
+        .cancelled => return error.TestUnexpectedResult,
         .out_of_memory => return error.OutOfMemory,
     };
     // The forced simplify step ran (prune-only spec still yields LOD files).
@@ -3756,6 +4016,520 @@ test "lod ladder forces a simplify step when the spec has none" {
         try testing.expect(st.size > 0);
         try testing.expect(item.triangles <= 12);
     }
+}
+
+// ---- cooperative cancellation -------------------------------------------------
+
+/// `on_job_done` capture: the test seam `deliver` calls instead of the main
+/// thread queue, so a job can run synchronously on the test thread.
+const DoneCapture = struct {
+    job: ?*Job = null,
+    calls: u32 = 0,
+
+    fn cb(ctx: ?*anyopaque, job: *Job) void {
+        const self: *DoneCapture = @ptrCast(@alignCast(ctx.?));
+        self.job = job;
+        self.calls += 1;
+    }
+};
+
+/// A manually built job the test owns end to end: no thread, no window.
+/// `cancelled` pre-sets the cooperative flag, like `requestCancel` would.
+fn manualJob(b: *Backend, kind: JobKind, cancelled: bool) !*Job {
+    const gpa = std.heap.c_allocator;
+    const job = try gpa.create(Job);
+    job.* = .{
+        .backend = b,
+        .gpa = gpa,
+        .io = testing.io,
+        .kind = kind,
+        .path = try gpa.dupe(u8, "test/fixtures/box.glb"),
+        .preset = null,
+        .arg = null,
+        .ratios = null,
+    };
+    if (cancelled) job.cancel_requested.store(true, .release);
+    return job;
+}
+
+test "cancelJob replies not-cancelled when idle, pendingOpenFiles is empty" {
+    var b = testBackend();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try testing.expect(!b.requestCancel());
+    try testing.expectEqualStrings("{\"cancelled\":false}", cancelled_reply_no);
+
+    const r = try b.pendingOpenFilesImpl(arena.allocator());
+    try testing.expectEqualStrings("{\"paths\":[]}", r.text);
+}
+
+test "cancelled optimize job fails terminal Cancelled and frees the gate" {
+    var b = testBackend();
+    var cap = DoneCapture{};
+    b.on_job_done = &DoneCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    // Simulate a spawned job holding the gate: `requestCancel` accepts it.
+    const job = try manualJob(&b, .optimize, false);
+    b.job = job;
+    try testing.expect(b.busy());
+    try testing.expect(b.requestCancel());
+    // A second request while it is still (not really) running still accepts.
+    try testing.expect(b.requestCancel());
+
+    // Synchronous run on the test thread: cancel wins before any work, the
+    // delivery reaches the seam, and the gate is still held (only the real
+    // `delivered` releases it — exactly once, when the worker is done).
+    job.run();
+    try testing.expectEqual(@as(u32, 1), cap.calls);
+    try testing.expect(cap.job.? == job);
+    try testing.expect(job.result == null);
+    try testing.expectEqualStrings("Cancelled", job.err());
+    try testing.expect(job.finished.load(.acquire));
+    try testing.expect(b.busy());
+
+    b.releaseJob(job);
+    try testing.expect(!b.busy());
+    // Gate free: a new job may start (restart works).
+    const next = try manualJob(&b, .optimize, false);
+    b.job = next;
+    try testing.expect(b.busy());
+    b.releaseJob(next);
+    try testing.expect(!b.requestCancel());
+
+    job.destroy();
+    next.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+}
+
+test "cancelled export job fails Cancelled without touching the destination" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+    var cap = DoneCapture{};
+    b.on_job_done = &DoneCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try seedExportSrc(a, &tmp);
+    const dst = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cancel-dst.glb", .{tmp.sub_path[0..]});
+
+    const job = try manualJob(&b, .export_file, true);
+    // Point the job at the real export paths.
+    std.heap.c_allocator.free(job.path);
+    job.path = try std.heap.c_allocator.dupe(u8, src);
+    job.arg = try std.heap.c_allocator.dupe(u8, dst);
+    b.job = job;
+
+    job.run();
+    try testing.expectEqual(@as(u32, 1), cap.calls);
+    try testing.expect(job.result == null);
+    try testing.expectEqualStrings("Cancelled", job.err());
+    try testing.expect(job.finished.load(.acquire));
+    // The destination was never created: cancel won before the copy.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, dst, .{}));
+
+    b.releaseJob(job);
+    job.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+}
+
+test "terminal done events carry the exact Cancelled contract" {
+    var buf: [256]u8 = undefined;
+    const cases = .{
+        .{ events.OptimizeDonePayload{ .ok = false, .@"error" = "Cancelled" }, "{\"ok\":false,\"error\":\"Cancelled\"}" },
+        .{ events.LodsDonePayload{ .ok = false, .@"error" = "Cancelled" }, "{\"ok\":false,\"error\":\"Cancelled\"}" },
+        .{ events.ExportDonePayload{ .ok = false, .@"error" = "Cancelled" }, "{\"ok\":false,\"error\":\"Cancelled\"}" },
+        .{ events.TextureEncodeDonePayload{ .ok = false, .index = 3, .@"error" = "Cancelled" }, "{\"ok\":false,\"index\":3,\"error\":\"Cancelled\"}" },
+        .{ events.TexturePreviewDonePayload{ .ok = false, .index = 3, .@"error" = "Cancelled" }, "{\"ok\":false,\"index\":3,\"error\":\"Cancelled\"}" },
+    };
+    inline for (cases) |c| {
+        var w = std.Io.Writer.fixed(&buf);
+        try std.json.Stringify.value(c[0], .{}, &w);
+        try testing.expectEqualStrings(c[1], w.buffered());
+    }
+}
+
+test "pre-cancelled lod ladder stops with no rung files" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+
+    // Scrub leftovers from other ladder tests so absence proves cleanup.
+    for ([_][]const u8{ "box_lod50.glb", "box_lod25.glb" }) |tail| {
+        const p = try std.fmt.allocPrint(a, "{s}/{s}", .{ paths.output_dir, tail });
+        std.Io.Dir.cwd().deleteFile(testing.io, p) catch {};
+    }
+
+    var flag: std.atomic.Value(bool) = .init(true);
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{}, &flag);
+    try testing.expect(outcome == .cancelled);
+    for ([_][]const u8{ "box_lod50.glb", "box_lod25.glb" }) |tail| {
+        const p = try std.fmt.allocPrint(a, "{s}/{s}", .{ paths.output_dir, tail });
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, p, .{}));
+    }
+}
+
+test "pre-cancelled texture encode stops with no png files" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var flag: std.atomic.Value(bool) = .init(true);
+    const outcome = try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0, null, &flag);
+    try testing.expect(outcome == .cancelled);
+}
+
+test "shutdown stays safe with a cancelled job outstanding" {
+    var b = testBackend();
+    const job = try manualJob(&b, .optimize, true);
+    b.job = job;
+    try testing.expect(b.requestCancel());
+    // Shutdown must not free or release anything: the worker still owns the
+    // job and `delivered` still owns the gate release.
+    b.shutdown();
+    try testing.expect(b.busy());
+    try testing.expect(job.cancel_requested.load(.acquire));
+    b.releaseJob(job);
+    job.destroy();
+    // Global flag: put it back so no later test can observe shutdown.
+    shutting_down.store(false, .release);
+}
+
+/// Progress sink that requests cancellation right after the first rung's
+/// `write` update: the next rung boundary must stop the ladder.
+const CancelAfterFirstWrite = struct {
+    flag: *std.atomic.Value(bool),
+    writes: u32 = 0,
+
+    fn cb(ctx: ?*anyopaque, step: []const u8, pct: f32, sub: ?core.runner.ProgressSub) void {
+        _ = pct;
+        _ = sub;
+        const self: *CancelAfterFirstWrite = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, step, "write")) {
+            self.writes += 1;
+            if (self.writes == 1) self.flag.store(true, .release);
+        }
+    }
+};
+
+test "cancelled lod ladder keeps previous finished files" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(a, "{\"steps\":[{\"prune\":{}}]}", &detail);
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+
+    const p50 = try std.fmt.allocPrint(a, "{s}/box_lod50.glb", .{paths.output_dir});
+    const p25 = try std.fmt.allocPrint(a, "{s}/box_lod25.glb", .{paths.output_dir});
+    // Rung 0 must be fresh (this run creates it); rung 1 simulates a previous
+    // finished result that the cancellation must not delete.
+    std.Io.Dir.cwd().deleteFile(testing.io, p50) catch {};
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = p25, .data = "previous-result" });
+
+    var flag: std.atomic.Value(bool) = .init(false);
+    var sink = CancelAfterFirstWrite{ .flag = &flag };
+    const outcome = lodRunSync(&b, a, "test/fixtures/box.glb", base, ladder, .{
+        .progress = &CancelAfterFirstWrite.cb,
+        .progress_ctx = &sink,
+    }, &flag);
+    try testing.expect(outcome == .cancelled);
+    try testing.expectEqual(@as(u32, 1), sink.writes);
+    // The fresh rung file is gone; the previous result is untouched.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, p50, .{}));
+    const back = try std.Io.Dir.cwd().readFileAlloc(testing.io, p25, a, .limited(1024));
+    try testing.expectEqualStrings("previous-result", back);
+    std.Io.Dir.cwd().deleteFile(testing.io, p25) catch {};
+}
+
+test "finished export job refuses a late cancel and keeps its success" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+    var cap = DoneCapture{};
+    b.on_job_done = &DoneCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = try seedExportSrc(a, &tmp);
+    const dst = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/late-dst.glb", .{tmp.sub_path[0..]});
+
+    const job = try manualJob(&b, .export_file, false);
+    std.heap.c_allocator.free(job.path);
+    job.path = try std.heap.c_allocator.dupe(u8, src);
+    job.arg = try std.heap.c_allocator.dupe(u8, dst);
+    b.job = job;
+
+    // No cancel: the copy completes, the outcome is fixed...
+    job.run();
+    try testing.expectEqual(@as(u32, 1), cap.calls);
+    try testing.expect(job.result != null);
+    try testing.expect(job.finished.load(.acquire));
+    // ...so a cancel now is honestly refused, and the success stands.
+    try testing.expect(!b.requestCancel());
+
+    b.releaseJob(job);
+    job.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+
+    const want = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
+    const got = try std.Io.Dir.cwd().readFileAlloc(testing.io, dst, a, .limited(64 << 20));
+    try testing.expectEqualSlices(u8, want, got);
+}
+
+/// Seeds every deterministic final of `ladder` for `src_path` with sentinel
+/// bytes (a simulated previous finished result).
+fn seedLodSentinels(a: std.mem.Allocator, src_path: []const u8, ladder: []const f32) !void {
+    for (ladder) |ratio| {
+        const p = try lodOutName(a, src_path, ratio);
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = p, .data = "previous-result" });
+    }
+}
+
+fn readLodFinal(a: std.mem.Allocator, src_path: []const u8, ratio: f32) ![]const u8 {
+    const p = try lodOutName(a, src_path, ratio);
+    return std.Io.Dir.cwd().readFileAlloc(testing.io, p, a, .limited(64 << 20));
+}
+
+/// True while any run-owned `lods_*` staging dir exists under the output dir.
+fn stagingLeftover() bool {
+    var d = std.Io.Dir.cwd().openDir(testing.io, paths.output_dir, .{ .iterate = true }) catch return false;
+    defer d.close(testing.io);
+    var it = d.iterate();
+    while (it.next(testing.io) catch null) |e| {
+        if (std.mem.startsWith(u8, e.name, "lods_")) return true;
+    }
+    return false;
+}
+
+/// True once the background ladder under test has written its first staged
+/// rung file (i.e. the cancel below lands strictly after a rung write).
+fn stagedFilePresent() bool {
+    var d = std.Io.Dir.cwd().openDir(testing.io, paths.output_dir, .{ .iterate = true }) catch return false;
+    defer d.close(testing.io);
+    var it = d.iterate();
+    while (it.next(testing.io) catch null) |e| {
+        if (e.kind != .directory or !std.mem.startsWith(u8, e.name, "lods_")) continue;
+        const sub = std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ paths.output_dir, e.name }) catch return false;
+        defer testing.allocator.free(sub);
+        var sd = std.Io.Dir.cwd().openDir(testing.io, sub, .{ .iterate = true }) catch continue;
+        defer sd.close(testing.io);
+        var sit = sd.iterate();
+        while (sit.next(testing.io) catch null) |se| {
+            if (se.kind == .file) return true;
+        }
+    }
+    return false;
+}
+
+/// Thread-safe `on_job_done` capture for tests that spawn a real worker.
+const AtomicCapture = struct {
+    calls: std.atomic.Value(u32) = .init(0),
+    job: ?*Job = null,
+
+    fn cb(ctx: ?*anyopaque, j: *Job) void {
+        const self: *AtomicCapture = @ptrCast(@alignCast(ctx.?));
+        self.job = j;
+        _ = self.calls.fetchAdd(1, .monotonic);
+    }
+};
+
+/// Gives a manual job a real LOD ladder (job-owned preset + ratios).
+fn manualLodsJob(b: *Backend, a: std.mem.Allocator, spec: []const u8, ratios_text: []const u8, src: []const u8, cancelled: bool) !*Job {
+    var detail: []const u8 = "";
+    const base = try customPresetFromSpec(a, spec, &detail);
+    const ladder = try parseLodRatios(a, ratios_text);
+    const job = try manualJob(b, .optimize_lods, cancelled);
+    std.heap.c_allocator.free(job.path);
+    job.path = try std.heap.c_allocator.dupe(u8, src);
+    job.preset = try clonePreset(std.heap.c_allocator, base);
+    job.ratios = try std.heap.c_allocator.dupe(f32, ladder);
+    return job;
+}
+
+test "background lods cancel before start touches nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const previous_dir = paths.output_dir;
+    paths.output_dir = try scratch.dir.realPathFileAlloc(testing.io, ".", a);
+    defer paths.output_dir = previous_dir;
+    var b = testBackend();
+    var cap = DoneCapture{};
+    b.on_job_done = &DoneCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    const src = "test/fixtures/box.glb";
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+    try seedLodSentinels(a, src, ladder);
+
+    // The flag is already set: the worker must stop before creating even its
+    // staging dir, let alone touching the deterministic finals.
+    const job = try manualLodsJob(&b, a, "{\"steps\":[{\"prune\":{}}]}", "[0.5,0.25]", src, true);
+    b.job = job;
+    job.run();
+
+    try testing.expectEqual(@as(u32, 1), cap.calls);
+    try testing.expect(job.result == null);
+    try testing.expectEqualStrings("Cancelled", job.err());
+    try testing.expect(job.finished.load(.acquire));
+    for (ladder) |ratio| {
+        const back = try readLodFinal(a, src, ratio);
+        try testing.expectEqualStrings("previous-result", back);
+    }
+    try testing.expect(!stagingLeftover());
+
+    b.releaseJob(job);
+    job.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+    for (ladder) |ratio| {
+        const p = try lodOutName(a, src, ratio);
+        std.Io.Dir.cwd().deleteFile(testing.io, p) catch {};
+    }
+}
+
+test "background lods success uses unique paths and preserves previous results" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const previous_dir = paths.output_dir;
+    paths.output_dir = try scratch.dir.realPathFileAlloc(testing.io, ".", a);
+    defer paths.output_dir = previous_dir;
+    var b = testBackend();
+    var cap = DoneCapture{};
+    b.on_job_done = &DoneCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    const src = "test/fixtures/box.glb";
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+    try seedLodSentinels(a, src, ladder);
+
+    const job = try manualLodsJob(&b, a, "{\"steps\":[{\"prune\":{}}]}", "[0.5,0.25]", src, false);
+    b.job = job;
+    job.run();
+
+    // Success publishes the unique paths, leaving all previous results alone.
+    try testing.expectEqual(@as(u32, 1), cap.calls);
+    try testing.expect(job.result != null);
+    try testing.expect(job.finished.load(.acquire));
+    try testing.expect(!b.requestCancel());
+    for (ladder) |ratio| {
+        const back = try readLodFinal(a, src, ratio);
+        try testing.expectEqualStrings("previous-result", back);
+    }
+    for (job.result.?.lods) |item| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, item.out_path, a, .limited(64 << 20));
+        try testing.expect(bytes.len > "previous-result".len);
+        try testing.expect(std.mem.indexOf(u8, item.out_path, "/lods_") != null);
+    }
+    job.discardResult();
+    try testing.expect(!stagingLeftover());
+
+    b.releaseJob(job);
+    job.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+    for (ladder) |ratio| {
+        const p = try lodOutName(a, src, ratio);
+        std.Io.Dir.cwd().deleteFile(testing.io, p) catch {};
+    }
+}
+
+test "background lods cancel after first rung keeps previous bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    const previous_dir = paths.output_dir;
+    paths.output_dir = try scratch.dir.realPathFileAlloc(testing.io, ".", a);
+    defer paths.output_dir = previous_dir;
+    var b = testBackend();
+    var cap = AtomicCapture{};
+    b.on_job_done = &AtomicCapture.cb;
+    b.on_job_done_ctx = &cap;
+
+    const src = "test/fixtures/real/DamagedHelmet.glb";
+    const ladder = try parseLodRatios(a, "[0.5,0.25]");
+    try seedLodSentinels(a, src, ladder);
+
+    const job = try manualLodsJob(
+        &b,
+        a,
+        "{\"steps\":[{\"simplify\":{\"target_ratio\":0.9,\"error_tolerance\":10.0}}]}",
+        "[0.5,0.25]",
+        src,
+        false,
+    );
+    b.job = job;
+    const thread = try std.Thread.spawn(.{}, Job.run, .{job});
+
+    // Wait for the first staged rung file: the cancel below then lands
+    // strictly after a rung write, while the finals are still untouched.
+    var waited: u32 = 0;
+    while (!stagedFilePresent() and cap.calls.load(.monotonic) == 0 and waited < 4000) : (waited += 1) {
+        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    if (!b.requestCancel()) {
+        // The worker outran the poll: nothing to cancel, outcome fixed.
+        thread.join();
+        b.releaseJob(job);
+        job.destroy();
+        b.on_job_done = null;
+        b.on_job_done_ctx = null;
+        for (ladder) |ratio| {
+            const p = try lodOutName(a, src, ratio);
+            std.Io.Dir.cwd().deleteFile(testing.io, p) catch {};
+        }
+        return error.SkipZigTest;
+    }
+
+    waited = 0;
+    while (cap.calls.load(.monotonic) == 0 and waited < 6000) : (waited += 1) {
+        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    thread.join();
+    try testing.expectEqual(@as(u32, 1), cap.calls.load(.monotonic));
+    try testing.expect(cap.job.? == job);
+    try testing.expect(job.result == null);
+    try testing.expectEqualStrings("Cancelled", job.err());
+    try testing.expect(job.finished.load(.acquire));
+
+    b.releaseJob(job);
+    job.destroy();
+    b.on_job_done = null;
+    b.on_job_done_ctx = null;
+
+    // The previous finished bytes never changed (rungs went to staging, the
+    // commit never ran) and no staging dir is left behind.
+    for (ladder) |ratio| {
+        const back = try readLodFinal(a, src, ratio);
+        try testing.expectEqualStrings("previous-result", back);
+        const p = try lodOutName(a, src, ratio);
+        std.Io.Dir.cwd().deleteFile(testing.io, p) catch {};
+    }
+    try testing.expect(!stagingLeftover());
 }
 
 test "optimizeLODs binding validates before spawning" {
@@ -4030,7 +4804,7 @@ test "texture encode reports an out-of-range index" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 999, null)) {
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 999, null, null)) {
         .failed => |msg| try testing.expect(std.mem.indexOf(u8, msg, "out of range") != null),
         else => return error.TestUnexpectedResult,
     }
@@ -4041,7 +4815,7 @@ test "texture encode writes before/after pngs and reports the settings" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0, null)) {
+    switch (try encodeTexture(testing.io, a, "test/fixtures/box.glb", 0, null, null)) {
         .done => |e| {
             // Absolute paths that actually exist and are real PNGs.
             try testing.expect(std.fs.path.isAbsolute(e.before_png));

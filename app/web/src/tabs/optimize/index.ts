@@ -33,9 +33,8 @@ export function mountOptimize(): TabHandle {
     dual,
     getResult: () => lastResult,
     onRunStarted: () => {
-      lastResult = null;
-      lastReport = null;
-      report.reset();
+      // The previous result/report stay until the new one lands: a cancelled
+      // run must not lose them. The progress strip shows the fresh run.
     },
     onFinished: (res) => {
       lastResult = res;
@@ -54,8 +53,7 @@ export function mountOptimize(): TabHandle {
       notify(t("opt.discarded"), "ok");
     },
     onLodsStarted: () => {
-      lastLods = null;
-      lods.reset();
+      // The previous ladder stays until the new one lands (same no-loss rule).
     },
     onLodsFinished: (items) => {
       lastLods = items;

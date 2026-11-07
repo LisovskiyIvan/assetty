@@ -3,9 +3,26 @@
  * and the options panel. Owns the job state and backend subscriptions.
  */
 import { app } from "../../app";
-import { isBusyError, notifyExportError, pickSaveTarget } from "../../guards";
+import {
+  isBusyError,
+  isCancelledError,
+  isFormTarget,
+  isOverlayOpen,
+  isTabVisible,
+  notifyExportError,
+  pickSaveTarget,
+} from "../../guards";
 import { t } from "../../i18n";
 import { el, fmtSecs } from "../../ui";
+import {
+  claimJob,
+  getJob,
+  jobLabelKey,
+  onJobChange,
+  releaseJob,
+  setJobCancelling,
+} from "../../jobs";
+import type { JobKind } from "../../jobs";
 import { getSettings, getTextureOverrides, updateSettings } from "../../settings";
 import type { OptimizeSteps, TextureOverride, TextureRule } from "../../settings";
 import { notify, onLog } from "../../notify";
@@ -290,10 +307,25 @@ export function createRunFlow(deps: RunDeps): RunApi {
     onclick: () => void generateLods(),
   });
   const exportBtn = el("button", { disabled: true });
+  /** Cancels the in-flight optimize/LOD job; the gate frees on its done event. */
+  const cancelBtn = el("button", {
+    disabled: true,
+    hidden: true,
+    text: t("common.cancel"),
+    title: t("job.cancelTitle"),
+    onclick: () => void cancelJob(),
+  }) as HTMLButtonElement;
+  /** Visible reason while Run/LOD/Export stay disabled (never title-only). */
+  const blockHint = el("div", { class: "hint", id: "opt-run-hint" });
+  blockHint.hidden = true;
   /** Compact progress strip: lives with the Run button so it stays visible. */
   const progressFill = el("div");
   const progressMeta = el("span", { class: "run-progress-meta" });
   const progressBar = el("div", { class: "progress grow" }, progressFill);
+  progressBar.setAttribute("role", "progressbar");
+  progressBar.setAttribute("aria-valuemin", "0");
+  progressBar.setAttribute("aria-valuemax", "100");
+  progressBar.setAttribute("aria-valuenow", "0");
   /** Stage chips (`load → geometry → textures → write → done`): one row above
    * the numeric bar. Always in the DOM (reserved min-height) so the report
    * below never shifts; empty until the first run plans it. */
@@ -328,7 +360,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
       viewNote,
       guardBox,
       presetRow,
-      el("div", { class: "row" }, runBtn, lodBtn, exportBtn),
+      el("div", { class: "row" }, runBtn, lodBtn, exportBtn, cancelBtn),
+      blockHint,
       chipsRow,
       el("div", { class: "row run-progress" }, progressBar, progressMeta),
       logLine,
@@ -341,6 +374,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
   let running = false;
   /** Which job owns the gate: an optimize run or an LOD ladder. */
   let jobKind: "optimize" | "lods" | null = null;
+  /** Cancel requested: the terminal done event is still pending, no new Run. */
+  let cancelling = false;
   /** True while an exportTo copy is in flight (Save as… stays disabled). */
   let exporting = false;
   /** `dst` of the in-flight export; only the matching exportDone notifies. */
@@ -470,6 +505,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     progressMeta.textContent = clock ? `${base} · ${clock}` : base;
     progressMeta.title = clock ? t("opt.elapsedTitle") : "";
     progressFill.style.width = `${progressPct}%`;
+    progressBar.setAttribute("aria-valuenow", String(Math.round(progressPct)));
   }
 
   function setProgress(
@@ -513,23 +549,118 @@ export function createRunFlow(deps: RunDeps): RunApi {
     logLine.title = message;
   }
 
+  function syncCancelBtn(): void {
+    // Visible only while this tab's job owns the gate (encode creates its
+    // button on demand; apply mirrors this in its own bar).
+    cancelBtn.hidden = !running;
+    cancelBtn.textContent = cancelling ? t("common.cancelling") : t("common.cancel");
+    cancelBtn.disabled = !running || cancelling;
+    cancelBtn.title = t("job.cancelTitle");
+  }
+
   function setRunning(on: boolean): void {
     running = on;
     if (on) startClock();
     else stopClock();
     runBtn.textContent = on ? t("opt.running") : t("opt.run");
     lodBtn.textContent = on ? t("opt.lodsRunning") : t("opt.lods");
-    runBtn.disabled = on || !app.bridge.live || !app.sourcePath;
-    lodBtn.disabled = on || !app.bridge.live || !app.sourcePath;
-    exportBtn.disabled = on || exporting || !deps.getResult();
+    syncCancelBtn();
     progressBar.classList.toggle("running", on);
+    panel.setAttribute("aria-busy", on ? "true" : "false");
+    syncControls();
     renderChips();
+  }
+
+  /** Visible reason while the action buttons stay disabled (never title-only). */
+  function blockReason(): string | null {
+    if (running) return null; // the progress strip + Cancel carry the state
+    const bus = getJob();
+    if (bus.kind !== null && bus.kind !== "optimize" && bus.kind !== "lods") {
+      return t("job.busyNote", { job: t(jobLabelKey(bus.kind)) });
+    }
+    if (!app.bridge.live) return t("job.noHost");
+    if (!app.sourcePath) return t("viewer.openHint");
+    return null;
+  }
+
+  function applyBlockReason(btn: HTMLButtonElement, reason: string | null, fallback: string): void {
+    if (reason) {
+      btn.title = reason;
+      btn.setAttribute("aria-describedby", "opt-run-hint");
+    } else {
+      btn.title = fallback;
+      btn.removeAttribute("aria-describedby");
+    }
+  }
+
+  function syncControls(): void {
+    const bus = getJob().kind;
+    const otherBusy = !running && bus !== null && bus !== "optimize" && bus !== "lods";
+    const noHost = !app.bridge.live;
+    const noSource = !app.sourcePath;
+    const noResult = !deps.getResult();
+    const reason = blockReason();
+    // Export explains itself when the source is open but nothing ran yet;
+    // Run/LOD stay enabled then, without a misleading title.
+    const hint = reason ?? (noResult && !noHost && !noSource ? t("job.noResult") : null);
+    blockHint.textContent = hint ?? "";
+    blockHint.hidden = hint == null;
+    const blocked = running || otherBusy || noHost || noSource;
+    runBtn.disabled = blocked;
+    lodBtn.disabled = blocked;
+    exportBtn.disabled = running || exporting || otherBusy || noResult;
+    applyBlockReason(runBtn as HTMLButtonElement, reason, "");
+    applyBlockReason(lodBtn as HTMLButtonElement, reason, t("opt.lodsTitle"));
+    const exportReason = running
+      ? t("opt.runningShort")
+      : otherBusy && reason
+        ? reason
+        : exporting
+          ? t("opt.exporting")
+          : noResult
+            ? t("job.noResult")
+            : null;
+    applyBlockReason(exportBtn as HTMLButtonElement, exportReason, "");
+    if (exportReason && blockHint.hidden) {
+      // The progress strip carries the state — no stale describedby target.
+      exportBtn.removeAttribute("aria-describedby");
+    }
   }
 
   function setExporting(on: boolean): void {
     exporting = on;
     exportBtn.textContent = on ? t("opt.exporting") : t("opt.export");
     exportBtn.disabled = running || on || !deps.getResult();
+    syncControls();
+  }
+
+  /** Export uses the same primary gate: claim it so other tabs disable with a reason. */
+  let exportTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearExportTimer(): void {
+    if (exportTimer) {
+      clearTimeout(exportTimer);
+      exportTimer = null;
+    }
+  }
+
+  /** Timeout never frees the gate: the backend still owns it, so keep waiting. */
+  function armExportTimer(): void {
+    clearExportTimer();
+    exportTimer = setTimeout(() => {
+      exportTimer = null;
+      if (!exporting) return;
+      setLog(t("job.stillRunning"));
+      notify(t("job.stillRunning"), "info");
+      armExportTimer();
+    }, RUN_TIMEOUT_MS);
+  }
+
+  function stopExporting(): void {
+    clearExportTimer();
+    pendingDst = null;
+    releaseJob("export");
+    setExporting(false);
   }
 
   /**
@@ -542,16 +673,29 @@ export function createRunFlow(deps: RunDeps): RunApi {
       notify(t("opt.exportBusy"), "error");
       return;
     }
+    const other = getJob();
+    if (other.kind !== null) {
+      notify(t("job.busyNote", { job: t(jobLabelKey(other.kind)) }), "error");
+      return;
+    }
     const dst = await pickSaveTarget(outPath);
     if (!dst) return; // cancel, no host, or dialog failure (already toasted)
+    if (!claimJob("export")) {
+      const owner = getJob().kind;
+      notify(
+        owner ? t("job.busyNote", { job: t(jobLabelKey(owner)) }) : t("opt.exportBusy"),
+        "error",
+      );
+      return;
+    }
     setExporting(true);
     pendingDst = dst;
+    armExportTimer();
     setLog(t("opt.exportingTo", { path: dst }));
     try {
       await app.bridge.exportTo(outPath, dst);
     } catch (err) {
-      pendingDst = null;
-      setExporting(false);
+      stopExporting();
       notifyExportError(err);
     }
   }
@@ -580,8 +724,73 @@ export function createRunFlow(deps: RunDeps): RunApi {
     }
     stopProgress?.();
     stopProgress = null;
+    if (jobKind) releaseJob(jobKind);
     jobKind = null;
+    cancelling = false;
     setRunning(false);
+  }
+
+  /**
+   * Asks the host to stop the in-flight job. The gate frees only on the
+   * terminal done event, so nothing releases here. A refused/failed request
+   * restores Cancel (never stuck in "Cancelling…") while the job keeps
+   * running; the running+kind guard keeps a late RPC from touching a job
+   * that already finished meanwhile.
+   */
+  async function cancelJob(): Promise<void> {
+    if (!running || cancelling || jobKind === null) return;
+    const kind: JobKind = jobKind;
+    cancelling = true;
+    setJobCancelling(kind, true);
+    syncCancelBtn();
+    setProgress(t("job.cancelling"), progressPct);
+    setLog(t("job.cancelling"));
+    let accepted = false;
+    let failed = false;
+    try {
+      accepted = (await app.bridge.cancelJob()).cancelled;
+    } catch (err) {
+      failed = true;
+      notify(t("job.cancelFail", { message: (err as Error).message }), "error");
+    }
+    if (!running || jobKind !== kind) return; // finished while the RPC flew
+    if (!accepted) {
+      cancelling = false;
+      setJobCancelling(kind, false);
+      syncCancelBtn();
+      setProgress(t("job.stillRunning"), progressPct);
+      setLog(t("job.stillRunning"));
+      if (!failed) notify(t("job.stillRunning"), "info");
+    }
+    // Accepted: the terminal done event (ok:false, error:"Cancelled") frees
+    // the gate. Still here if the RPC threw — the job keeps running.
+  }
+
+  /** Timeout never frees the gate: the terminal done event is contractually
+   * guaranteed, so a missing one means the backend is still working — keep
+   * waiting (and keep Cancel available) instead of releasing prematurely. */
+  function armDoneTimer(): void {
+    if (doneTimer) clearTimeout(doneTimer);
+    doneTimer = setTimeout(() => {
+      doneTimer = null;
+      if (!running) return;
+      setProgress(t("job.stillRunning"), progressPct);
+      setLog(t("job.stillRunning"));
+      notify(t("job.stillRunning"), "info");
+      armDoneTimer();
+    }, RUN_TIMEOUT_MS);
+  }
+
+  /** Neutral end of a user-cancelled job: info, never error; result kept. */
+  function finishCancelled(): void {
+    stopJob();
+    resetSub();
+    stageActive = null;
+    stageDoneAll = false;
+    freezeClock();
+    setProgress(t("job.cancelled"), 0);
+    setLog(t("job.cancelled"));
+    notify(t("job.cancelled"), "info");
   }
 
   function finishJobError(message: string): void {
@@ -616,6 +825,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
   const offDone = app.bridge.onOptimizeDone((event) => {
     if (!running || jobKind !== "optimize") return;
     if (!event.ok) {
+      if (isCancelledError(event.error)) {
+        finishCancelled();
+        return;
+      }
       finishJobError(event.error);
       return;
     }
@@ -636,6 +849,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
   const offLodsDone = app.bridge.onLodsDone((event) => {
     if (!running || jobKind !== "lods") return;
     if (!event.ok) {
+      if (isCancelledError(event.error)) {
+        finishCancelled();
+        return;
+      }
       stopJob();
       resetSub();
       resetStages();
@@ -660,13 +877,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
   const offExport = app.bridge.onExportDone((event) => {
     if (exporting && pendingDst != null) {
       if (event.ok && event.dst === pendingDst) {
-        pendingDst = null;
-        setExporting(false);
+        stopExporting();
         setLog(t("opt.savedTo", { path: event.dst }));
         notify(t("opt.savedTo", { path: event.dst }), "ok");
       } else if (!event.ok) {
-        pendingDst = null;
-        setExporting(false);
+        stopExporting();
         notify(t("opt.exportFail", { message: event.error }), "error");
       }
     }
@@ -1073,8 +1288,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       notify(t("opt.loadFail", { message: (err as Error).message }), "error");
       deps.dual.showOpenHint();
     }
-    runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
-    lodBtn.disabled = running || !app.bridge.live || !app.sourcePath;
+    syncControls();
   }
 
   /** Images of the optimize source (cached info when it matches, else fresh). */
@@ -1148,6 +1362,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
   async function doRun(): Promise<void> {
     const path = app.sourcePath;
     if (!path || running) return;
+    const other = getJob();
+    if (other.kind !== null) {
+      notify(t("job.busyNote", { job: t(jobLabelKey(other.kind)) }), "error");
+      return;
+    }
     const specSteps = buildSpec(steps());
     if (specSteps.length === 0) {
       notify(t("opt.pickStep"), "error");
@@ -1157,8 +1376,10 @@ export function createRunFlow(deps: RunDeps): RunApi {
     stopProgress?.();
     stopProgress = null;
     jobKind = "optimize";
+    claimJob("optimize");
     setRunning(true);
-    /* The run supersedes the previous result: drop it before doing any work. */
+    /* The previous result stays until the new one lands: a cancelled run
+     * must not lose it (deps.onRunStarted no longer clears). */
     deps.onRunStarted();
     resetSub();
     stagePlan = planStages(specSteps);
@@ -1181,10 +1402,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
         }
         setProgress(t("opt.runningShort"), 0);
         setLog(t("opt.runningBg"));
-        doneTimer = setTimeout(() => {
-          doneTimer = null;
-          finishJobError(t("opt.jobTimeout"));
-        }, RUN_TIMEOUT_MS);
+        armDoneTimer();
         return;
       }
 
@@ -1220,6 +1438,32 @@ export function createRunFlow(deps: RunDeps): RunApi {
     if (res) void saveAs(res.out_path);
   });
 
+  // Escape cancels the in-flight optimize/LOD job. The preset menu/save row
+  // owns Escape first (close + focus back on its toggle); editable fields
+  // and other overlays own it next. Hidden tabs never act (main.ts keeps them
+  // mounted with display:none), and held keys don't repeat the cancel.
+  const onKey = (ev: KeyboardEvent): void => {
+    if (ev.key !== "Escape" || ev.repeat || !isTabVisible(panel)) return;
+    if (menuOpen || saveOpen) {
+      const wasMenu = menuOpen;
+      menuOpen = false;
+      saveOpen = false;
+      confirmDelete = null;
+      renderPresetRow();
+      const toggle = presetRow.querySelector<HTMLElement>(
+        wasMenu ? ".preset-menu-wrap > button" : ".preset-save-wrap > button",
+      );
+      toggle?.focus();
+      return;
+    }
+    if (isFormTarget(ev.target) || isOverlayOpen()) return;
+    if (running && !cancelling) void cancelJob();
+  };
+  document.addEventListener("keydown", onKey);
+
+  // Another tab claimed the gate (encode/apply): reflect it in the buttons.
+  const offJob = onJobChange(() => syncControls());
+
   /* ------------------------------------------------------------ LOD ladder */
 
   async function generateLods(): Promise<void> {
@@ -1227,6 +1471,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
     if (!path || running) return;
     if (!app.bridge.live) {
       notify(t("opt.lodsDemo"), "error");
+      return;
+    }
+    const other = getJob();
+    if (other.kind !== null) {
+      notify(t("job.busyNote", { job: t(jobLabelKey(other.kind)) }), "error");
       return;
     }
     // The current form spec is the base: same steps, simplify overridden per
@@ -1240,6 +1489,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     stopProgress?.();
     stopProgress = null;
     jobKind = "lods";
+    claimJob("lods");
     setRunning(true);
     deps.onLodsStarted();
     resetSub();
@@ -1267,15 +1517,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
         }
         setProgress(t("opt.runningShort"), 0);
         setLog(t("opt.runningBg"));
-        doneTimer = setTimeout(() => {
-          doneTimer = null;
-          stopJob();
-          resetSub();
-          resetStages();
-          freezeClock();
-          setProgress(t("common.failed"), 0);
-          notify(t("opt.lodsFailedMsg", { message: t("opt.jobTimeout") }), "error");
-        }, RUN_TIMEOUT_MS);
+        armDoneTimer();
         return;
       }
 
@@ -1309,11 +1551,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     exportNote,
     edit,
     isInternalEdit: () => internalEdit,
-    syncControls: () => {
-      runBtn.disabled = running || !app.bridge.live || !app.sourcePath;
-      lodBtn.disabled = running || !app.bridge.live || !app.sourcePath;
-      exportBtn.disabled = running || exporting || !deps.getResult();
-    },
+    syncControls,
     syncSourceHead,
     syncTexts: () => {
       optSectionHead.textContent = t("opt.section");
@@ -1322,8 +1560,11 @@ export function createRunFlow(deps: RunDeps): RunApi {
       runBtn.textContent = running ? t("opt.running") : t("opt.run");
       lodBtn.textContent = running ? t("opt.lodsRunning") : t("opt.lods");
       lodBtn.title = t("opt.lodsTitle");
+      cancelBtn.title = t("job.cancelTitle");
+      syncCancelBtn();
       exportBtn.textContent = exporting ? t("opt.exporting") : t("opt.export");
       exportNote.textContent = t("opt.exportNote");
+      syncControls();
       renderProgress();
       renderChips();
     },
@@ -1333,11 +1574,24 @@ export function createRunFlow(deps: RunDeps): RunApi {
     discardResult,
     viewResult,
     dispose: () => {
+      document.removeEventListener("keydown", onKey);
       offDone();
       offLodsDone();
       offExport();
       offLog();
-      stopJob();
+      offJob();
+      // Unmount never frees an in-flight gate: the backend still owns it.
+      // (Tabs live for the app lifetime; this only matters for HMR/tests.)
+      if (!running) stopJob();
+      else {
+        if (doneTimer) {
+          clearTimeout(doneTimer);
+          doneTimer = null;
+        }
+        clearExportTimer();
+        stopProgress?.();
+        stopProgress = null;
+      }
     },
   };
 }

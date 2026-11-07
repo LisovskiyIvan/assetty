@@ -10,6 +10,9 @@
  *   openDialog()            -> { path } | "/abs/file.glb" | null (cancel)
  *   pickSavePath(name)      -> { path } | "/abs/out.glb" | null (cancel)
  *   exportTo(src, dst)      -> { started: true } — result arrives as "exportDone"
+ *   cancelJob()             -> { cancelled } — the primary job still reports its
+ *                              terminal done event (ok:false, error:"Cancelled");
+ *                              the gate stays busy until then (missing on old hosts)
  *   info(path)              -> Info
  *   loadBytes(path)         -> { b64, size } | string (base64)
  *   optimize(path, preset)  -> { started: true } — result arrives as "optimizeDone"

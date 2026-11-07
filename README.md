@@ -10,12 +10,28 @@ Grab a build from [GitHub Releases](../../releases):
 
 | asset | platform | notes |
 |---|---|---|
-| `assetty-macos-arm64.zip` | macOS 12+ (Apple Silicon) | nothing to install |
+| `assetty-macos-arm64.dmg` | macOS 12+ (Apple Silicon) | drag `assetty.app` to Applications |
+| `assetty-macos-arm64.zip` | macOS 12+ (Apple Silicon) | same app; also used by the updater |
 | `assetty-windows-x64.zip` | Windows 10/11 x64 | WebView2 preinstalled on Win10/11 |
 | `assetty-linux-x64.tar.gz` | Linux x64 | needs GTK 3/4 + WebKitGTK 2.40+ (`sudo apt install libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`) |
 | `assetty-linux-arm64.tar.gz` | Linux ARM64 | same |
 
-Unpack, run `assetty` — that opens the desktop app. Same binary with arguments is the CLI (`assetty help`).
+On macOS, open the DMG and drag `assetty.app` to Applications. Double-click the app for the GUI, use **Open With → assetty** on a `.glb`, or drop a model on the Dock icon. The app remains unsigned: Gatekeeper approval may still be required on the first launch.
+
+The same binary is also the CLI. To install the `assetty` command for your user (no sudo):
+
+```sh
+sh /Applications/assetty.app/Contents/Resources/install-cli.sh
+# Follow the printed PATH instruction if ~/.local/bin is not on your PATH.
+assetty help
+assetty info model.glb
+```
+
+Without command installation: `/Applications/assetty.app/Contents/MacOS/assetty help`. CLI commands preserve the caller's working directory and relative file paths; `help` writes to stdout.
+
+On Windows, unpack and double-click `assetty.exe` for the GUI without a console. Keep the included `WebView2Loader.dll` beside it. Commands still work from a terminal; scripts that need reliable waiting/exit codes for this GUI-subsystem executable should use a process API such as PowerShell `Start-Process -Wait -PassThru`.
+
+On Linux, unpack and run `sh install.sh` to install the desktop launcher, icon and CLI for your user, without sudo. The launcher opens the GUI without a terminal and accepts `.glb` files. Running `./assetty` directly remains supported.
 
 **Updates:** Settings → check for updates; on a new release the app downloads it, verifies the checksum, swaps the binary and **restarts itself** (all platforms). Releases are published per tag, not per commit.
 
@@ -53,6 +69,8 @@ Run `assetty` with no arguments. Tabs:
 Strip animations: one checkbox — drops all animation tracks, keeps the scene graph and skins (on a 28 MiB animated character: mobile preset 28 → 8.3 MiB, +strip → **3.7 MiB**, −87%).
 
 Pipeline progress is animated: stage chips (load → geometry → textures → write → done) with a spinner, `texture 3/7` sub-progress and an elapsed clock.
+
+**Cancel** (or `Esc` outside menus/text fields) requests a safe stop of Optimize, LOD, texture encoding or Apply. An encoder call already in flight finishes first; the UI shows **Cancelling…** and keeps conflicting actions disabled until the worker exits. Disabled actions explain the missing model, demo mode or active job. Subtle transitions respect the system's reduced-motion preference; keyboard focus is visible and the comparison divider supports arrow keys, Home and End.
 
 ## CLI
 
@@ -112,5 +130,5 @@ gltfpack-`-cc`-style: every eligible vertex/index buffer view is meshopt-compres
 ## Notes
 
 - Malformed GLBs exit with clean errors (fuzzed corpus, 600+ runs, zero crashes — ReleaseFast keeps runtime checks off, parse layer validates instead).
-- Settings live in `assetty.settings.json` (cwd) — the app writes it atomically and tolerates hand edits.
+- Installed macOS apps keep settings and user presets in `~/Library/Application Support/assetty/`, and temporary results in `~/Library/Caches/assetty/results/`. Existing settings/presets next to the app are copied on first launch without deleting the originals or replacing newer user data. Raw/development binaries keep `assetty.settings.json` and `.zig-cache/assetty-app/` in the working directory. Settings writes are atomic.
 - Roadmap: batch/folder mode, `.gltf` (non-binary) output, signed macOS bundles for in-app updates.

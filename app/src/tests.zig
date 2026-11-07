@@ -6,4 +6,6 @@ test {
     _ = @import("assets.zig");
     _ = @import("update.zig");
     _ = @import("backend.zig");
+    _ = @import("paths.zig");
+    _ = @import("native_open.zig");
 }

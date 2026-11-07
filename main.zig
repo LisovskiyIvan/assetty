@@ -1,5 +1,5 @@
 //! Single-binary entry: `assetty` with no args opens the desktop app,
-//! any args are dispatched to the CLI — on every platform.
+//! commands use the CLI; a `.glb` path opens the desktop viewer.
 const std = @import("std");
 const config = @import("config");
 
@@ -20,16 +20,22 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         if (first) |a| {
-            if (nanoui_flag or std.mem.eql(u8, a, "app") or std.mem.eql(u8, a, "--app") or std.mem.eql(u8, a, "-a")) {
+            if (nanoui_flag or std.mem.eql(u8, a, "app") or std.mem.eql(u8, a, "--app") or std.mem.eql(u8, a, "-a") or
+                std.mem.eql(u8, a, "--open") or @import("app/src/native_open.zig").isSupportedPath(a))
+            {
                 return @import("app/src/main.zig").run(init);
             }
         } else {
+            // GUI-subsystem binary (Windows app build): a double-click opens
+            // the window with no console, ever. Shell launches of the CLI
+            // branch below attach the parent console themselves.
             return @import("app/src/main.zig").run(init);
         }
+        @import("app/src/windows_console.zig").attachParentConsole(init);
         return @import("cli/src/main.zig").run(init);
     }
 
-    // CLI-only build (`-Dapp=false`): no desktop app in this binary.
+    // CLI-only build (`-Dapp=false`): a console program, no console games.
     if (first == null) {
         std.debug.print("assetty: built without the desktop app; use CLI commands (info, optimize, textures, presets)\n", .{});
         return 2;

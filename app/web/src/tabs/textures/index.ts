@@ -3,7 +3,24 @@ import { app } from "../../app";
 import { isMissingMethodError, notify } from "../../notify";
 import { onLang, t } from "../../i18n";
 import { el, fmtBytes } from "../../ui";
-import { createSeq, createSettingsEdit, isBusyError, notifyJobError } from "../../guards";
+import {
+  createSeq,
+  createSettingsEdit,
+  isBusyError,
+  isCancelledError,
+  isFormTarget,
+  isOverlayOpen,
+  isTabVisible,
+  notifyJobError,
+} from "../../guards";
+import {
+  claimJob,
+  getJob,
+  jobLabelKey,
+  onJobChange,
+  releaseJob,
+  setJobCancelling,
+} from "../../jobs";
 import { clearTextureOverride, replaceTextureOverride, onSettingsChange } from "../../settings";
 import type { TextureOverride } from "../../settings";
 import type { EncodeResult, ImageInfo, TexturePreview } from "../../types";
@@ -58,6 +75,8 @@ export function mountTextures(): TabHandle {
   /* -------------------------------------------------------------- encode state */
 
   let activeEncode: ActiveEncode | null = null;
+  /** Cancel requested: the terminal encode-done event is still pending. */
+  let cancellingEncode = false;
   const encodeSeq = createSeq();
   let encodeTimer: ReturnType<typeof setTimeout> | null = null;
   const results = new Map<number, EncodeResult>();
@@ -85,6 +104,8 @@ export function mountTextures(): TabHandle {
   }
 
   function renderSide(): void {
+    const bus = getJob();
+    const otherKind = !activeEncode && bus.kind !== null && bus.kind !== "encode" ? bus.kind : null;
     renderSidePanel(
       side,
       {
@@ -96,12 +117,15 @@ export function mountTextures(): TabHandle {
         previewErrorIndex,
         results,
         encoding: activeEncode !== null,
+        cancelling: cancellingEncode,
+        busyNote: otherKind ? t("job.busyNote", { job: t(jobLabelKey(otherKind)) }) : null,
         encodeBtn,
         previewActs: bar.previewActs,
       },
       {
         onDeselect: () => deselect(),
         onEncode: () => void startEncode(),
+        onCancelEncode: () => void cancelEncode(),
         onApplyShortcut: (settings) => void applyFlow.start(settings),
         commitOverride: (src: string, patch: TextureOverride) => {
           selfEdit.wrap(() => {
@@ -235,7 +259,62 @@ export function mountTextures(): TabHandle {
       clearTimeout(encodeTimer);
       encodeTimer = null;
     }
+    releaseJob("encode");
     activeEncode = null;
+    cancellingEncode = false;
+  }
+
+  /** Timeout never frees the gate: the terminal event is still owed, so keep
+   * waiting (and keep Cancel available). Re-arms until the done event lands. */
+  function armEncodeTimer(token: number): void {
+    if (encodeTimer) clearTimeout(encodeTimer);
+    encodeTimer = setTimeout(() => {
+      encodeTimer = null;
+      if (!encodeSeq.check(token) || !activeEncode) return;
+      renderList();
+      renderSide();
+      notify(t("job.stillRunning"), "info");
+      armEncodeTimer(token);
+    }, ENCODE_TIMEOUT_MS);
+  }
+
+  /** Neutral end of a user-cancelled encode: info, never error; kept results stay. */
+  function finishEncodeCancelled(): void {
+    clearEncodeState();
+    renderList();
+    renderSide();
+    notify(t("job.cancelled"), "info");
+  }
+
+  /**
+   * Asks the host to stop the in-flight encode. The gate frees only on the
+   * terminal encode-done event, so nothing releases here. A refused/failed
+   * request restores Cancel while the job keeps running; the token guard
+   * keeps a late RPC from touching a job that already finished meanwhile.
+   */
+  async function cancelEncode(): Promise<void> {
+    if (!activeEncode || cancellingEncode) return;
+    const token = activeEncode.token;
+    cancellingEncode = true;
+    setJobCancelling("encode", true);
+    renderList();
+    renderSide();
+    let accepted = false;
+    let failed = false;
+    try {
+      accepted = (await app.bridge.cancelJob()).cancelled;
+    } catch (err) {
+      failed = true;
+      notify(t("job.cancelFail", { message: (err as Error).message }), "error");
+    }
+    if (activeEncode?.token !== token) return; // finished while the RPC flew
+    if (!accepted) {
+      cancellingEncode = false;
+      setJobCancelling("encode", false);
+      renderList();
+      renderSide();
+      if (!failed) notify(t("job.stillRunning"), "info");
+    }
   }
 
   function applyEncode(index: number, result: EncodeResult): void {
@@ -279,24 +358,25 @@ export function mountTextures(): TabHandle {
     const path = app.viewPath;
     const img = images.find((i) => i.index === selected);
     if (!path || !img || activeEncode) return;
+    const other = getJob();
+    if (other.kind !== null) {
+      notify(t("job.busyNote", { job: t(jobLabelKey(other.kind)) }), "error");
+      return;
+    }
     const token = encodeSeq.next();
+    claimJob("encode");
     activeEncode = { token, index: img.index, path };
+    cancellingEncode = false;
     renderList();
     renderSide();
     try {
       const call = await app.bridge.textureEncode(path, img.index, effectiveFor(img));
       if (!encodeSeq.check(token) || activeEncode?.token !== token) return;
       if (call.started) {
-        encodeTimer = setTimeout(() => {
-          encodeTimer = null;
-          if (!encodeSeq.check(token)) return;
-          activeEncode = null;
-          renderList();
-          renderSide();
-          notify(t("tex.encodeTimeout"), "error");
-        }, ENCODE_TIMEOUT_MS);
+        armEncodeTimer(token);
         return;
       }
+      releaseJob("encode");
       applyEncode(img.index, call.result);
     } catch (err) {
       if (!encodeSeq.check(token)) return;
@@ -338,6 +418,10 @@ export function mountTextures(): TabHandle {
       return;
     }
     if (!event.ok) {
+      if (isCancelledError(event.error)) {
+        finishEncodeCancelled();
+        return;
+      }
       clearEncodeState();
       renderList();
       renderSide();
@@ -383,8 +467,11 @@ export function mountTextures(): TabHandle {
     clearPreviewTimer();
     previewSeq.bump();
     compareGen.bump();
-    encodeSeq.bump();
-    clearEncodeState();
+    // An in-flight encode keeps its claim: the backend still owns the gate
+    // and the terminal event finalizes it (path-mismatch releases safely).
+    // Only the seq is NOT bumped for the encode — stale encode replies must
+    // still land while the job runs. Preview seqs are bumped above.
+    if (!activeEncode) clearEncodeState();
     applyFlow.reset();
     applyFlow.syncActsOn();
     results.clear();
@@ -418,9 +505,30 @@ export function mountTextures(): TabHandle {
   });
 
   const onKey = (ev: KeyboardEvent): void => {
-    if (ev.key === "Escape" && selected >= 0) deselect();
+    // Hidden tabs never act (both tabs stay mounted); held keys don't repeat.
+    if (ev.key !== "Escape" || ev.repeat || !isTabVisible(root)) return;
+    if (isFormTarget(ev.target) || isOverlayOpen()) return;
+    // One Escape = one action: a running job first (encode, then apply), else
+    // the row selection. Open menus own Escape (see isOverlayOpen).
+    if (activeEncode && !cancellingEncode) {
+      void cancelEncode();
+      return;
+    }
+    if (applyFlow.isRunning()) {
+      void applyFlow.cancel();
+      return;
+    }
+    if (cancellingEncode) return; // terminal event still pending
+    if (selected >= 0) deselect();
   };
   document.addEventListener("keydown", onKey);
+
+  // Another tab claimed the gate (optimize/LODs): reflect it in the buttons.
+  const offJob = onJobChange(() => {
+    renderList();
+    renderSide();
+    applyFlow.sync();
+  });
 
   return {
     el: root,
@@ -438,8 +546,14 @@ export function mountTextures(): TabHandle {
       offPreviewDone();
       offApplySettings();
       offLang();
+      offJob();
       applyFlow.dispose();
-      clearEncodeState();
+      // Unmount never frees an in-flight gate: the backend still owns it.
+      if (!activeEncode) clearEncodeState();
+      else if (encodeTimer) {
+        clearTimeout(encodeTimer);
+        encodeTimer = null;
+      }
       clearPreviewTimer();
       previewSeq.bump();
       encodeSeq.bump();

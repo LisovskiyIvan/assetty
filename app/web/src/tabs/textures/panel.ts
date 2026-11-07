@@ -41,6 +41,10 @@ export interface SidePanelState {
   results: Map<number, EncodeResult>;
   /** Dry-run encode in flight (button shows the busy label). */
   encoding: boolean;
+  /** Cancel requested: the terminal encode-done event is still pending. */
+  cancelling: boolean;
+  /** Visible reason while Encode stays disabled (never title-only). */
+  busyNote: string | null;
   encodeBtn: HTMLButtonElement;
   /** "Acts on <view>" muted hint (owned by the apply bar, shown in dry-run). */
   previewActs: HTMLElement;
@@ -49,6 +53,7 @@ export interface SidePanelState {
 export interface SidePanelCbs {
   onDeselect(): void;
   onEncode(): void;
+  onCancelEncode(): void;
   onApplyShortcut(settings?: EncodeSettings): void;
   commitOverride(src: string, patch: TextureOverride): void;
   resetOverride(src: string, img: ImageInfo): void;
@@ -474,6 +479,8 @@ export function renderSidePanel(
     previewErrorIndex,
     results,
     encoding,
+    cancelling,
+    busyNote,
     encodeBtn,
     previewActs,
   } = state;
@@ -532,8 +539,25 @@ export function renderSidePanel(
     overrideEditor(img, cbs),
   );
 
-  const dryRun: Array<Node | string> = [
-    el("div", { class: "row" }, encodeBtn),
+  const dryRun: Array<Node | string | null> = [
+    el(
+      "div",
+      { class: "row" },
+      encodeBtn,
+      (() => {
+        if (!encoding) return null;
+        const cancel = el("button", {
+          text: cancelling ? t("common.cancelling") : t("common.cancel"),
+          title: t("job.cancelTitle"),
+          disabled: cancelling,
+        });
+        cancel.addEventListener("click", () => cbs.onCancelEncode());
+        return cancel;
+      })(),
+    ),
+    busyNote && !encoding
+      ? el("div", { class: "hint", id: "tex-encode-hint", text: busyNote })
+      : null,
     previewActs,
     el("div", {
       class: "hint",
@@ -561,9 +585,24 @@ export function renderSidePanel(
   } else {
     dryRun.push(el("div", { class: "muted", text: t("tex.notEncoded") }));
   }
-  encodeBtn.textContent = !encoding ? t("tex.encodeBtn") : t("tex.previewing");
-  encodeBtn.disabled = !app.bridge.live || encoding;
-  body.append(el("div", { class: "section-title", text: t("tex.dryRun") }), ...dryRun);
+  encodeBtn.textContent = cancelling
+    ? t("common.cancelling")
+    : !encoding
+      ? t("tex.encodeBtn")
+      : t("tex.previewing");
+  encodeBtn.disabled = !app.bridge.live || encoding || !!busyNote;
+  if (encodeBtn.disabled && busyNote) {
+    encodeBtn.title = busyNote;
+    encodeBtn.setAttribute("aria-describedby", "tex-encode-hint");
+  } else {
+    encodeBtn.title = "";
+    encodeBtn.removeAttribute("aria-describedby");
+  }
+  encodeBtn.setAttribute("aria-busy", encoding ? "true" : "false");
+  body.append(
+    el("div", { class: "section-title", text: t("tex.dryRun") }),
+    ...dryRun.filter((n): n is Node | string => n !== null),
+  );
   if (result)
     body.append(
       ...compareNodes(

@@ -23,6 +23,7 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=6144
       - run: bun run typecheck
+      - run: bun test src
       - run: bun install -g oxlint
       - run: oxlint src
 
@@ -50,3 +51,13 @@ jobs:
       # Explicit gnu target: same cross config the release matrix ships, and
       # it does not depend on the runner's MSVC environment.
       - run: zig build -Dtarget=x86_64-windows-gnu --summary all
+      # Stage WebView2Loader.dll + license next to the GUI exe (nanoui loads
+      # it dynamically; without it the GUI falls back even with the runtime
+      # installed). Must run before the smoke so zig-out/bin matches the ZIP.
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/fetch-webview2.ps1
+      # Runtime smoke without opening a window: CLI-only args that print and
+      # exit. The script launches via Start-Process -Wait / Process.WaitForExit,
+      # which really wait for a GUI-subsystem exe (plain `&`/cmd do not
+      # reliably report its exit code). Covers stdout/stderr, `>`/`2>`
+      # redirects, pipes, error text, and exit codes.
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-windows.ps1

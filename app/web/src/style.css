@@ -397,6 +397,36 @@ button:hover:not(:disabled) {
   border-color: var(--accent);
 }
 
+/* Subtle state transitions (no layout shift, no color flashes). */
+button,
+select,
+input,
+textarea,
+.tab,
+.stage-chip,
+.badge {
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+/* Keyboard-only outlines: mouse users see no ring. */
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible,
+.split-grip:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: -2px;
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -999,6 +1029,20 @@ tr.selected {
 
   .stage-spin {
     animation: none;
+  }
+
+  .spin {
+    animation: none;
+  }
+
+  button,
+  select,
+  input,
+  textarea,
+  .tab,
+  .stage-chip,
+  .badge {
+    transition: none;
   }
 }
 

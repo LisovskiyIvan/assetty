@@ -14,10 +14,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nanoui = @import("nanoui");
+const native_open = @import("native_open.zig");
 
 const has_page = nanoui.Call != void;
 
 pub fn run(init: std.process.Init) !u8 {
+    defer native_open.deinit();
+    // Resolve document arguments before the installed bundle switches to its
+    // writable data directory. CLI commands never enter this function.
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
+    _ = args.skip();
+    const cwd = try std.process.currentPathAlloc(init.io, init.gpa);
+    defer init.gpa.free(cwd);
+    while (args.next()) |arg| {
+        if (!native_open.isSupportedPath(arg)) continue;
+        const path = try std.fs.path.resolve(init.gpa, &.{ cwd, arg });
+        defer init.gpa.free(path);
+        try native_open.enqueue(init.gpa, path);
+    }
+    try @import("paths.zig").prepare(init);
     if (has_page) return runPage(init);
     return runNative(init);
 }
@@ -29,6 +45,7 @@ fn runPage(init: std.process.Init) !u8 {
 
     const app = try nanoui.App.create(init, .{ .name = "assetty" });
     defer app.destroy();
+    native_open.install(app);
 
     var backend = backend_mod.Backend{ .gpa = init.gpa, .io = init.io };
     // Before `destroy`: a delivery still queued after this must not touch the app.

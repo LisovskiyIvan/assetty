@@ -658,9 +658,36 @@ app.on("context", () => updateStatusBar());
 /* ------------------------------------------------------------------- boot */
 
 // Apply the persisted theme + optimize defaults before the first tab mounts.
-void loadSettings();
+const settingsReady = loadSettings();
 
 selectTab("viewer");
+
+// Queueing on the host preserves cold-start Finder requests until settings
+// and the page are ready. Polls never overlap; hidden apps still accept Dock
+// opens. Only the final document of a multi-selection is shown in this viewer.
+if (app.bridge.live) {
+  let readingOpenFiles = false;
+  const readOpenFiles = async (): Promise<void> => {
+    if (readingOpenFiles) return;
+    readingOpenFiles = true;
+    try {
+      await settingsReady;
+      const paths = await app.bridge.pendingOpenFiles();
+      const path = paths.at(-1);
+      if (path) {
+        app.openSource(path);
+        selectTab("viewer");
+      }
+    } catch {
+      // Older hosts may not expose native document opens; Open… still works.
+    } finally {
+      readingOpenFiles = false;
+    }
+  };
+  void readOpenFiles();
+  const openFilesTimer = window.setInterval(() => void readOpenFiles(), 750);
+  window.addEventListener("pagehide", () => window.clearInterval(openFilesTimer), { once: true });
+}
 
 window.addEventListener("keydown", (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "o") {
