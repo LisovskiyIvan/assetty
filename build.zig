@@ -124,7 +124,9 @@ pub fn build(b: *std.Build) void {
         core_mod.addCSourceFiles(.{
             .root = b.path("vendor/webp"),
             .files = &.{
+                "src/dsp/alpha_processing_sse41.c",
                 "src/dsp/dec_sse41.c",
+                "src/dsp/lossless_sse41.c",
                 "src/dsp/upsampling_sse41.c",
                 "src/dsp/yuv_sse41.c",
             },
