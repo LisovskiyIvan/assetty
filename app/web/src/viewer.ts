@@ -63,6 +63,12 @@ export class ViewerScene {
   private resizeObserver: ResizeObserver;
   private inputAbort = new AbortController();
   private disposed = false;
+  /** True between a successful model/demo load and the next clearScene(). */
+  private loadedModel = false;
+  /** False for a fresh/emptied scene: model-derived stats are meaningless. */
+  get hasModel(): boolean {
+    return this.loadedModel;
+  }
   private envWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   onProgress?: (label: string) => void;
@@ -283,6 +289,7 @@ export class ViewerScene {
 
   async loadBytes(bytes: Uint8Array): Promise<void> {
     this.clearScene();
+    this.loadedModel = true;
     SceneLoader.ShowLoadingScreen = false;
     this.onProgress?.("parsing glb…");
     const container = await LoadAssetContainerAsync(bytes, this.scene, { pluginExtension: ".glb" });
@@ -343,6 +350,7 @@ export class ViewerScene {
   /** Placeholder geometry so the layout is usable without nanoui. */
   loadDemo(): void {
     this.clearScene();
+    this.loadedModel = true;
     const matA = new StandardMaterial("demo-a", this.scene);
     matA.diffuseColor = new Color3(0.32, 0.58, 0.9);
     matA.specularColor = new Color3(0.3, 0.3, 0.3);
@@ -374,6 +382,7 @@ export class ViewerScene {
   }
 
   clearScene(): void {
+    this.loadedModel = false;
     this.highlight.removeAllMeshes();
     this.scene.animationGroups.slice().forEach((g) => g.stop());
     this.scene.meshes.slice().forEach((m) => m.dispose());

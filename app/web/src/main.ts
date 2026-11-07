@@ -626,7 +626,9 @@ const updateStatusBar = (): void => {
     if (chip.value.textContent !== value) chip.value.textContent = value;
   };
   const viewer = app.viewer;
-  if (!viewer) {
+  if (!viewer || !viewer.hasModel) {
+    // Empty scene: engine-only numbers (0 FPS, phantom BRDF-LUT textures
+    // kept across clearScene) would read as garbage — show placeholders.
     set(status.fps, "—");
     set(status.tris, "—");
     set(status.draws, "—");
