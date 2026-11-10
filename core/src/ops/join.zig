@@ -304,7 +304,7 @@ fn mergeGroup(
         const ic = ir.count();
         for (0..ic) |i| out_idx[io + i] = ir.get(i) + voff;
         io += ic;
-        voff += @intCast(attrCount(p));
+        voff += std.math.cast(u32, attrCount(p)) orelse return error.AccessorOutOfRange;
     }
 
     // --- concatenated attribute streams ----------------------------------

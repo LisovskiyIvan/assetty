@@ -23,7 +23,26 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse (optimize != .debug);
 
     // One-command build: refresh app/web/dist before distAssets() embeds it.
-    if (want_app) ensureFrontend(b);
+    // A frontend failure does not panic out of configuration: it wires a
+    // failing step so Zig reports the message through the normal build flow.
+    if (want_app) {
+        ensureFrontend(b) catch |err| {
+            const fail_step = std.Build.Step.Fail.create(
+                b,
+                b.fmt("assetty: frontend build failed ({s}); run `bun run build` in app/web", .{@errorName(err)}),
+            );
+            b.getInstallStep().dependOn(&fail_step.step);
+        };
+    }
+
+    const dist_mod = distAssets(b) catch |err| {
+        const fail_step = std.Build.Step.Fail.create(
+            b,
+            b.fmt("assetty: cannot embed app/web/dist ({s})", .{@errorName(err)}),
+        );
+        b.getInstallStep().dependOn(&fail_step.step);
+        return;
+    };
 
     const cgltf_mod = b.addTranslateC(.{
         .root_source_file = b.path("vendor/cgltf/cgltf.h"),
@@ -217,7 +236,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }).module("nanoui") },
-        .{ .name = "dist_assets", .module = distAssets(b) },
+        .{ .name = "dist_assets", .module = dist_mod },
     } else &.{
         .{ .name = "core", .module = core_mod },
         .{ .name = "config", .module = config_mod },
@@ -278,7 +297,7 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                 }).module("nanoui") },
-                .{ .name = "dist_assets", .module = distAssets(b) },
+                .{ .name = "dist_assets", .module = dist_mod },
             },
         }) });
         test_step.dependOn(&b.addRunArtifact(app_tests).step);
@@ -288,8 +307,10 @@ pub fn build(b: *std.Build) void {
 /// Runs `bun run build` in app/web when dist is missing or older than the
 /// frontend sources, so `zig build` alone always embeds a fresh webview UI.
 /// npm is tried as a fallback. A stale-but-present dist is tolerated with a
-/// warning (e.g. no JS runtime installed); a missing dist is fatal.
-fn ensureFrontend(b: *std.Build) void {
+/// warning (e.g. no JS runtime installed); a missing dist or a failed build
+/// returns `error.FrontendBuildFailed` (the caller surfaces it as a failing
+/// build step) after printing the collected child output.
+fn ensureFrontend(b: *std.Build) !void {
     const io = b.graph.io;
     const gpa = b.allocator;
     const web_rel = "app/web";
@@ -303,10 +324,12 @@ fn ensureFrontend(b: *std.Build) void {
     var stale = dist_mtime == null;
     if (!stale) {
         const limit = dist_mtime.?;
-        var web_dir = std.Io.Dir.cwd().openDir(io, web_rel, .{ .iterate = true }) catch
-            @panic("assetty: cannot open app/web");
+        var web_dir = std.Io.Dir.cwd().openDir(io, web_rel, .{ .iterate = true }) catch |err| {
+            std.debug.print("assetty: cannot open app/web: {s}\n", .{@errorName(err)});
+            return error.FrontendBuildFailed;
+        };
         defer web_dir.close(io);
-        var walker = web_dir.walk(gpa) catch @panic("OOM");
+        var walker = try web_dir.walk(gpa);
         defer walker.deinit();
         while (walker.next(io) catch null) |entry| {
             // Third-party tree and the build output itself never trigger a
@@ -342,12 +365,13 @@ fn ensureFrontend(b: *std.Build) void {
     if (result) |res| {
         if (res.term != .exited or res.term.exited != 0) {
             std.debug.print("{s}{s}", .{ res.stdout, res.stderr });
-            @panic("assetty: frontend build failed (bun run build in app/web)");
+            return error.FrontendBuildFailed;
         }
     } else if (dist_mtime != null) {
         std.debug.print("assetty: bun/npm not found — embedding possibly stale app/web/dist\n", .{});
     } else {
-        @panic("assetty: app/web/dist missing and neither bun nor npm found — install bun (https://bun.sh) and run `bun install` in app/web");
+        std.debug.print("assetty: app/web/dist missing and neither bun nor npm found — install bun (https://bun.sh) and run `bun install` in app/web\n", .{});
+        return error.FrontendBuildFailed;
     }
 }
 
@@ -357,9 +381,11 @@ fn ensureFrontend(b: *std.Build) void {
 /// and `@embedFile`d there (Zig only embeds files inside a module's own path),
 /// so the binary is self-contained and Vite's hashed names are picked up
 /// automatically. app/src/assets.zig turns `entries` into nanoui assets.
-fn distAssets(b: *std.Build) *std.Build.Module {
+fn distAssets(b: *std.Build) !*std.Build.Module {
     const dist_rel = "app/web/dist";
     const io = b.graph.io;
+    // Build allocator: everything duped below lives for the whole build, so
+    // no per-entry free is needed (and none is possible after return).
     const gpa = b.allocator;
 
     const Entry = struct { url: []const u8, rel: []const u8 };
@@ -370,7 +396,7 @@ fn distAssets(b: *std.Build) *std.Build.Module {
     if (std.Io.Dir.cwd().openDir(io, dist_rel, .{ .iterate = true })) |dir_| {
         var dir = dir_;
         defer dir.close(io);
-        var walker = dir.walk(gpa) catch @panic("OOM");
+        var walker = try dir.walk(gpa);
         defer walker.deinit();
         while (walker.next(io) catch null) |entry| {
             if (entry.kind == .directory) {
@@ -381,14 +407,14 @@ fn distAssets(b: *std.Build) *std.Build.Module {
             // Forward slashes everywhere: on a Windows host the walker yields
             // `assets\name.js`, and `\a` is an invalid escape in the generated
             // Zig string literals.
-            const rel = gpa.dupe(u8, entry.path) catch @panic("OOM");
+            const rel = try gpa.dupe(u8, entry.path);
             for (rel) |*ch| {
                 if (ch.* == '\\') ch.* = '/';
             }
-            entries.append(gpa, .{
+            try entries.append(gpa, .{
                 .url = b.fmt("/{s}", .{rel}),
                 .rel = rel,
-            }) catch @panic("OOM");
+            });
         }
     } else |_| {}
 
@@ -401,21 +427,19 @@ fn distAssets(b: *std.Build) *std.Build.Module {
     const wf = b.addWriteFiles();
     var aw: std.Io.Writer.Allocating = .init(gpa);
     const w = &aw.writer;
-    w.writeAll("pub const Entry = struct { url: []const u8, data: []const u8 };\n") catch @panic("OOM");
-    w.writeAll("pub const entries = [_]Entry{\n") catch @panic("OOM");
+    try w.writeAll("pub const Entry = struct { url: []const u8, data: []const u8 };\n");
+    try w.writeAll("pub const entries = [_]Entry{\n");
     for (entries.items) |e| {
         if (std.mem.eql(u8, e.url, "/index.html")) {
-            const raw = std.Io.Dir.cwd().readFileAlloc(io, b.fmt("{s}/{s}", .{ dist_rel, e.rel }), gpa, .limited(64 * 1024 * 1024)) catch
-                @panic("assetty: cannot read app/web/dist/index.html");
-            _ = wf.add(e.rel, patchIndex(gpa, raw));
+            const raw = try std.Io.Dir.cwd().readFileAlloc(io, b.fmt("{s}/{s}", .{ dist_rel, e.rel }), gpa, .limited(64 * 1024 * 1024));
+            _ = wf.add(e.rel, try patchIndex(gpa, raw));
         } else {
             // Copy next to the generated source so @embedFile stays in-package.
             _ = wf.addCopyFile(b.path(b.fmt("{s}/{s}", .{ dist_rel, e.rel })), e.rel);
         }
-        w.print("    .{{ .url = \"{s}\", .data = @embedFile(\"{s}\") }},\n", .{ e.url, e.rel }) catch
-            @panic("OOM");
+        try w.print("    .{{ .url = \"{s}\", .data = @embedFile(\"{s}\") }},\n", .{ e.url, e.rel });
     }
-    w.writeAll("};\n") catch @panic("OOM");
+    try w.writeAll("};\n");
 
     return b.createModule(.{ .root_source_file = wf.add("assets.zig", aw.written()) });
 }
@@ -443,7 +467,7 @@ const host_shim =
     \\
 ;
 
-fn patchIndex(gpa: std.mem.Allocator, html: []const u8) []const u8 {
+fn patchIndex(gpa: std.mem.Allocator, html: []const u8) ![]const u8 {
     // Right after <head> so the shim exists before the app's module script.
     const at = if (std.mem.indexOf(u8, html, "<head>")) |i|
         i + "<head>".len
@@ -455,8 +479,8 @@ fn patchIndex(gpa: std.mem.Allocator, html: []const u8) []const u8 {
         return html;
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
-    aw.writer.writeAll(html[0..at]) catch @panic("OOM");
-    aw.writer.writeAll(host_shim) catch @panic("OOM");
-    aw.writer.writeAll(html[at..]) catch @panic("OOM");
+    try aw.writer.writeAll(html[0..at]);
+    try aw.writer.writeAll(host_shim);
+    try aw.writer.writeAll(html[at..]);
     return aw.written();
 }

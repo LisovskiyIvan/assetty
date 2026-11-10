@@ -2,6 +2,7 @@ pub const model = @import("gltf/model.zig");
 pub const parse = @import("gltf/parse.zig");
 pub const write = @import("gltf/write.zig");
 pub const stats = @import("stats.zig");
+pub const json_util = @import("json_util.zig");
 pub const decode = @import("tex/decode.zig");
 pub const formats = @import("tex/formats.zig");
 pub const mips = @import("tex/mips.zig");

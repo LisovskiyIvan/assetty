@@ -64,18 +64,13 @@ pub fn halve(a: std.mem.Allocator, src: []const u8, w: u32, h: u32) Error!Scaled
     return downscaleRgba(a, src, w, h, 2);
 }
 
-/// Repeatedly halve until max(w,h) <= max_dim. Returns a copy when already small.
+/// Downscale once by the exact ceil factor so max(w,h) <= max_dim.
+/// Returns a copy when already small.
 pub fn fitMaxSize(a: std.mem.Allocator, src: []const u8, w: u32, h: u32, max_dim: u32) Error!Scaled {
     if (max_dim == 0 or (w <= max_dim and h <= max_dim)) return downscaleRgba(a, src, w, h, 1);
-    var cur = try downscaleRgba(a, src, w, h, 1);
-    while (cur.w > max_dim or cur.h > max_dim) {
-        const next = try halve(a, cur.pixels, cur.w, cur.h);
-        a.free(cur.pixels);
-        cur = next;
-    }
-    // possible still > max_dim when factor=1? loop always shrinks; guard anyway
-    if (cur.w > max_dim or cur.h > max_dim) return error.InvalidImage;
-    return cur;
+    const m: u32 = @max(w, h);
+    const factor = (m + max_dim - 1) / max_dim; // ceil; >= 2 since m > max_dim
+    return downscaleRgba(a, src, w, h, factor);
 }
 
 test "downscale 4x4 gradient factor 2" {

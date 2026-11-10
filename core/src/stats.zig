@@ -141,29 +141,31 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     @memset(used_textures, false);
     @memset(used_images, false);
 
-    // materials via reachable nodes
-    const stack = try a.alloc(u32, asset.nodes.len + 1);
-    var sp: usize = 0;
+    // materials via reachable nodes (growing stack + visited set: deep or
+    // cyclic graphs terminate instead of silently undercounting)
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(a);
     for (asset.scenes) |scene| {
         for (scene.roots) |root| {
-            stack[sp] = root;
-            sp += 1;
-            while (sp > 0) {
-                sp -= 1;
-                const ni = stack[sp];
+            if (root >= asset.nodes.len) continue;
+            try stack.append(a, root);
+            while (stack.items.len > 0) {
+                const ni = stack.pop().?;
                 if (used_nodes[ni]) continue;
                 used_nodes[ni] = true;
                 const node = asset.nodes[ni];
                 if (node.mesh) |mi| {
-                    for (asset.meshes[mi].primitives) |p| {
-                        if (p.material) |mat| used_materials[mat] = true;
+                    if (mi < asset.meshes.len) {
+                        for (asset.meshes[mi].primitives) |p| {
+                            if (p.material) |mat| {
+                                if (mat < used_materials.len) used_materials[mat] = true;
+                            }
+                        }
                     }
                 }
                 for (node.children) |ch| {
-                    if (sp < stack.len) {
-                        stack[sp] = ch;
-                        sp += 1;
-                    }
+                    if (ch >= asset.nodes.len or used_nodes[ch]) continue;
+                    try stack.append(a, ch);
                 }
             }
         }
@@ -171,7 +173,7 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     // animation targets keep nodes alive
     for (asset.animations) |anim| {
         for (anim.targets) |t| {
-            if (t < used_nodes.len and !used_nodes[t]) markSubtree(asset, used_nodes, t, stack);
+            if (t < used_nodes.len) try markSubtree(a, asset, used_nodes, t);
         }
     }
 
@@ -210,20 +212,18 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     return st;
 }
 
-fn markSubtree(asset: model.Asset, used_nodes: []bool, root: u32, stack: []u32) void {
-    var sp: usize = 0;
-    stack[sp] = root;
-    sp += 1;
-    while (sp > 0) {
-        sp -= 1;
-        const ni = stack[sp];
+fn markSubtree(a: std.mem.Allocator, asset: model.Asset, used_nodes: []bool, root: u32) !void {
+    if (root >= used_nodes.len or used_nodes[root]) return;
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(a);
+    try stack.append(a, root);
+    while (stack.items.len > 0) {
+        const ni = stack.pop().?;
         if (used_nodes[ni]) continue;
         used_nodes[ni] = true;
         for (asset.nodes[ni].children) |ch| {
-            if (ch < used_nodes.len and sp < stack.len) {
-                stack[sp] = ch;
-                sp += 1;
-            }
+            if (ch >= used_nodes.len or used_nodes[ch]) continue;
+            try stack.append(a, ch);
         }
     }
 }

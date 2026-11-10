@@ -48,6 +48,7 @@ const std = @import("std");
 const c = @import("cgltf");
 const mo = @import("meshopt");
 const mc = @import("meshopt.zig");
+const geom = @import("geom.zig");
 
 pub const Options = struct {
     position_bits: u5 = 14,
@@ -77,232 +78,22 @@ pub const Result = struct {
     meshopt_no_codec: bool = false,
 };
 
-// ---------------------------------------------------------------------------
-// cgltf helpers (local copies; gltf/write.zig has the same private helpers)
-// ---------------------------------------------------------------------------
-
-fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
-    if (n == 0 or @intFromPtr(ptr) == 0) return &.{};
-    return ptr[0..n];
-}
-
-fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
-    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
-    const b: usize = @intFromPtr(base);
-    const q: usize = @intFromPtr(p);
-    if (q < b) return null;
-    const off = q - b;
-    if (off % @sizeOf(T) != 0) return null;
-    const i = off / @sizeOf(T);
-    if (i >= count) return null;
-    return @intCast(i);
-}
-
-fn numComponents(t: c.cgltf_type) usize {
-    return switch (t) {
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 4,
-        6 => 9,
-        7 => 16,
-        else => 1,
-    };
-}
-
-/// Allocate raw bytes through cgltf's allocator hooks, so that `cgltf_free`
-/// (which releases `buffer_view.data` with the same hooks) stays balanced.
-fn allocRaw(data: *const c.cgltf_data, n: usize) ?[*]u8 {
-    const mem = data.memory;
-    if (mem.alloc_func) |f| {
-        const p = f(mem.user_data, n) orelse return null;
-        return @ptrCast(p);
-    }
-    const p = std.c.malloc(n) orelse return null;
-    return @ptrCast(p);
-}
-
-fn freeRaw(data: *const c.cgltf_data, p: anytype) void {
-    const mem = data.memory;
-    if (mem.free_func) |f| {
-        f(mem.user_data, @ptrCast(@constCast(p)));
-    } else {
-        std.c.free(@ptrCast(@constCast(p)));
-    }
-}
+// Shared cdata helpers (sl, ptrIndex, numComponents, allocRaw, freeRaw, Pool,
+// remapRefs, commitPools) live in geom.zig.
 
 /// Allocate an array owned by cgltf (freed by `cgltf_free` with its hooks).
 fn cgltfAllocSlice(comptime T: type, data: *const c.cgltf_data, n: usize) ![*c]T {
     if (n == 0) return null;
-    const bytes = allocRaw(data, n * @sizeOf(T)) orelse return error.OutOfMemory;
+    const bytes = geom.allocRaw(data, n * @sizeOf(T)) orelse return error.OutOfMemory;
     return @ptrCast(@alignCast(bytes));
 }
 
 fn dupStr(data: *const c.cgltf_data, s: [*c]const u8) ![*c]u8 {
     const src = std.mem.span(s);
-    const raw = allocRaw(data, src.len + 1) orelse return error.OutOfMemory;
+    const raw = geom.allocRaw(data, src.len + 1) orelse return error.OutOfMemory;
     @memcpy(raw[0..src.len], src);
     raw[src.len] = 0;
     return @ptrCast(raw);
-}
-
-// ---------------------------------------------------------------------------
-// pool regrow + pointer remap
-//
-// TODO(geom.Builder): this belongs in core/src/ops/geom.zig once that lands
-// (shared pool-regrow helper).  Kept private here to stay decoupled.
-// ---------------------------------------------------------------------------
-
-const Pool = struct {
-    acc: std.ArrayListUnmanaged(c.cgltf_accessor) = .empty,
-    view: std.ArrayListUnmanaged(c.cgltf_buffer_view) = .empty,
-
-    fn deinit(self: *Pool, a: std.mem.Allocator) void {
-        self.acc.deinit(a);
-        self.view.deinit(a);
-    }
-};
-
-fn remapAcc(
-    p: [*c]c.cgltf_accessor,
-    old_base: [*c]c.cgltf_accessor,
-    old_n: usize,
-    new_base: [*c]c.cgltf_accessor,
-) [*c]c.cgltf_accessor {
-    const i = ptrIndex(c.cgltf_accessor, old_base, old_n, p) orelse return p;
-    return new_base + i;
-}
-
-fn remapView(
-    p: [*c]c.cgltf_buffer_view,
-    old_base: [*c]c.cgltf_buffer_view,
-    old_n: usize,
-    new_base: [*c]c.cgltf_buffer_view,
-) [*c]c.cgltf_buffer_view {
-    const i = ptrIndex(c.cgltf_buffer_view, old_base, old_n, p) orelse return p;
-    return new_base + i;
-}
-
-/// Rewrite every accessor / buffer-view reference so that it points into the
-/// regrown pools.  `new_acc` holds copies of the old entries at the same
-/// indices (appended entries last), same for `new_view`.
-fn remapRefs(
-    data: *c.cgltf_data,
-    old_acc: [*c]c.cgltf_accessor,
-    old_acc_n: usize,
-    new_acc: [*c]c.cgltf_accessor,
-    old_view: [*c]c.cgltf_buffer_view,
-    old_view_n: usize,
-    new_view: [*c]c.cgltf_buffer_view,
-) void {
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
-            p.indices = remapAcc(p.indices, old_acc, old_acc_n, new_acc);
-            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
-                at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
-            }
-            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
-                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
-                    at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
-                }
-            }
-            if (@intFromPtr(p.draco_mesh_compression.buffer_view) != 0) {
-                p.draco_mesh_compression.buffer_view = remapView(
-                    p.draco_mesh_compression.buffer_view,
-                    old_view,
-                    old_view_n,
-                    new_view,
-                );
-            }
-            for (sl(c.cgltf_attribute, p.draco_mesh_compression.attributes, p.draco_mesh_compression.attributes_count)) |*at| {
-                at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
-            }
-        }
-    }
-    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
-        for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
-            s.input = remapAcc(s.input, old_acc, old_acc_n, new_acc);
-            s.output = remapAcc(s.output, old_acc, old_acc_n, new_acc);
-        }
-    }
-    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
-        sk.inverse_bind_matrices = remapAcc(sk.inverse_bind_matrices, old_acc, old_acc_n, new_acc);
-    }
-    // accessors themselves reference buffer views (incl. sparse storage)
-    for (sl(c.cgltf_accessor, new_acc, data.accessors_count)) |*acc| {
-        acc.buffer_view = remapView(acc.buffer_view, old_view, old_view_n, new_view);
-        if (acc.is_sparse != 0) {
-            acc.sparse.indices_buffer_view = remapView(
-                acc.sparse.indices_buffer_view,
-                old_view,
-                old_view_n,
-                new_view,
-            );
-            acc.sparse.values_buffer_view = remapView(
-                acc.sparse.values_buffer_view,
-                old_view,
-                old_view_n,
-                new_view,
-            );
-        }
-    }
-    for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
-        im.buffer_view = remapView(im.buffer_view, old_view, old_view_n, new_view);
-    }
-}
-
-/// Grow both pools by the appended entries and remap every reference.
-/// The old pool arrays are released through cgltf's hooks; their string /
-/// extras pointers live on in the copied entries, so nothing is double-freed
-/// (`cgltf_free` only walks the arrays currently registered in `data`).
-fn commitPools(data: *c.cgltf_data, pool: *Pool) !void {
-    const old_acc = data.accessors;
-    const old_acc_n: usize = data.accessors_count;
-    const old_view = data.buffer_views;
-    const old_view_n: usize = data.buffer_views_count;
-
-    const new_acc_n = old_acc_n + pool.acc.items.len;
-    const new_view_n = old_view_n + pool.view.items.len;
-    if (new_acc_n == old_acc_n and new_view_n == old_view_n) return;
-
-    var new_acc: [*c]c.cgltf_accessor = old_acc;
-    var new_view: [*c]c.cgltf_buffer_view = old_view;
-
-    if (pool.acc.items.len != 0) {
-        const bytes = allocRaw(data, new_acc_n * @sizeOf(c.cgltf_accessor)) orelse return error.OutOfMemory;
-        new_acc = @ptrCast(@alignCast(bytes));
-        if (old_acc_n != 0) @memcpy(new_acc[0..old_acc_n], old_acc[0..old_acc_n]);
-        @memcpy(new_acc[old_acc_n..new_acc_n], pool.acc.items);
-    }
-    errdefer if (pool.acc.items.len != 0) freeRaw(data, new_acc);
-
-    if (pool.view.items.len != 0) {
-        const bytes = allocRaw(data, new_view_n * @sizeOf(c.cgltf_buffer_view)) orelse return error.OutOfMemory;
-        new_view = @ptrCast(@alignCast(bytes));
-        if (old_view_n != 0) @memcpy(new_view[0..old_view_n], old_view[0..old_view_n]);
-        @memcpy(new_view[old_view_n..new_view_n], pool.view.items);
-    }
-    errdefer if (pool.view.items.len != 0) freeRaw(data, new_view);
-
-    // pool counts are already updated below, remapRefs needs the *new* count
-    data.accessors = new_acc;
-    data.accessors_count = new_acc_n;
-    data.buffer_views = new_view;
-    data.buffer_views_count = new_view_n;
-
-    remapRefs(data, old_acc, old_acc_n, new_acc, old_view, old_view_n, new_view);
-
-    // appended entries are paired 1:1 (each new accessor owns one new view);
-    // wire them up now that the final array addresses are known
-    std.debug.assert(pool.acc.items.len == pool.view.items.len);
-    for (0..pool.acc.items.len) |k| {
-        data.accessors[old_acc_n + k].buffer_view = data.buffer_views + (old_view_n + k);
-    }
-
-    // old arrays only held copies now: release them
-    if (pool.acc.items.len != 0 and @intFromPtr(old_acc) != 0) freeRaw(data, old_acc);
-    if (pool.view.items.len != 0 and @intFromPtr(old_view) != 0) freeRaw(data, old_view);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,19 +105,19 @@ fn commitMeshes(data: *c.cgltf_data, extra: []const c.cgltf_mesh) !void {
     const old = data.meshes;
     const old_n: usize = data.meshes_count;
     const n = old_n + extra.len;
-    const bytes = allocRaw(data, n * @sizeOf(c.cgltf_mesh)) orelse return error.OutOfMemory;
+    const bytes = geom.allocRaw(data, n * @sizeOf(c.cgltf_mesh)) orelse return error.OutOfMemory;
     const new: [*c]c.cgltf_mesh = @ptrCast(@alignCast(bytes));
     if (old_n != 0) @memcpy(new[0..old_n], old[0..old_n]);
     @memcpy(new[old_n..n], extra);
 
     // meshes are only referenced from nodes
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
-        if (ptrIndex(c.cgltf_mesh, old, old_n, nd.mesh)) |i| nd.mesh = new + i;
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
+        if (geom.ptrIndex(c.cgltf_mesh, old, old_n, nd.mesh)) |i| nd.mesh = new + i;
     }
 
     data.meshes = new;
     data.meshes_count = n;
-    if (old_n != 0 and @intFromPtr(old) != 0) freeRaw(data, old);
+    if (old_n != 0 and @intFromPtr(old) != 0) geom.freeRaw(data, old);
 }
 
 fn remapNodePtr(
@@ -335,7 +126,7 @@ fn remapNodePtr(
     old_n: usize,
     new: [*c]c.cgltf_node,
 ) void {
-    if (ptrIndex(c.cgltf_node, old, old_n, slot.*)) |i| slot.* = new + i;
+    if (geom.ptrIndex(c.cgltf_node, old, old_n, slot.*)) |i| slot.* = new + i;
 }
 
 fn commitNodes(data: *c.cgltf_data, extra: []const c.cgltf_node) !void {
@@ -343,7 +134,7 @@ fn commitNodes(data: *c.cgltf_data, extra: []const c.cgltf_node) !void {
     const old = data.nodes;
     const old_n: usize = data.nodes_count;
     const n = old_n + extra.len;
-    const bytes = allocRaw(data, n * @sizeOf(c.cgltf_node)) orelse return error.OutOfMemory;
+    const bytes = geom.allocRaw(data, n * @sizeOf(c.cgltf_node)) orelse return error.OutOfMemory;
     const new: [*c]c.cgltf_node = @ptrCast(@alignCast(bytes));
     if (old_n != 0) @memcpy(new[0..old_n], old[0..old_n]);
     @memcpy(new[old_n..n], extra);
@@ -351,30 +142,30 @@ fn commitNodes(data: *c.cgltf_data, extra: []const c.cgltf_node) !void {
     data.nodes = new;
     data.nodes_count = n;
 
-    for (sl(c.cgltf_node, new, n)) |*nd| {
+    for (geom.sl(c.cgltf_node, new, n)) |*nd| {
         remapNodePtr(&nd.parent, old, old_n, new);
-        for (sl([*c]c.cgltf_node, nd.children, nd.children_count)) |*cp| {
+        for (geom.sl([*c]c.cgltf_node, nd.children, nd.children_count)) |*cp| {
             remapNodePtr(cp, old, old_n, new);
         }
     }
-    for (sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
-        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |*cp| {
+    for (geom.sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
+        for (geom.sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |*cp| {
             remapNodePtr(cp, old, old_n, new);
         }
     }
-    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+    for (geom.sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
         remapNodePtr(&sk.skeleton, old, old_n, new);
-        for (sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |*jp| {
+        for (geom.sl([*c]c.cgltf_node, sk.joints, sk.joints_count)) |*jp| {
             remapNodePtr(jp, old, old_n, new);
         }
     }
-    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
-        for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+    for (geom.sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (geom.sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
             remapNodePtr(&ch.target_node, old, old_n, new);
         }
     }
 
-    if (old_n != 0 and @intFromPtr(old) != 0) freeRaw(data, old);
+    if (old_n != 0 and @intFromPtr(old) != 0) geom.freeRaw(data, old);
 }
 
 fn appendNodeRef(
@@ -387,7 +178,7 @@ fn appendNodeRef(
     const out = try cgltfAllocSlice([*c]c.cgltf_node, data, n + 1);
     if (n != 0) @memcpy(out[0..n], arr.*[0..n]);
     out[n] = node;
-    if (n != 0 and @intFromPtr(arr.*) != 0) freeRaw(data, arr.*);
+    if (n != 0 and @intFromPtr(arr.*) != 0) geom.freeRaw(data, arr.*);
     arr.* = out;
     count.* = n + 1;
 }
@@ -400,9 +191,9 @@ fn appendChild(data: *c.cgltf_data, parent: [*c]c.cgltf_node, child: [*c]c.cgltf
 
 /// Add `np` to every scene that lists `src` (root nodes have no parent).
 fn addToScenes(data: *c.cgltf_data, src: [*c]c.cgltf_node, np: [*c]c.cgltf_node) !void {
-    for (sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
+    for (geom.sl(c.cgltf_scene, data.scenes, data.scenes_count)) |*s| {
         var found = false;
-        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |cand| {
+        for (geom.sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |cand| {
             if (@intFromPtr(cand) == @intFromPtr(src)) {
                 found = true;
                 break;
@@ -649,7 +440,7 @@ fn clampSnorm(v: f32) f32 {
 }
 
 fn findAttr(p: *const c.cgltf_primitive, at_type: c_int) ?[*c]c.cgltf_accessor {
-    for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+    for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
         if (at.type == at_type) return at.data;
     }
     return null;
@@ -658,7 +449,7 @@ fn findAttr(p: *const c.cgltf_primitive, at_type: c_int) ?[*c]c.cgltf_accessor {
 /// Bounds of a VEC3 position accessor (dequantized floats; sparse-aware).
 fn computeBounds(a: std.mem.Allocator, acc: [*c]const c.cgltf_accessor) !?Bounds {
     const src = acc.*;
-    if (numComponents(src.type) != 3 or src.count == 0) return null;
+    if (geom.numComponents(src.type) != 3 or src.count == 0) return null;
 
     const total: usize = src.count * 3;
     const tmp = try a.alloc(f32, total);
@@ -697,7 +488,7 @@ fn build(
     pos_bounds: ?Bounds,
 ) !?Built {
     const src = acc.*;
-    const ncomp = numComponents(src.type);
+    const ncomp = geom.numComponents(src.type);
     if (ncomp != expectedComponents(kind)) return null;
     const count: usize = src.count;
     if (count == 0) return null;
@@ -739,8 +530,8 @@ fn build(
     }
 
     const out_bytes = count * ncomp * 2;
-    const raw = allocRaw(data, out_bytes) orelse return error.OutOfMemory;
-    errdefer freeRaw(data, raw);
+    const raw = geom.allocRaw(data, out_bytes) orelse return error.OutOfMemory;
+    errdefer geom.freeRaw(data, raw);
     const out = raw[0..out_bytes];
 
     const signed = kind == .normal or kind == .tangent;
@@ -854,22 +645,22 @@ fn baseEligible(
         if (n.has_matrix != 0) return false;
         if (@intFromPtr(n.skin) != 0) return false;
         // animations on translation/scale would overwrite the baked dequant
-        const ni = ptrIndex(c.cgltf_node, data.nodes, anim_trs.len, n) orelse return false;
+        const ni = geom.ptrIndex(c.cgltf_node, data.nodes, anim_trs.len, n) orelse return false;
         if (anim_trs[ni]) return false;
     }
     if (mesh.primitives_count == 0) return false;
 
-    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
         // morph target deltas are mesh-space offsets: the baked node scale
         // would scale them as well, so keep the whole mesh in float space
         if (p.targets_count != 0) return false;
 
         var has_pos = false;
-        for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+        for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
             if (at.type == c.cgltf_attribute_type_joints) return false; // skinned
             if (at.type == c.cgltf_attribute_type_position) {
                 if (@intFromPtr(at.data) == 0) return false;
-                if (numComponents(at.data.*.type) != 3 or at.data.*.count == 0) return false;
+                if (geom.numComponents(at.data.*.type) != 3 or at.data.*.count == 0) return false;
                 has_pos = true;
             }
         }
@@ -890,9 +681,9 @@ fn planGroups(
     done: []bool,
 ) !bool {
     plan.clearGroups(a);
-    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count), 0..) |*p, pi| {
+    for (geom.sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count), 0..) |*p, pi| {
         const acc = findAttr(p, c.cgltf_attribute_type_position) orelse return false;
-        const ai = ptrIndex(c.cgltf_accessor, acc_base, acc_n, acc) orelse return false;
+        const ai = geom.ptrIndex(c.cgltf_accessor, acc_base, acc_n, acc) orelse return false;
         if (!done[ai]) {
             cache[ai] = try computeBounds(a, acc_base + ai);
             done[ai] = true;
@@ -937,8 +728,8 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
         a.free(refs);
     }
     for (refs) |*r| r.* = .empty;
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
-        if (ptrIndex(c.cgltf_mesh, data.meshes, mesh_n, n.mesh)) |mi| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        if (geom.ptrIndex(c.cgltf_mesh, data.meshes, mesh_n, n.mesh)) |mi| {
             try refs[mi].append(a, n);
         }
     }
@@ -949,12 +740,12 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     const anim_trs = try a.alloc(bool, data.nodes_count);
     defer a.free(anim_trs);
     @memset(anim_trs, false);
-    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
-        for (sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
+    for (geom.sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (geom.sl(c.cgltf_animation_channel, an.channels, an.channels_count)) |*ch| {
             if (@intFromPtr(ch.target_node) == 0) continue;
             if (ch.target_path != c.cgltf_animation_path_type_translation and
                 ch.target_path != c.cgltf_animation_path_type_scale) continue;
-            if (ptrIndex(c.cgltf_node, data.nodes, data.nodes_count, ch.target_node)) |ni| {
+            if (geom.ptrIndex(c.cgltf_node, data.nodes, data.nodes_count, ch.target_node)) |ni| {
                 anim_trs[ni] = true;
             }
         }
@@ -988,10 +779,10 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
         // meshes without node references are dropped by the writer's GC; they
         // must not veto quantizing an accessor they happen to share
         if (refs[mi].items.len == 0) continue;
-        const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
-        for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+        const mesh = &geom.sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+        for (geom.sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
             const acc = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
-            const ai = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
+            const ai = geom.ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
             const gop = try pos_use.getOrPut(a, ai);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(a, @intCast(mi));
@@ -999,7 +790,7 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     }
 
     for (plans, 0..) |*plan, mi| {
-        const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+        const mesh = &geom.sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
         plan.eligible = baseEligible(data, mesh, refs[mi].items, anim_trs);
     }
 
@@ -1011,11 +802,11 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
         stable = true;
         for (plans, 0..) |*plan, mi| {
             if (!plan.eligible) continue;
-            const mesh = &sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
+            const mesh = &geom.sl(c.cgltf_mesh, data.meshes, mesh_n)[mi];
 
-            outer: for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+            outer: for (geom.sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
                 const acc = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
-                const ai = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
+                const ai = geom.ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, acc) orelse continue;
                 if (pos_use.get(ai)) |users| {
                     for (users.items) |mj| {
                         if (!plans[mj].eligible) {
@@ -1066,7 +857,7 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     for (0..mesh_n) |mi| {
         const plan = &plans[mi];
         if (!plan.eligible) continue;
-        const meshes = sl(c.cgltf_mesh, data.meshes, mesh_n);
+        const meshes = geom.sl(c.cgltf_mesh, data.meshes, mesh_n);
         const mesh = &meshes[mi];
         const groups = plan.groups.items;
 
@@ -1111,9 +902,9 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
                     try assignments.append(a, .{ .node = node, .mesh_index = mindex, .bounds = grp.bounds });
                 } else {
                     // extra bounds group: needs a sibling leaf node
-                    const src_index = ptrIndex(c.cgltf_node, data.nodes, old_node_n, node) orelse continue;
+                    const src_index = geom.ptrIndex(c.cgltf_node, data.nodes, old_node_n, node) orelse continue;
                     const parent_index: ?u32 = if (@intFromPtr(node.parent) != 0)
-                        ptrIndex(c.cgltf_node, data.nodes, old_node_n, node.parent)
+                        geom.ptrIndex(c.cgltf_node, data.nodes, old_node_n, node.parent)
                     else
                         null;
                     try jobs.append(a, .{
@@ -1143,7 +934,7 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     var extra: std.ArrayListUnmanaged(c.cgltf_node) = .empty;
     defer extra.deinit(a);
     for (jobs.items) |job| {
-        const src = &sl(c.cgltf_node, data.nodes, old_node_n)[job.src_index];
+        const src = &geom.sl(c.cgltf_node, data.nodes, old_node_n)[job.src_index];
         var nn = try cloneNodeForGroup(data, src, job.bounds);
         nn.mesh = data.meshes + job.mesh_index;
         try extra.append(a, nn);
@@ -1176,20 +967,20 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     defer a.free(mapping);
     @memset(mapping, null);
 
-    var pool: Pool = .{};
+    var pool: geom.Pool = .{};
     defer pool.deinit(a);
     var rewrites: std.ArrayListUnmanaged(Rewrite) = .empty;
     defer rewrites.deinit(a);
 
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, mi| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count), 0..) |*m, mi| {
         const pos_bounds: ?Bounds = final_bounds[mi];
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             // vertex-only attribute rewrite; morph targets keep their floats
-            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+            for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 const kind = kindOf(at) orelse continue;
                 // no baked dequant for this mesh: keep float POSITION
                 if (kind == .position and pos_bounds == null) continue;
-                const old_index = ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, at.data) orelse continue;
+                const old_index = geom.ptrIndex(c.cgltf_accessor, data.accessors, base_acc_n, at.data) orelse continue;
                 if (mapping[old_index] == null) {
                     const built = try build(
                         a,
@@ -1220,7 +1011,7 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
 
     if (pool.acc.items.len == 0) return res;
 
-    try commitPools(data, &pool);
+    try geom.commitPools(data, &pool);
 
     // point the rewritten attributes at their new accessors
     for (rewrites.items) |r| {
@@ -1268,18 +1059,7 @@ const Use = struct {
 /// cgltf cannot decode (no meshopt decoder linked): never touch those.
 fn viewRawBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
     if (v.has_meshopt_compression != 0) return null;
-    if (v.data) |d| {
-        const p: [*]const u8 = @ptrCast(d);
-        return p[0..v.size];
-    }
-    if (@intFromPtr(v.buffer) == 0) return null;
-    const data = v.buffer.*.data orelse return null;
-    const bsize: usize = @intCast(v.buffer.*.size);
-    const off: usize = @intCast(v.offset);
-    const sz: usize = @intCast(v.size);
-    if (off > bsize or sz > bsize - off) return null;
-    const p: [*]const u8 = @ptrCast(data);
-    return p[off .. off + sz];
+    return geom.viewData(v);
 }
 
 /// Install `enc` as the view payload: op-built allocations are reused
@@ -1291,7 +1071,7 @@ fn installPayload(data: *const c.cgltf_data, a: std.mem.Allocator, v: *c.cgltf_b
         @memcpy(p[0..enc.len], enc);
         a.free(enc);
     } else {
-        const mem = allocRaw(data, enc.len) orelse return error.OutOfMemory;
+        const mem = geom.allocRaw(data, enc.len) orelse return error.OutOfMemory;
         @memcpy(mem[0..enc.len], enc);
         a.free(enc);
         v.data = mem;
@@ -1392,14 +1172,14 @@ fn compressAttributes(
 ) !void {
     var use: AttrUse = .{};
     defer use.accs.deinit(a);
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
-            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
                 if (try checkAttrElem(at, false, v, raw.len, &use, a)) return;
             }
-            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
-                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+            for (geom.sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (geom.sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
                     if (@intFromPtr(at.data) == 0 or at.data.*.buffer_view != v) continue;
                     if (try checkAttrElem(at, true, v, raw.len, &use, a)) return;
                 }
@@ -1528,8 +1308,8 @@ fn compressIndices(
     var refs: std.ArrayListUnmanaged(*c.cgltf_accessor) = .empty;
     defer refs.deinit(a);
     var s_orig: usize = 0;
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             if (@intFromPtr(p.indices) == 0) continue;
             const acc: *c.cgltf_accessor = @ptrCast(p.indices);
             if (acc.buffer_view != v) continue;
@@ -1599,8 +1379,8 @@ fn compressIndices(
     // writer) use the triangle codec; anything else the index sequence.
     var all_tris = n_idx % 3 == 0;
     var any_user = false;
-    outer: for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    outer: for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             if (@intFromPtr(p.indices) == 0) continue;
             const acc: *c.cgltf_accessor = @ptrCast(p.indices);
             if (acc.buffer_view != v) continue;
@@ -1665,59 +1445,59 @@ pub fn compressViews(a: std.mem.Allocator, data: *c.cgltf_data, res: *Result, op
     const usage = try a.alloc(u8, n_views);
     defer a.free(usage);
     @memset(usage, 0);
-    const views = sl(c.cgltf_buffer_view, data.buffer_views, n_views);
+    const views = geom.sl(c.cgltf_buffer_view, data.buffer_views, n_views);
 
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
-            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 if (@intFromPtr(at.data) == 0) continue;
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
             }
-            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
-                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+            for (geom.sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (geom.sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
                     if (@intFromPtr(at.data) == 0) continue;
-                    if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
+                    if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.vertex;
                 }
             }
             if (@intFromPtr(p.indices) != 0) {
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.indices.*.buffer_view)) |vi| usage[vi] |= Use.index;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.indices.*.buffer_view)) |vi| usage[vi] |= Use.index;
             }
             if (@intFromPtr(p.draco_mesh_compression.buffer_view) != 0) {
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.draco_mesh_compression.buffer_view)) |vi| usage[vi] |= Use.other;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, p.draco_mesh_compression.buffer_view)) |vi| usage[vi] |= Use.other;
             }
         }
     }
-    for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
-        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, im.buffer_view)) |vi| usage[vi] |= Use.image;
+    for (geom.sl(c.cgltf_image, data.images, data.images_count)) |*im| {
+        if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, im.buffer_view)) |vi| usage[vi] |= Use.image;
     }
-    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
-        for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+    for (geom.sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (geom.sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
             if (@intFromPtr(s.input) != 0) {
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.input.*.buffer_view)) |vi| usage[vi] |= Use.other;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.input.*.buffer_view)) |vi| usage[vi] |= Use.other;
             }
             if (@intFromPtr(s.output) != 0) {
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.output.*.buffer_view)) |vi| usage[vi] |= Use.other;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, s.output.*.buffer_view)) |vi| usage[vi] |= Use.other;
             }
         }
     }
-    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+    for (geom.sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
         if (@intFromPtr(sk.inverse_bind_matrices) != 0) {
-            if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, sk.inverse_bind_matrices.*.buffer_view)) |vi| usage[vi] |= Use.other;
+            if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, sk.inverse_bind_matrices.*.buffer_view)) |vi| usage[vi] |= Use.other;
         }
     }
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*nd| {
         if (nd.has_mesh_gpu_instancing != 0) {
-            for (sl(c.cgltf_attribute, nd.mesh_gpu_instancing.attributes, nd.mesh_gpu_instancing.attributes_count)) |*at| {
+            for (geom.sl(c.cgltf_attribute, nd.mesh_gpu_instancing.attributes, nd.mesh_gpu_instancing.attributes_count)) |*at| {
                 if (@intFromPtr(at.data) == 0) continue;
-                if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.other;
+                if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, at.data.*.buffer_view)) |vi| usage[vi] |= Use.other;
             }
         }
     }
     // Sparse storage is never eligible.
-    for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
+    for (geom.sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
         if (acc.is_sparse == 0) continue;
-        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.indices_buffer_view)) |vi| usage[vi] |= Use.other;
-        if (ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.values_buffer_view)) |vi| usage[vi] |= Use.other;
+        if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.indices_buffer_view)) |vi| usage[vi] |= Use.other;
+        if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, n_views, acc.sparse.values_buffer_view)) |vi| usage[vi] |= Use.other;
     }
 
     for (views, 0..) |*v, i| {
@@ -1782,7 +1562,7 @@ const write_mod = @import("../gltf/write.zig");
 
 fn countMeshTriangles(m: *const c.cgltf_mesh) u64 {
     var tris: u64 = 0;
-    for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
         if (p.type != c.cgltf_primitive_type_triangles) continue;
         if (@intFromPtr(p.indices) != 0) {
             tris += p.indices.*.count / 3;
@@ -1798,17 +1578,17 @@ fn countMeshTriangles(m: *const c.cgltf_mesh) u64 {
 /// mesh duplication (one mesh per node) stays invisible to this metric.
 fn instancedTriangles(data: *const c.cgltf_data) u64 {
     var tris: u64 = 0;
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
-        const mi = ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, n.mesh) orelse continue;
-        tris += countMeshTriangles(&sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi]);
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+        const mi = geom.ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, n.mesh) orelse continue;
+        tris += countMeshTriangles(&geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi]);
     }
     return tris;
 }
 
 fn firstAttrAcc(data: *const c.cgltf_data, kind: c_int) ?*const c.cgltf_accessor {
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
-            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            for (geom.sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
                 if (at.type != kind) continue;
                 if (@intFromPtr(at.data) == 0) continue;
                 return at.data;
@@ -1819,7 +1599,7 @@ fn firstAttrAcc(data: *const c.cgltf_data, kind: c_int) ?*const c.cgltf_accessor
 }
 
 fn findNode(data: *const c.cgltf_data, name: []const u8) ?*c.cgltf_node {
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
         if (@intFromPtr(n.name) == 0) continue;
         if (std.mem.eql(u8, std.mem.span(n.name), name)) return n;
     }
@@ -1827,7 +1607,7 @@ fn findNode(data: *const c.cgltf_data, name: []const u8) ?*c.cgltf_node {
 }
 
 fn meshPosBounds(m: *const c.cgltf_mesh) ?Bounds {
-    for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
         const pos = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
         if (pos[0].has_min == 0 or pos[0].has_max == 0) continue;
         return .{
@@ -1875,14 +1655,14 @@ fn nodeWorldAabb(
     node: *const c.cgltf_node,
 ) !Aabb {
     var out = Aabb{};
-    const mi = ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, node.mesh) orelse return out;
+    const mi = geom.ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, node.mesh) orelse return out;
     var m: [16]f32 = undefined;
     c.cgltf_node_transform_world(node, &m);
 
-    const mesh = &sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi];
-    for (sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
+    const mesh = &geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)[mi];
+    for (geom.sl(c.cgltf_primitive, mesh.primitives, mesh.primitives_count)) |*p| {
         const pos = findAttr(p, c.cgltf_attribute_type_position) orelse continue;
-        const ncomp = numComponents(pos[0].type);
+        const ncomp = geom.numComponents(pos[0].type);
         if (ncomp < 3 or pos[0].count == 0) continue;
         const total = pos[0].count * ncomp;
         const tmp = try a.alloc(f32, total);
@@ -1903,7 +1683,7 @@ fn nodeWorldAabb(
 
 fn worldAabb(data: *const c.cgltf_data, a: std.mem.Allocator) !Aabb {
     var out = Aabb{};
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
         out.merge(try nodeWorldAabb(data, a, n));
     }
     return out;
@@ -2067,10 +1847,10 @@ test "quantize: dequant baked into node TRS keeps the cube's world bounds" {
 
     // every mesh-carrying node carries the dequant scale / offset
     var mesh_nodes: usize = 0;
-    for (sl(c.cgltf_node, loaded.cdata.nodes, loaded.cdata.nodes_count)) |*n| {
-        const mi = ptrIndex(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count, n.mesh) orelse continue;
+    for (geom.sl(c.cgltf_node, loaded.cdata.nodes, loaded.cdata.nodes_count)) |*n| {
+        const mi = geom.ptrIndex(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count, n.mesh) orelse continue;
         mesh_nodes += 1;
-        const b = meshPosBounds(&sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[mi]) orelse continue;
+        const b = meshPosBounds(&geom.sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[mi]) orelse continue;
         try std.testing.expect(n.has_scale != 0);
         for (0..3) |k| {
             const range = b.mx[k] - b.mn[k];
@@ -2103,7 +1883,7 @@ test "quantize: dequant baked into node TRS keeps the cube's world bounds" {
     const scale_a = box_a_after.scale;
     const trans_a = box_a_after.translation;
     try std.testing.expect(box_a_after.has_scale != 0 and box_a_after.has_translation != 0);
-    const mesh_a = &sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[0];
+    const mesh_a = &geom.sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count)[0];
     const b = meshPosBounds(mesh_a) orelse return error.NoBounds;
     for (0..3) |k| {
         const range = b.mx[k] - b.mn[k];
@@ -2289,8 +2069,8 @@ test "quantize: multi-primitive mesh splits per bounds group" {
 
     var found_a = false;
     var found_b = false;
-    for (sl(c.cgltf_node, rp.loaded.cdata.nodes, rp.loaded.cdata.nodes_count)) |*n| {
-        if (ptrIndex(c.cgltf_mesh, rp.loaded.cdata.meshes, rp.loaded.cdata.meshes_count, n.mesh) == null) continue;
+    for (geom.sl(c.cgltf_node, rp.loaded.cdata.nodes, rp.loaded.cdata.nodes_count)) |*n| {
+        if (geom.ptrIndex(c.cgltf_mesh, rp.loaded.cdata.meshes, rp.loaded.cdata.meshes_count, n.mesh) == null) continue;
         // group A: unit range; group B: x range 2 (0 range axes become 1)
         if (std.math.approxEqAbs(f32, n.scale[0], 1.0, 1e-5) and
             std.math.approxEqAbs(f32, n.scale[1], 1.0, 1e-5)) found_a = true;
@@ -2370,7 +2150,7 @@ fn jsonU64(v: std.json.Value) !u64 {
 
 /// Raw (or, for compressed views, compressed-payload) bytes of a parsed view.
 fn parsedViewBytes(data: *c.cgltf_data, i: usize) ![]const u8 {
-    const views = sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count);
+    const views = geom.sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count);
     if (i >= views.len) return error.BadView;
     const v = &views[i];
     if (v.has_meshopt_compression != 0) {
@@ -2400,11 +2180,11 @@ fn parsedViewBytes(data: *c.cgltf_data, i: usize) ![]const u8 {
 
 /// First accessor for (mesh, prim, attribute name) in lockstep-walked cdata.
 fn primAttrAcc(data: *c.cgltf_data, mi: usize, pi: usize, name: []const u8) ?*c.cgltf_accessor {
-    const meshes = sl(c.cgltf_mesh, data.meshes, data.meshes_count);
+    const meshes = geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count);
     if (mi >= meshes.len) return null;
-    const prims = sl(c.cgltf_primitive, meshes[mi].primitives, meshes[mi].primitives_count);
+    const prims = geom.sl(c.cgltf_primitive, meshes[mi].primitives, meshes[mi].primitives_count);
     if (pi >= prims.len) return null;
-    for (sl(c.cgltf_attribute, prims[pi].attributes, prims[pi].attributes_count)) |*at| {
+    for (geom.sl(c.cgltf_attribute, prims[pi].attributes, prims[pi].attributes_count)) |*at| {
         if (@intFromPtr(at.name) == 0) continue;
         if (!std.mem.eql(u8, std.mem.span(at.name), name)) continue;
         return @ptrCast(at.data);
@@ -2414,7 +2194,7 @@ fn primAttrAcc(data: *c.cgltf_data, mi: usize, pi: usize, name: []const u8) ?*c.
 
 fn unpackFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) ![]f32 {
     var cp = acc.*;
-    const ncomp = numComponents(cp.type);
+    const ncomp = geom.numComponents(cp.type);
     const out = try a.alloc(f32, @as(usize, @intCast(acc.count)) * ncomp);
     if (cp.stride == 0) cp.stride = c.cgltf_calc_size(cp.type, cp.component_type);
     const got = c.cgltf_accessor_unpack_floats(&cp, out.ptr, out.len);
@@ -2498,7 +2278,7 @@ fn expectMeshoptDecodes(a: std.mem.Allocator, orig: *c.cgltf_data, comp: *c.cglt
     try std.testing.expectEqual(orig.meshes_count, comp.meshes_count);
 
     // Payload-level checks: no cross-file correlation needed.
-    const views = sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count);
+    const views = geom.sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count);
     for (views, 0..) |*v, i| {
         if (v.has_meshopt_compression == 0) continue;
         const m = v.meshopt_compression;
@@ -2528,26 +2308,26 @@ fn expectMeshoptDecodes(a: std.mem.Allocator, orig: *c.cgltf_data, comp: *c.cglt
     }
 
     // Value checks against the original input, per (mesh, prim, attribute).
-    const om = sl(c.cgltf_mesh, orig.meshes, orig.meshes_count);
-    const cm = sl(c.cgltf_mesh, comp.meshes, comp.meshes_count);
+    const om = geom.sl(c.cgltf_mesh, orig.meshes, orig.meshes_count);
+    const cm = geom.sl(c.cgltf_mesh, comp.meshes, comp.meshes_count);
     for (om, 0..) |_, mi| {
-        const oprims = sl(c.cgltf_primitive, om[mi].primitives, om[mi].primitives_count);
-        const cprims = sl(c.cgltf_primitive, cm[mi].primitives, cm[mi].primitives_count);
+        const oprims = geom.sl(c.cgltf_primitive, om[mi].primitives, om[mi].primitives_count);
+        const cprims = geom.sl(c.cgltf_primitive, cm[mi].primitives, cm[mi].primitives_count);
         try std.testing.expectEqual(oprims.len, cprims.len);
         for (oprims, 0..) |_, pi| {
             // Indices: rotation-insensitive triple sets (or exact sequences).
             if (@intFromPtr(oprims[pi].indices) != 0) {
                 const oa: *c.cgltf_accessor = @ptrCast(oprims[pi].indices);
                 const ca: *c.cgltf_accessor = @ptrCast(cprims[pi].indices);
-                const cvi = ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
-                const cv = &sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
+                const cvi = geom.ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
+                const cv = &geom.sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
                 if (cv.has_meshopt_compression != 0) {
                     const mcc = cv.meshopt_compression;
                     const s_new: usize = @intCast(mcc.stride);
                     const n: usize = @intCast(mcc.count);
                     try std.testing.expectEqual(oa.count, n);
                     const s_orig: usize = @intCast(c.cgltf_calc_size(oa.type, oa.component_type));
-                    const ovi = ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view) orelse return error.NoAcc;
+                    const ovi = geom.ptrIndex(c.cgltf_buffer_view, orig.buffer_views, orig.buffer_views_count, oa.buffer_view) orelse return error.NoAcc;
                     const raw_o = try parsedViewBytes(orig, ovi);
                     try std.testing.expectEqual(n * s_orig, raw_o.len);
                     const payload = try parsedViewBytes(comp, cvi);
@@ -2575,8 +2355,8 @@ fn expectMeshoptDecodes(a: std.mem.Allocator, orig: *c.cgltf_data, comp: *c.cglt
             for ([_]struct { name: []const u8, is_position: bool }{ .{ .name = "POSITION", .is_position = true }, .{ .name = "NORMAL", .is_position = false }, .{ .name = "TANGENT", .is_position = false }, .{ .name = "TEXCOORD_0", .is_position = false }, .{ .name = "TEXCOORD_1", .is_position = false } }) |attr| {
                 const oa = primAttrAcc(orig, mi, pi, attr.name) orelse continue;
                 const ca = primAttrAcc(comp, mi, pi, attr.name) orelse return error.NoAcc;
-                const cvi = ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
-                const cv = &sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
+                const cvi = geom.ptrIndex(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count, ca.buffer_view) orelse return error.NoAcc;
+                const cv = &geom.sl(c.cgltf_buffer_view, comp.buffer_views, comp.buffer_views_count)[cvi];
                 if (cv.has_meshopt_compression == 0) continue;
                 const mcc = cv.meshopt_compression;
                 const cstride: usize = @intCast(mcc.stride);
@@ -2589,7 +2369,7 @@ fn expectMeshoptDecodes(a: std.mem.Allocator, orig: *c.cgltf_data, comp: *c.cglt
                 defer a.free(dec);
                 try mc.decodeVertices(dec, payload, ccount, cstride);
                 if (mcc.filter == c.cgltf_meshopt_compression_filter_octahedral) try mc.decodeFilterOct(dec, ccount, cstride);
-                const ncomp = numComponents(ca.type);
+                const ncomp = geom.numComponents(ca.type);
                 const ccomp = ca.component_type;
                 // Original per-component bounds (only POSITION accessors
                 // carry min/max; UVs normalize against these same bounds).
@@ -2679,7 +2459,7 @@ fn meshoptHelmetOn() !void {
     // inside become no-ops — inflated-data checks live in parse/write
     // tests; here we pin the inflate itself.)
     try expectMeshoptDecodes(aa, orig_l.cdata, rp.loaded.cdata);
-    for (sl(c.cgltf_buffer_view, rp.loaded.cdata.buffer_views, rp.loaded.cdata.buffer_views_count)) |*v| {
+    for (geom.sl(c.cgltf_buffer_view, rp.loaded.cdata.buffer_views, rp.loaded.cdata.buffer_views_count)) |*v| {
         try std.testing.expectEqual(@as(c_int, 0), v.has_meshopt_compression);
     }
     try std.testing.expectEqual(orig_l.cdata.meshes_count, rp.loaded.cdata.meshes_count);

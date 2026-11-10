@@ -157,6 +157,20 @@ fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
     return ptr[0..n];
 }
 
+/// Pool index of `p` in `base[0..count]`, or null when `p` is null, misaligned
+/// or outside the pool (corrupt input). Never subtracts raw pointers.
+fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
+    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
+    const b: usize = @intFromPtr(base);
+    const q: usize = @intFromPtr(p);
+    if (q < b) return null;
+    const off = q - b;
+    if (off % @sizeOf(T) != 0) return null;
+    const i = off / @sizeOf(T);
+    if (i >= count) return null;
+    return std.math.cast(u32, i);
+}
+
 /// Raw bytes of a buffer view, overflow-safe. Null when the buffer data is
 /// not loaded (external uri) or the view runs past its buffer.
 fn viewBytesChecked(v: *const c.cgltf_buffer_view) ?[]const u8 {
@@ -380,7 +394,7 @@ fn semanticOf(attr_type: c_uint) model.Semantic {
 fn convTextureView(view: *const c.cgltf_texture_view, maps: *Maps) !?model.TextureInfo {
     const tex = view.texture orelse return null;
     const idx = maps.textures.get(tex) orelse return null;
-    return .{ .texture = idx, .texcoord = @intCast(@max(view.texcoord, 0)) };
+    return .{ .texture = idx, .texcoord = std.math.cast(u32, @max(view.texcoord, 0)) orelse return error.AccessorOutOfRange };
 }
 
 fn markExt(exts: *model.Extensions, name: [*c]const u8) void {
@@ -610,17 +624,17 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
                 const acc = attr.data;
                 attrs[k] = .{
                     .semantic = semanticOf(attr.type),
-                    .semantic_index = @intCast(@max(attr.index, 0)),
-                    .count = @intCast(acc.*.count),
+                    .semantic_index = std.math.cast(u32, @max(attr.index, 0)) orelse return error.AccessorOutOfRange,
+                    .count = std.math.cast(u32, acc.*.count) orelse return error.AccessorOutOfRange,
                     .component = convComponent(acc.*.component_type),
                     .dim = convDim(acc.*.type),
                 };
-                if (attr.type == 1) vertex_count = @intCast(acc.*.count);
+                if (attr.type == 1) vertex_count = std.math.cast(u32, acc.*.count) orelse return error.AccessorOutOfRange;
             }
             prims[j] = .{
                 .mode = convMode(p.type),
                 .attributes = attrs,
-                .index_count = if (p.indices) |ix| @intCast(ix.*.count) else 0,
+                .index_count = if (p.indices) |ix| std.math.cast(u32, ix.*.count) orelse return error.AccessorOutOfRange else 0,
                 .indexed = p.indices != null,
                 .material = if (p.material) |mat| maps.materials.get(mat) else null,
             };
@@ -637,10 +651,15 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     const nodes = try a.alloc(model.Node, data.nodes_count);
     for (sl(c.cgltf_node, data.nodes, data.nodes_count), 0..) |*n, i| {
         const children = try a.alloc(u32, n.children_count);
-        for (sl([*c]c.cgltf_node, n.children, n.children_count), 0..) |ch, k| {
-            // Unknown pointers (corrupt input) degrade to node 0 rather than
-            // leaving the slot uninitialized.
-            children[k] = maps.nodes.get(ch) orelse 0;
+        var cn: usize = 0;
+        for (sl([*c]c.cgltf_node, n.children, n.children_count)) |ch| {
+            // Corrupt refs (pointers outside the node pool) are dropped
+            // instead of remapping to node 0.
+            if (@intFromPtr(ch) == 0) continue;
+            if (maps.nodes.get(ch)) |idx| {
+                children[cn] = idx;
+                cn += 1;
+            }
         }
         var mtx: [16]f32 = undefined;
         for (n.matrix, 0..) |v, k| mtx[k] = @floatCast(v);
@@ -652,9 +671,9 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         for (n.scale, 0..) |v, k| scl[k] = @floatCast(v);
         nodes[i] = .{
             .name = try dupName(a, n.name),
-            .children = children,
+            .children = children[0..cn],
             .mesh = if (n.mesh) |m| maps.meshes.get(m) else null,
-            .skin = if (n.skin) |s| @intCast(indexOf(data.skins, s)) else null,
+            .skin = if (n.skin) |s| ptrIndex(c.cgltf_skin, data.skins, data.skins_count, s) else null,
             .translation = tr,
             .rotation = rot,
             .scale = scl,
@@ -668,10 +687,17 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     const scenes = try a.alloc(model.Scene, data.scenes_count);
     for (sl(c.cgltf_scene, data.scenes, data.scenes_count), 0..) |*s, i| {
         const roots = try a.alloc(u32, s.nodes_count);
-        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count), 0..) |n, k| {
-            roots[k] = maps.nodes.get(n) orelse 0;
+        var rn: usize = 0;
+        for (sl([*c]c.cgltf_node, s.nodes, s.nodes_count)) |n| {
+            // Corrupt refs (pointers outside the node pool) are dropped
+            // instead of remapping to node 0.
+            if (@intFromPtr(n) == 0) continue;
+            if (maps.nodes.get(n)) |idx| {
+                roots[rn] = idx;
+                rn += 1;
+            }
         }
-        scenes[i] = .{ .name = try dupName(a, s.name), .roots = roots };
+        scenes[i] = .{ .name = try dupName(a, s.name), .roots = roots[0..rn] };
     }
     out.scenes = scenes;
 
@@ -688,8 +714,8 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         }
         anims[i] = .{
             .name = try dupName(a, an.name),
-            .channels = @intCast(an.channels_count),
-            .samplers = @intCast(an.samplers_count),
+            .channels = std.math.cast(u32, an.channels_count) orelse return error.AccessorOutOfRange,
+            .samplers = std.math.cast(u32, an.samplers_count) orelse return error.AccessorOutOfRange,
             .duration = duration,
         };
         var targets: std.ArrayList(u32) = .empty;
@@ -706,7 +732,7 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     for (sl(c.cgltf_skin, data.skins, data.skins_count), 0..) |*sk, i| {
         skins[i] = .{
             .name = try dupName(a, sk.name),
-            .joints = @intCast(sk.joints_count),
+            .joints = std.math.cast(u32, sk.joints_count) orelse return error.AccessorOutOfRange,
             .has_inverse_bind_matrices = sk.inverse_bind_matrices != null,
         };
     }
@@ -753,11 +779,6 @@ fn convWrap(v: c_uint) model.Wrap {
         10497 => .repeat,
         else => .unknown,
     };
-}
-
-fn indexOf(skins: [*]const c.cgltf_skin, ptr: *const c.cgltf_skin) usize {
-    const byte_off = @intFromPtr(ptr) - @intFromPtr(skins);
-    return byte_off / @sizeOf(c.cgltf_skin);
 }
 
 test "loadFile inflates meshopt views to plain data" {

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const c = @import("cgltf");
+const geom = @import("geom.zig");
 
 pub const Options = struct {
     accessors: bool = true,
@@ -27,48 +28,6 @@ pub const Result = struct {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
-    if (n == 0 or @intFromPtr(ptr) == 0) return &.{};
-    return ptr[0..n];
-}
-
-fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
-    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
-    const b: usize = @intFromPtr(base);
-    const q: usize = @intFromPtr(p);
-    if (q < b) return null;
-    const off = q - b;
-    if (off % @sizeOf(T) != 0) return null;
-    const i = off / @sizeOf(T);
-    if (i >= count) return null;
-    return @intCast(i);
-}
-
-fn numComponents(t: c.cgltf_type) usize {
-    return switch (t) {
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 4,
-        6 => 9,
-        7 => 16,
-        else => 1,
-    };
-}
-
-fn componentSize(t: c.cgltf_component_type) usize {
-    return switch (t) {
-        1 => 1, // BYTE
-        2 => 1, // UNSIGNED_BYTE
-        3 => 2, // SHORT
-        4 => 2, // UNSIGNED_SHORT
-        5 => 4, // UNSIGNED_INT
-        6 => 4, // FLOAT
-        else => 4,
-    };
-}
 
 fn strSame(a: [*c]const u8, b: [*c]const u8) bool {
     const an = @intFromPtr(a) == 0;
@@ -89,23 +48,11 @@ fn f32SliceSame(x: []const f32, y: []const f32) bool {
     return true;
 }
 
-/// payload bytes of a buffer view (buffer data is mapped into the source file)
+/// payload bytes of a buffer view (buffer data is mapped into the source file);
+/// delegates to `geom.viewData` after the null check.
 fn viewData(vp: [*c]c.cgltf_buffer_view) ?[]const u8 {
     if (@intFromPtr(vp) == 0) return null;
-    const v: *const c.cgltf_buffer_view = @ptrCast(vp);
-    if (v.data) |d| {
-        const p: [*]const u8 = @ptrCast(d);
-        return p[0..v.size];
-    }
-    if (@intFromPtr(v.buffer) == 0) return null;
-    const bd = v.buffer.*.data orelse return null;
-    // Overflow-safe: ReleaseFast wraps on arithmetic.
-    const bsize: usize = @intCast(v.buffer.*.size);
-    const off: usize = @intCast(v.offset);
-    const sz: usize = @intCast(v.size);
-    if (off > bsize or sz > bsize - off) return null;
-    const p: [*]const u8 = @ptrCast(bd);
-    return p[off .. off + sz];
+    return geom.viewData(@ptrCast(vp));
 }
 
 /// A strided element stream over a buffer view (or the sparse sub-ranges).
@@ -154,7 +101,7 @@ fn accessorKey(acc: *const c.cgltf_accessor) KeyBuf {
         @as(u8, @intFromBool(acc.normalized != 0)) << 1 |
         @as(u8, @intFromBool(acc.has_min != 0)) << 2 |
         @as(u8, @intFromBool(acc.has_max != 0)) << 3;
-    const ncomp = numComponents(acc.type);
+    const ncomp = geom.numComponents(acc.type);
     if (acc.has_min != 0) {
         const b = std.mem.sliceAsBytes(acc.min[0..ncomp]);
         @memcpy(k[24..][0..b.len], b);
@@ -176,7 +123,7 @@ fn accessorContentSame(x: *const c.cgltf_accessor, y: *const c.cgltf_accessor) b
     if (!Stream.same(xs, ys)) return false;
 
     if (x.is_sparse != 0) {
-        const isz = componentSize(x.sparse.indices_component_type);
+        const isz = geom.componentSize(x.sparse.indices_component_type);
         const ixs = Stream.init(
             x.sparse.indices_buffer_view,
             @intCast(x.sparse.indices_byte_offset),
@@ -220,7 +167,7 @@ fn fixAccessorRef(
 ) void {
     const p = slot.*;
     if (@intFromPtr(p) == 0) return;
-    const i = ptrIndex(c.cgltf_accessor, data.accessors, data.accessors_count, p) orelse return;
+    const i = geom.ptrIndex(c.cgltf_accessor, data.accessors, data.accessors_count, p) orelse return;
     slot.* = &accs[rep[i]];
 }
 
@@ -231,17 +178,17 @@ fn fixAttributeRefs(
     attrs: [*c]c.cgltf_attribute,
     count: usize,
 ) void {
-    for (sl(c.cgltf_attribute, attrs, count)) |*at| {
+    for (geom.sl(c.cgltf_attribute, attrs, count)) |*at| {
         fixAccessorRef(data, accs, rep, &at.data);
     }
 }
 
 fn rewriteAccessorRefs(data: *c.cgltf_data, accs: []c.cgltf_accessor, rep: []const u32) void {
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             fixAttributeRefs(data, accs, rep, p.attributes, p.attributes_count);
             fixAccessorRef(data, accs, rep, &p.indices);
-            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+            for (geom.sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
                 fixAttributeRefs(data, accs, rep, t.attributes, t.attributes_count);
             }
             if (p.has_draco_mesh_compression != 0) {
@@ -255,7 +202,7 @@ fn rewriteAccessorRefs(data: *c.cgltf_data, accs: []c.cgltf_accessor, rep: []con
             }
         }
     }
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
         if (n.has_mesh_gpu_instancing != 0) {
             fixAttributeRefs(
                 data,
@@ -266,13 +213,13 @@ fn rewriteAccessorRefs(data: *c.cgltf_data, accs: []c.cgltf_accessor, rep: []con
             );
         }
     }
-    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
-        for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+    for (geom.sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (geom.sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
             fixAccessorRef(data, accs, rep, &s.input);
             fixAccessorRef(data, accs, rep, &s.output);
         }
     }
-    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+    for (geom.sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
         fixAccessorRef(data, accs, rep, &sk.inverse_bind_matrices);
     }
 }
@@ -280,7 +227,7 @@ fn rewriteAccessorRefs(data: *c.cgltf_data, accs: []c.cgltf_accessor, rep: []con
 fn dedupAccessors(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     const n: usize = @intCast(data.accessors_count);
     if (n < 2) return 0;
-    const accs = sl(c.cgltf_accessor, data.accessors, n);
+    const accs = geom.sl(c.cgltf_accessor, data.accessors, n);
     const rep = try a.alloc(u32, n);
 
     var buckets: std.AutoHashMapUnmanaged(u64, std.ArrayList(u32)) = .empty;
@@ -353,7 +300,7 @@ fn extensionsSame(
     yc: usize,
 ) bool {
     if (xc != yc) return false;
-    for (sl(c.cgltf_extension, xp, xc), sl(c.cgltf_extension, yp, yc)) |*xe, *ye| {
+    for (geom.sl(c.cgltf_extension, xp, xc), geom.sl(c.cgltf_extension, yp, yc)) |*xe, *ye| {
         if (!strSame(xe.name, ye.name)) return false;
         if (!strSame(xe.data, ye.data)) return false;
     }
@@ -491,14 +438,14 @@ fn fixMaterialRef(
 ) void {
     const p = slot.*;
     if (@intFromPtr(p) == 0) return;
-    const i = ptrIndex(c.cgltf_material, data.materials, data.materials_count, p) orelse return;
+    const i = geom.ptrIndex(c.cgltf_material, data.materials, data.materials_count, p) orelse return;
     slot.* = &mats[rep[i]];
 }
 
 fn dedupMaterials(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     const n: usize = @intCast(data.materials_count);
     if (n < 2) return 0;
-    const mats = sl(c.cgltf_material, data.materials, n);
+    const mats = geom.sl(c.cgltf_material, data.materials, n);
     const rep = try a.alloc(u32, n);
 
     var removed: u32 = 0;
@@ -515,10 +462,10 @@ fn dedupMaterials(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     }
 
     if (removed == 0) return 0;
-    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
-        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+    for (geom.sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (geom.sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
             fixMaterialRef(data, mats, rep, &p.material);
-            for (sl(c.cgltf_material_mapping, p.mappings, p.mappings_count)) |*mp| {
+            for (geom.sl(c.cgltf_material_mapping, p.mappings, p.mappings_count)) |*mp| {
                 fixMaterialRef(data, mats, rep, &mp.material);
             }
         }
@@ -540,16 +487,16 @@ fn primitiveSame(x: *const c.cgltf_primitive, y: *const c.cgltf_primitive) bool 
     if (x.indices != y.indices) return false;
     if (x.material != y.material) return false;
     if (x.attributes_count != y.attributes_count) return false;
-    for (sl(c.cgltf_attribute, x.attributes, x.attributes_count), 0..) |*xa, k| {
-        const ya = &sl(c.cgltf_attribute, y.attributes, y.attributes_count)[k];
+    for (geom.sl(c.cgltf_attribute, x.attributes, x.attributes_count), 0..) |*xa, k| {
+        const ya = &geom.sl(c.cgltf_attribute, y.attributes, y.attributes_count)[k];
         if (!attributeSame(xa, ya)) return false;
     }
     if (x.targets_count != y.targets_count) return false;
-    for (sl(c.cgltf_morph_target, x.targets, x.targets_count), 0..) |*xt, k| {
-        const yt = &sl(c.cgltf_morph_target, y.targets, y.targets_count)[k];
+    for (geom.sl(c.cgltf_morph_target, x.targets, x.targets_count), 0..) |*xt, k| {
+        const yt = &geom.sl(c.cgltf_morph_target, y.targets, y.targets_count)[k];
         if (xt.attributes_count != yt.attributes_count) return false;
-        for (sl(c.cgltf_attribute, xt.attributes, xt.attributes_count), 0..) |*xa, ai| {
-            const ya = &sl(c.cgltf_attribute, yt.attributes, yt.attributes_count)[ai];
+        for (geom.sl(c.cgltf_attribute, xt.attributes, xt.attributes_count), 0..) |*xa, ai| {
+            const ya = &geom.sl(c.cgltf_attribute, yt.attributes, yt.attributes_count)[ai];
             if (!attributeSame(xa, ya)) return false;
         }
     }
@@ -560,16 +507,16 @@ fn primitiveSame(x: *const c.cgltf_primitive, y: *const c.cgltf_primitive) bool 
 
 fn meshSame(x: *const c.cgltf_mesh, y: *const c.cgltf_mesh) bool {
     if (x.primitives_count != y.primitives_count) return false;
-    for (sl(c.cgltf_primitive, x.primitives, x.primitives_count), 0..) |*xp, k| {
-        const yp = &sl(c.cgltf_primitive, y.primitives, y.primitives_count)[k];
+    for (geom.sl(c.cgltf_primitive, x.primitives, x.primitives_count), 0..) |*xp, k| {
+        const yp = &geom.sl(c.cgltf_primitive, y.primitives, y.primitives_count)[k];
         if (!primitiveSame(xp, yp)) return false;
     }
-    const xw = std.mem.sliceAsBytes(sl(c.cgltf_float, x.weights, x.weights_count));
-    const yw = std.mem.sliceAsBytes(sl(c.cgltf_float, y.weights, y.weights_count));
+    const xw = std.mem.sliceAsBytes(geom.sl(c.cgltf_float, x.weights, x.weights_count));
+    const yw = std.mem.sliceAsBytes(geom.sl(c.cgltf_float, y.weights, y.weights_count));
     if (!std.mem.eql(u8, xw, yw)) return false;
     if (x.target_names_count != y.target_names_count) return false;
-    for (sl([*c]u8, @ptrCast(x.target_names), x.target_names_count), 0..) |xp, k| {
-        const yp = sl([*c]u8, @ptrCast(y.target_names), y.target_names_count)[k];
+    for (geom.sl([*c]u8, @ptrCast(x.target_names), x.target_names_count), 0..) |xp, k| {
+        const yp = geom.sl([*c]u8, @ptrCast(y.target_names), y.target_names_count)[k];
         if (!strSame(xp, yp)) return false;
     }
     if (!extrasSame(&x.extras, &y.extras)) return false;
@@ -580,7 +527,7 @@ fn meshSame(x: *const c.cgltf_mesh, y: *const c.cgltf_mesh) bool {
 fn dedupMeshes(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     const n: usize = @intCast(data.meshes_count);
     if (n < 2) return 0;
-    const meshes = sl(c.cgltf_mesh, data.meshes, n);
+    const meshes = geom.sl(c.cgltf_mesh, data.meshes, n);
     const rep = try a.alloc(u32, n);
 
     var removed: u32 = 0;
@@ -597,10 +544,10 @@ fn dedupMeshes(a: std.mem.Allocator, data: *c.cgltf_data) !u32 {
     }
 
     if (removed == 0) return 0;
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*node| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*node| {
         const p = node.mesh;
         if (@intFromPtr(p) == 0) continue;
-        const mi = ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, p) orelse continue;
+        const mi = geom.ptrIndex(c.cgltf_mesh, data.meshes, data.meshes_count, p) orelse continue;
         node.mesh = &meshes[rep[mi]];
     }
     return removed;
@@ -662,15 +609,15 @@ test "dedup: duplicate-heavy fixture" {
     try std.testing.expectEqual(@as(u32, 2), res.removed_materials);
 
     // references must now point at the representatives
-    const nodes = sl(c.cgltf_node, loaded.cdata.nodes, loaded.cdata.nodes_count);
+    const nodes = geom.sl(c.cgltf_node, loaded.cdata.nodes, loaded.cdata.nodes_count);
     try std.testing.expect(nodes[1].mesh == nodes[2].mesh);
-    const meshes = sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count);
-    const p0 = &sl(c.cgltf_primitive, meshes[0].primitives, meshes[0].primitives_count)[0];
-    const p1 = &sl(c.cgltf_primitive, meshes[1].primitives, meshes[1].primitives_count)[0];
+    const meshes = geom.sl(c.cgltf_mesh, loaded.cdata.meshes, loaded.cdata.meshes_count);
+    const p0 = &geom.sl(c.cgltf_primitive, meshes[0].primitives, meshes[0].primitives_count)[0];
+    const p1 = &geom.sl(c.cgltf_primitive, meshes[1].primitives, meshes[1].primitives_count)[0];
     try std.testing.expect(p0.indices == p1.indices);
     try std.testing.expect(p0.material == p1.material);
-    const a0 = &sl(c.cgltf_attribute, p0.attributes, p0.attributes_count)[0];
-    const a1 = &sl(c.cgltf_attribute, p1.attributes, p1.attributes_count)[0];
+    const a0 = &geom.sl(c.cgltf_attribute, p0.attributes, p0.attributes_count)[0];
+    const a1 = &geom.sl(c.cgltf_attribute, p1.attributes, p1.attributes_count)[0];
     try std.testing.expect(a0.data == a1.data);
 
     // the writer GC turns unreferenced duplicates into a smaller asset

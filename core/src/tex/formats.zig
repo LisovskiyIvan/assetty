@@ -71,25 +71,38 @@ pub const BasisModel = enum(u8) {
     }
 };
 
-/// bytes per pixel (x100 to stay integral): transcodable formats are approximations
+/// bytes per pixel (x100 to stay integral). Only exact formats are listed:
+/// block formats carry a fixed number of bits per block (BC 64/128, ETC/EAC
+/// 64/128, ASTC always 128), uncompressed formats a fixed byte count.
+/// Anything else returns 0 (unknown: no estimate rather than a bogus one).
 pub fn vkBytesPerPixelX100(vk_format: u32) u32 {
     return switch (vk_format) {
-        131, 132, 133, 134 => 50, // BC1_RGB / BC1_RGBA (64bit per 4x4)
-        135, 136, 137, 138 => 100, // BC2, BC3
-        139, 140 => 50, // BC4
-        141, 142 => 100, // BC5
-        143, 144 => 100, // BC7, BC6H
-        145, 146, 147 => 50, // ETC2 RGB / punchthrough
-        148, 149 => 100, // ETC2 RGBA
-        150, 151, 152, 153, 154 => 50, // EAC R/RG
-        157, 158 => 100, // ASTC 4x4
-        159 => 100, // ASTC 5x4
-        160, 161 => 45, // ASTC 6x6 (~16/36)
-        162...178 => 100, // other ASTC blocks (rough)
-        37, 38 => 400, // R8G8B8A8 / sRGB
-        43, 44 => 300, // R8G8B8
-        56...64 => 100, // single/dual channel 8bit families (rough)
-        else => 400, // unknown → assume RGBA8
+        37, 38 => 400, // R8G8B8A8_UNORM / SRGB
+        43, 44 => 300, // R8G8B8_UNORM / SRGB
+        131, 132, 133, 134 => 400, // BC1 (64-bit block)
+        135, 136, 137, 138 => 800, // BC2/BC3 (128-bit block)
+        139, 140 => 400, // BC4 (64-bit block)
+        141, 142 => 800, // BC5 (128-bit block)
+        143, 144, 145, 146 => 800, // BC6H/BC7 (128-bit block)
+        147, 148, 149, 150 => 400, // ETC2 RGB / punchthrough alpha (64-bit block)
+        151, 152 => 800, // ETC2 RGBA8 (128-bit block)
+        153, 154 => 400, // EAC R11 (64-bit block)
+        155, 156 => 800, // EAC R11G11 (128-bit block)
+        157, 158 => 800, // ASTC 4x4: 128 / 16
+        159, 160 => 640, // ASTC 5x4: 128 / 20
+        161, 162 => 512, // ASTC 5x5: 128 / 25
+        163, 164 => 427, // ASTC 6x5: 128 / 30
+        165, 166 => 356, // ASTC 6x6: 128 / 36
+        167, 168 => 320, // ASTC 8x5: 128 / 40
+        169, 170 => 267, // ASTC 8x6: 128 / 48
+        171, 172 => 200, // ASTC 8x8: 128 / 64
+        173, 174 => 256, // ASTC 10x5: 128 / 50
+        175, 176 => 213, // ASTC 10x6: 128 / 60
+        177, 178 => 160, // ASTC 10x8: 128 / 80
+        179, 180 => 128, // ASTC 10x10: 128 / 100
+        181, 182 => 107, // ASTC 12x10: 128 / 120
+        183, 184 => 89, // ASTC 12x12: 128 / 144
+        else => 0, // unknown → no estimate
     };
 }
 
@@ -98,17 +111,28 @@ pub fn formatLabel(vk_format: u32) []const u8 {
         0 => "BasisU",
         131, 132 => "BC1_RGB",
         133, 134 => "BC1_RGBA",
-        135 => "BC2", 136 => "BC3",
-        139, 140 => "BC4", 141, 142 => "BC5",
-        143 => "BC7", 144 => "BC6H",
+        135 => "BC2",
+        136 => "BC3",
+        139, 140 => "BC4",
+        141, 142 => "BC5",
+        143 => "BC7",
+        144 => "BC6H",
         145, 146, 147 => "ETC2",
         148, 149 => "ETC2_RGBA",
         157, 158, 159, 160, 161 => "ASTC",
-        162...178 => "ASTC",
+        162...184 => "ASTC",
         37, 38 => "RGBA8",
         43, 44 => "RGB8",
         else => "VK?",
     };
+}
+
+/// Full mip-chain depth for a w×h image: floor(log2(max(w,h))) + 1.
+/// Centralizes the 32-clz levels math every vram estimate uses.
+pub fn mipLevels(w: u32, h: u32) u32 {
+    const m = @max(w, h);
+    if (m == 0) return 1;
+    return @as(u32, 32 - @clz(m));
 }
 
 /// total bytes of the full mip chain for w×h at this format (1 face)
@@ -117,6 +141,7 @@ pub fn mipChainBytes(w: u32, h: u32, vk_format: u32, levels: u32) u64 {
 }
 
 pub fn mipChainBytesBpp(w: u32, h: u32, bpp_x100: u32, levels: u32) u64 {
+    if (bpp_x100 == 0) return 0; // unknown format: no estimate, not a bogus one
     const bpp: f64 = @as(f64, @floatFromInt(bpp_x100)) / 100.0;
     var total: f64 = 0;
     var cw: f64 = @floatFromInt(w);
@@ -142,8 +167,8 @@ test "ktx2 header" {
     try std.testing.expectEqual(@as(u32, 7), h.mip_levels);
     try std.testing.expectEqual(@as(u32, 143), h.vk_format);
     try std.testing.expectEqual(@as(u32, 64), h.width);
-    try std.testing.expectEqual(@as(u32, 100), vkBytesPerPixelX100(h.vk_format));
-    // 64x64 BC7 with 7 mips: 4096 + 1024 + 256 + 64 + 16 + 4 + 1... bytes
+    try std.testing.expectEqual(@as(u32, 800), vkBytesPerPixelX100(h.vk_format));
+    // 64x64 BC7 with 7 mips at 8bpp: 8 * (4096 + 1024 + 256 + 64 + 16 + 4 + 1)
     const bytes = mipChainBytes(64, 64, 143, 7);
-    try std.testing.expectEqual(@as(u64, 4096 + 1024 + 256 + 64 + 16 + 4 + 1), bytes);
+    try std.testing.expectEqual(@as(u64, 8 * (4096 + 1024 + 256 + 64 + 16 + 4 + 1)), bytes);
 }

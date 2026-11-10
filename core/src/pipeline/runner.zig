@@ -1,5 +1,5 @@
 //! Pipeline runner: load an asset, execute the steps of a preset in order, write
-//! the result back to disk and report before/after statistics.
+//! the result back to disk and report before/statistics.
 //!
 //! # Memory
 //!
@@ -10,17 +10,21 @@
 //! strings are duplicated into `a` so they stay valid after the loader's
 //! internal arenas are released.
 //!
-//! # Known limitation (intermediate state)
+//! # Reachability (prune vs writer GC)
 //!
-//! `ops/prune` works on the model-level `model.Asset` only and does not mutate
-//! the underlying cgltf data. The written file is therefore produced from the
-//! *unpruned* cgltf graph, so it may still contain elements that were dropped
-//! from the model. `Report.after` correctly reflects the pruned model (plus the
-//! real on-disk byte counts of the written file); once the writer GC and the
-//! cdata-level ops land, the output will shrink too.
+//! `ops/prune` works on the model-level `model.Asset` while the writer
+//! serializes the cgltf graph. Both sides run the same reachability GC from
+//! the same anchors (scene roots + animation channel targets + skin joints),
+//! so the file output mirrors the model-level removals with no cdata sync:
+//! unreferenced nodes, meshes, materials, textures, images and samplers are
+//! dropped from the file by the writer's GC pass. Animation stripping is
+//! synced explicitly (`loaded.cdata.animations_count = 0` in the prune step
+//! below); the writer GC then drops the orphaned sampler accessors and
+//! buffer views on its own.
 //!
-//! TODO: sync the pruned model back into `cgltf_data` (or run the ops on cgltf
-//! directly) so that the serialized output is lossless w.r.t. the report.
+//! Gap: assets with NO scenes, NO animations and NO skins are unanchored —
+//! the writer keeps every pool entry for those (lossless fallback), and
+//! `prune` mirrors that by keeping everything too.
 
 const std = @import("std");
 const preset = @import("preset.zig");
@@ -1199,7 +1203,7 @@ fn pruneNote(a: std.mem.Allocator, r: prune.Removed) ![]const u8 {
     if (total == 0) return "nothing to remove";
     const base = try std.fmt.allocPrint(
         a,
-        "removed {d} node(s), {d} mesh(es), {d} mat(s), {d} tex(s), {d} img(s), {d} sampler(s); model-level; cdata sync pending",
+        "removed {d} node(s), {d} mesh(es), {d} mat(s), {d} tex(s), {d} img(s), {d} sampler(s); file-level cleanup via writer GC",
         .{ r.nodes, r.meshes, r.materials, r.textures, r.images, r.samplers },
     );
     if (r.animations == 0) return base;

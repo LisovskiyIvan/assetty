@@ -67,6 +67,18 @@ pub fn run(a: std.mem.Allocator, asset: model.Asset, opts: Options) !Result {
     const stack = try a.alloc(u32, nn + 1);
     const allow_node_prune = asset.skins.len == 0;
 
+    // No scene, animation or skin anchor: mirror the writer GC's unanchored
+    // fallback and keep every pool entry (marking nothing would empty the
+    // whole asset while the file keeps everything).
+    if (asset.scenes.len == 0 and asset.animations.len == 0 and asset.skins.len == 0) {
+        @memset(used_nodes, true);
+        @memset(used_meshes, true);
+        @memset(used_materials, true);
+        @memset(used_textures, true);
+        @memset(used_images, true);
+        @memset(used_samplers, true);
+    }
+
     for (asset.scenes) |scene| {
         for (scene.roots) |root| {
             if (root < nn) markSubtree(asset, used_nodes, root, stack);
@@ -397,6 +409,40 @@ test "prune strips all animations when disabled" {
     try std.testing.expectEqualStrings("root", out.nodes[0].name.?);
     try std.testing.expectEqualStrings("used", out.nodes[1].name.?);
     try std.testing.expectEqual(@as(u32, 1), res.removed.nodes);
+}
+
+test "prune keeps everything when unanchored" {
+    // No scenes, animations or skins: mirror the writer GC's unanchored
+    // fallback and keep every pool entry instead of emptying the asset.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const asset: model.Asset = .{
+        .nodes = &.{.{ .name = "a" }},
+        .meshes = &.{.{ .name = "m" }},
+        .materials = &.{.{ .name = "mat" }},
+        .textures = &.{.{}},
+        .images = &.{.{ .mime = .png }},
+        .samplers = &.{.{}},
+    };
+
+    for ([_]bool{ true, false }) |keep_anim| {
+        const res = try run(a, asset, .{ .animations = keep_anim });
+        try std.testing.expectEqual(@as(usize, 1), res.asset.nodes.len);
+        try std.testing.expectEqual(@as(usize, 1), res.asset.meshes.len);
+        try std.testing.expectEqual(@as(usize, 1), res.asset.materials.len);
+        try std.testing.expectEqual(@as(usize, 1), res.asset.textures.len);
+        try std.testing.expectEqual(@as(usize, 1), res.asset.images.len);
+        try std.testing.expectEqual(@as(usize, 1), res.asset.samplers.len);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.nodes);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.meshes);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.materials);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.textures);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.images);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.samplers);
+        try std.testing.expectEqual(@as(u32, 0), res.removed.animations);
+    }
 }
 
 test "prune with animations keeps animation-only nodes, strip prunes them" {

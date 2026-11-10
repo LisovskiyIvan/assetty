@@ -229,6 +229,10 @@ pub fn strictestSlot(slots: u8) ?TexSlot {
 /// skips, cutout alpha, normal, arm, occlusion, emissive, single-channel
 /// name fallbacks, base-color name fallbacks.
 pub fn defaultTexRules() []const TexRule {
+    // The `_basecolor` fallback below intentionally skips a channel swizzle
+    // that is not implemented yet — say so out loud instead of silently
+    // ignoring it, then continue with the existing behavior.
+    std.debug.print("warning: _basecolor swizzle is not implemented and is being ignored\n", .{});
     const defaults = struct {
         const rules = [_]TexRule{
             // tiny (<256px min side): never worth encoding

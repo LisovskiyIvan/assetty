@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const c = @import("cgltf");
+const geom = @import("geom.zig");
 
 pub const Options = struct {
     /// Drop constant tracks (and snap static nodes). False = no-op step.
@@ -47,36 +48,6 @@ pub const Result = struct {
     nodes_snapped: u32 = 0,
 };
 
-fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
-    if (n == 0 or @intFromPtr(ptr) == 0) return &.{};
-    return ptr[0..n];
-}
-
-fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
-    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
-    const b: usize = @intFromPtr(base);
-    const q: usize = @intFromPtr(p);
-    if (q < b) return null;
-    const off = q - b;
-    if (off % @sizeOf(T) != 0) return null;
-    const i = off / @sizeOf(T);
-    if (i >= count) return null;
-    return @intCast(i);
-}
-
-fn numComponents(t: c.cgltf_type) usize {
-    return switch (t) {
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 4,
-        6 => 9,
-        7 => 16,
-        else => 1,
-    };
-}
-
 fn expectedComponents(path: c.cgltf_animation_path_type) ?usize {
     return switch (path) {
         c.cgltf_animation_path_type_translation => 3,
@@ -89,7 +60,7 @@ fn expectedComponents(path: c.cgltf_animation_path_type) ?usize {
 /// Plain-float decode of an accessor (sparse-aware via unpack). Null when the
 /// bytes are unavailable (already-compressed views, corrupt offsets).
 fn readFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !?[]f32 {
-    const ncomp = numComponents(acc.type);
+    const ncomp = geom.numComponents(acc.type);
     const count: usize = @intCast(acc.count);
     if (count == 0 or ncomp == 0) return null;
     const total = count * ncomp;
@@ -105,7 +76,7 @@ fn readFloats(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !?[]f32 {
 }
 
 fn hasAdditiveExt(extensions: [*c]c.cgltf_extension, n: usize) bool {
-    for (sl(c.cgltf_extension, extensions, n)) |*e| {
+    for (geom.sl(c.cgltf_extension, extensions, n)) |*e| {
         if (@intFromPtr(e.name) == 0) continue;
         const s = std.mem.span(e.name);
         if (s.len < 8) continue;
@@ -136,7 +107,7 @@ fn constantValue(
     const vals = try readFloats(a, out_acc) orelse return null;
     errdefer a.free(vals);
 
-    const ncomp = numComponents(out_acc.type);
+    const ncomp = geom.numComponents(out_acc.type);
     if (ncomp == 0 or vals.len % ncomp != 0) {
         a.free(vals);
         return null;
@@ -240,14 +211,14 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
     if (!opts.remove_constant_tracks) return res;
     if (data.animations_count == 0) return res;
 
-    const anims = sl(c.cgltf_animation, data.animations, data.animations_count);
+    const anims = geom.sl(c.cgltf_animation, data.animations, data.animations_count);
     var kept_anims: usize = 0;
 
     for (anims, 0..) |*an, ai| {
         _ = ai;
         const additive_anim = hasAdditiveExt(an.extensions, an.extensions_count);
-        const channels = sl(c.cgltf_animation_channel, an.channels, an.channels_count);
-        const samplers = sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count);
+        const channels = geom.sl(c.cgltf_animation_channel, an.channels, an.channels_count);
+        const samplers = geom.sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count);
 
         // pass 1: classify every channel (constant value or null = varies)
         const const_vals = try a.alloc(?[]const f32, channels.len);
@@ -293,7 +264,7 @@ pub fn run(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8, op
             @memset(used, false);
             for (channels[0..kept_ch]) |*ch| {
                 if (@intFromPtr(ch.sampler) == 0) continue;
-                const si = ptrIndex(c.cgltf_animation_sampler, an.samplers, an.samplers_count, ch.sampler) orelse continue;
+                const si = geom.ptrIndex(c.cgltf_animation_sampler, an.samplers, an.samplers_count, ch.sampler) orelse continue;
                 used[si] = true;
             }
             const remap = try a.alloc(usize, samplers.len);
@@ -406,7 +377,7 @@ fn glbTwoAnims(a: std.mem.Allocator, tmp_name: []const u8, still_b: [3]f32) !Rep
 }
 
 fn findNode(data: *c.cgltf_data, name: []const u8) ?*c.cgltf_node {
-    for (sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
+    for (geom.sl(c.cgltf_node, data.nodes, data.nodes_count)) |*n| {
         if (@intFromPtr(n.name) == 0) continue;
         if (std.mem.eql(u8, std.mem.span(n.name), name)) return n;
     }
@@ -439,7 +410,7 @@ test "animops drops constant channel, snaps node, keeps animated, drops empty" {
     try testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, st.translation[0..3]);
 
     // "move" kept whole: channel + sampler intact, values untouched
-    const anims = sl(c.cgltf_animation, loaded.cdata.animations, loaded.cdata.animations_count);
+    const anims = geom.sl(c.cgltf_animation, loaded.cdata.animations, loaded.cdata.animations_count);
     var saw_move = false;
     for (anims) |*an| {
         if (@intFromPtr(an.name) == 0) continue;

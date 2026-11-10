@@ -230,11 +230,37 @@ const SpecParams = struct {
     }
 };
 
+/// Known keys of a `rules` entry. Anything else is a typo: reject it instead
+/// of silently ignoring the entry's intent.
+fn isRuleKey(k: []const u8) bool {
+    for ([_][]const u8{
+        "slot",             "name",   "priority", "format",   "quality",  "rdo_lambda",
+        "supercompression", "srgb",   "max_size", "min_side", "max_side", "generate_mips",
+        "normal_map",       "cutout", "skip",
+    }) |known| {
+        if (std.mem.eql(u8, k, known)) return true;
+    }
+    return false;
+}
+
+/// Known keys of an `overrides` entry. Anything else is a typo: reject it
+/// instead of silently ignoring the entry's intent.
+fn isOverrideKey(k: []const u8) bool {
+    for ([_][]const u8{
+        "image",    "name",          "skip",       "format",           "quality", "rdo_lambda",
+        "max_size", "generate_mips", "normal_map", "supercompression",
+    }) |known| {
+        if (std.mem.eql(u8, k, known)) return true;
+    }
+    return false;
+}
+
 /// Parse the textures step's `rules` array (first match wins). Lenient like
 /// `overrides`: missing/non-array means no rules, non-object items are
-/// skipped, mistyped fields keep their default (unset). Unknown keys ignored.
-/// An unknown `format`/`slot` string leaves the field unset.
-fn parseTextureRules(a: Allocator, v: ?std.json.Value) SpecError![]preset.TexRule {
+/// skipped, mistyped fields keep their default (unset). Unknown keys are an
+/// error (named in `detail`). An unknown `format`/`slot` string leaves the
+/// field unset.
+fn parseTextureRules(a: Allocator, v: ?std.json.Value, detail: *[]const u8) SpecError![]preset.TexRule {
     const items = switch (v orelse return &.{}) {
         .array => |arr| arr.items,
         else => return &.{},
@@ -245,6 +271,13 @@ fn parseTextureRules(a: Allocator, v: ?std.json.Value) SpecError![]preset.TexRul
             .object => |o| o,
             else => continue,
         };
+        var kit = fields.iterator();
+        while (kit.next()) |entry| {
+            if (!isRuleKey(entry.key_ptr.*)) {
+                detail.* = try a.dupe(u8, entry.key_ptr.*);
+                return error.BadParam;
+            }
+        }
         var r: preset.TexRule = .{};
         if (fields.get("slot")) |sv| {
             if (sv == .string) {
@@ -308,10 +341,10 @@ fn parseTextureRules(a: Allocator, v: ?std.json.Value) SpecError![]preset.TexRul
 }
 /// Lenient on purpose: a missing/non-array value means no overrides, a
 /// non-object item is skipped, and a mistyped field keeps its default.
-/// Unknown keys are ignored, like the step params themselves. An unknown
+/// Unknown keys are an error (named in `detail`). An unknown
 /// format string leaves the override's format unset (it must not silently
 /// become `.auto`, which is a real value here).
-fn parseTextureOverrides(a: Allocator, v: ?std.json.Value) SpecError![]preset.TextureOverride {
+fn parseTextureOverrides(a: Allocator, v: ?std.json.Value, detail: *[]const u8) SpecError![]preset.TextureOverride {
     const items = switch (v orelse return &.{}) {
         .array => |arr| arr.items,
         else => return &.{},
@@ -322,6 +355,13 @@ fn parseTextureOverrides(a: Allocator, v: ?std.json.Value) SpecError![]preset.Te
             .object => |o| o,
             else => continue,
         };
+        var kit = fields.iterator();
+        while (kit.next()) |entry| {
+            if (!isOverrideKey(entry.key_ptr.*)) {
+                detail.* = try a.dupe(u8, entry.key_ptr.*);
+                return error.BadParam;
+            }
+        }
         var o: preset.TextureOverride = .{};
         if (fields.get("image")) |iv| {
             if (iv == .integer) o.image = std.math.cast(u32, iv.integer);
@@ -420,8 +460,8 @@ fn stepFromSpec(
                 .supercompression = (try r.supercompressionField("supercompression")) orelse d.supercompression,
                 .apply_rules = (try r.boolField("apply_rules")) orelse d.apply_rules,
                 .reencode_ktx2 = (try r.boolField("reencode_ktx2")) orelse d.reencode_ktx2,
-                .rules = try parseTextureRules(a, r.get("rules")),
-                .overrides = try parseTextureOverrides(a, r.get("overrides")),
+                .rules = try parseTextureRules(a, r.get("rules"), detail),
+                .overrides = try parseTextureOverrides(a, r.get("overrides"), detail),
             } };
         },
         .quantize => blk: {
@@ -698,6 +738,26 @@ test "spec rejects unknown step kinds by name" {
         parseSpec(a, "{\"steps\":[{\"bperfume\":{}}]}", &detail),
     );
     try testing.expect(std.mem.indexOf(u8, detail, "bperfume") != null);
+}
+
+test "spec rejects unknown override and rule keys by name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var detail: []const u8 = "";
+    try testing.expectError(
+        error.BadParam,
+        parseSpec(a, "{\"steps\":[{\"textures\":{\"overrides\":[{\"image\":0,\"qualty\":200}]}}]}", &detail),
+    );
+    try testing.expectEqualStrings("qualty", detail);
+
+    var detail2: []const u8 = "";
+    try testing.expectError(
+        error.BadParam,
+        parseSpec(a, "{\"steps\":[{\"textures\":{\"rules\":[{\"slot\":\"normal\",\"skiped\":true}]}}]}", &detail2),
+    );
+    try testing.expectEqualStrings("skiped", detail2);
 }
 
 test "spec rejects empty and malformed specs" {

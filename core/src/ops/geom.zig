@@ -46,6 +46,21 @@ pub fn sl(comptime T: type, ptr: [*c]T, n: usize) []T {
     return ptr[0..n];
 }
 
+/// Pool index of `p` in `base[0..count]`, or null when `p` is null,
+/// misaligned or outside the pool (corrupt input). Never subtracts raw
+/// pointers.
+pub fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
+    if (count == 0 or @intFromPtr(base) == 0 or @intFromPtr(p) == 0) return null;
+    const b: usize = @intFromPtr(base);
+    const q: usize = @intFromPtr(p);
+    if (q < b) return null;
+    const off = q - b;
+    if (off % @sizeOf(T) != 0) return null;
+    const i = off / @sizeOf(T);
+    if (i >= count) return null;
+    return @intCast(i);
+}
+
 pub fn numComponents(t: c.cgltf_type) usize {
     return switch (t) {
         1 => 1,
@@ -85,6 +100,44 @@ pub fn viewData(v: *const c.cgltf_buffer_view) ?[]const u8 {
     return p[off .. off + size];
 }
 
+/// Payload bytes of a buffer view, meshopt-aware. Writer-produced meshopt
+/// views (`quantize` `meshopt_compression`) keep the COMPRESSED payload in
+/// `data` while `size` reports the DECOMPRESSED length: the payload is sliced
+/// by `meshopt_compression.size`, not by the view. (Parsed meshopt files are
+/// inflated at load, so they never take this branch — only fresh op output
+/// does.) Plain views behave exactly like `viewData`.
+pub fn viewBytes(v: *const c.cgltf_buffer_view) ?[]const u8 {
+    if (v.has_meshopt_compression != 0) {
+        const d = v.data orelse return null;
+        const p: [*]const u8 = @ptrCast(d);
+        const n: usize = @intCast(v.meshopt_compression.size);
+        return p[0..n];
+    }
+    return viewData(v);
+}
+
+/// Allocate raw bytes through cgltf's allocator hooks, so that `cgltf_free`
+/// (which releases `buffer_view.data` with the same hooks) stays balanced.
+/// Falls back to libc malloc when the data carries no allocator.
+pub fn allocRaw(data: *const c.cgltf_data, n: usize) ?[*]u8 {
+    const mem = data.memory;
+    if (mem.alloc_func) |f| {
+        const p = f(mem.user_data, n) orelse return null;
+        return @ptrCast(p);
+    }
+    const p = std.c.malloc(n) orelse return null;
+    return @ptrCast(p);
+}
+
+pub fn freeRaw(data: *const c.cgltf_data, p: anytype) void {
+    const mem = data.memory;
+    if (mem.free_func) |f| {
+        f(mem.user_data, @ptrCast(@constCast(p)));
+    } else {
+        std.c.free(@ptrCast(@constCast(p)));
+    }
+}
+
 /// A strided element stream over one accessor (stride 0 == natural).
 pub const Stream = struct {
     data: []const u8 = &.{},
@@ -101,7 +154,8 @@ pub const Stream = struct {
         const elem: usize = @intCast(c.cgltf_calc_size(acc.type, acc.component_type));
         if (elem == 0) return null;
         const count: usize = @intCast(acc.count);
-        var stride: usize = @intCast(acc.stride);
+        // stride comes from the file: checked cast, corrupt values fail the stream.
+        var stride: usize = std.math.cast(usize, acc.stride) orelse return null;
         if (stride == 0) stride = elem;
 
         const d = viewData(view) orelse return null;
@@ -336,6 +390,166 @@ fn remapViewRefs(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Accessor / buffer-view pool regrow (shared by `quantize`, `simplify`).
+//
+// New entries are staged in Zig-side arrays and flushed into regrown cgltf
+// pools once; every accessor / buffer-view reference in the graph is then
+// remapped to the new arrays. The old pool arrays are released through
+// cgltf's hooks; their string / extras pointers live on in the copied
+// entries, so nothing is double-freed (`cgltf_free` only walks the arrays
+// currently registered in `data`).
+// ---------------------------------------------------------------------------
+
+pub const Pool = struct {
+    acc: std.ArrayListUnmanaged(c.cgltf_accessor) = .empty,
+    view: std.ArrayListUnmanaged(c.cgltf_buffer_view) = .empty,
+
+    pub fn deinit(self: *Pool, a: std.mem.Allocator) void {
+        self.acc.deinit(a);
+        self.view.deinit(a);
+    }
+};
+
+fn remapAcc(
+    p: [*c]c.cgltf_accessor,
+    old_base: [*c]c.cgltf_accessor,
+    old_n: usize,
+    new_base: [*c]c.cgltf_accessor,
+) [*c]c.cgltf_accessor {
+    const i = ptrIndex(c.cgltf_accessor, old_base, old_n, p) orelse return p;
+    return new_base + i;
+}
+
+fn remapView(
+    p: [*c]c.cgltf_buffer_view,
+    old_base: [*c]c.cgltf_buffer_view,
+    old_n: usize,
+    new_base: [*c]c.cgltf_buffer_view,
+) [*c]c.cgltf_buffer_view {
+    const i = ptrIndex(c.cgltf_buffer_view, old_base, old_n, p) orelse return p;
+    return new_base + i;
+}
+
+/// Rewrite every accessor / buffer-view reference so that it points into the
+/// regrown pools. `new_acc` holds copies of the old entries at the same
+/// indices (appended entries last), same for `new_view`.
+pub fn remapRefs(
+    data: *c.cgltf_data,
+    old_acc: [*c]c.cgltf_accessor,
+    old_acc_n: usize,
+    new_acc: [*c]c.cgltf_accessor,
+    old_view: [*c]c.cgltf_buffer_view,
+    old_view_n: usize,
+    new_view: [*c]c.cgltf_buffer_view,
+) void {
+    for (sl(c.cgltf_mesh, data.meshes, data.meshes_count)) |*m| {
+        for (sl(c.cgltf_primitive, m.primitives, m.primitives_count)) |*p| {
+            p.indices = remapAcc(p.indices, old_acc, old_acc_n, new_acc);
+            for (sl(c.cgltf_attribute, p.attributes, p.attributes_count)) |*at| {
+                at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
+            }
+            for (sl(c.cgltf_morph_target, p.targets, p.targets_count)) |*t| {
+                for (sl(c.cgltf_attribute, t.attributes, t.attributes_count)) |*at| {
+                    at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
+                }
+            }
+            if (@intFromPtr(p.draco_mesh_compression.buffer_view) != 0) {
+                p.draco_mesh_compression.buffer_view = remapView(
+                    p.draco_mesh_compression.buffer_view,
+                    old_view,
+                    old_view_n,
+                    new_view,
+                );
+            }
+            for (sl(c.cgltf_attribute, p.draco_mesh_compression.attributes, p.draco_mesh_compression.attributes_count)) |*at| {
+                at.data = remapAcc(at.data, old_acc, old_acc_n, new_acc);
+            }
+        }
+    }
+    for (sl(c.cgltf_animation, data.animations, data.animations_count)) |*an| {
+        for (sl(c.cgltf_animation_sampler, an.samplers, an.samplers_count)) |*s| {
+            s.input = remapAcc(s.input, old_acc, old_acc_n, new_acc);
+            s.output = remapAcc(s.output, old_acc, old_acc_n, new_acc);
+        }
+    }
+    for (sl(c.cgltf_skin, data.skins, data.skins_count)) |*sk| {
+        sk.inverse_bind_matrices = remapAcc(sk.inverse_bind_matrices, old_acc, old_acc_n, new_acc);
+    }
+    // accessors themselves reference buffer views (incl. sparse storage)
+    for (sl(c.cgltf_accessor, new_acc, data.accessors_count)) |*acc| {
+        acc.buffer_view = remapView(acc.buffer_view, old_view, old_view_n, new_view);
+        if (acc.is_sparse != 0) {
+            acc.sparse.indices_buffer_view = remapView(
+                acc.sparse.indices_buffer_view,
+                old_view,
+                old_view_n,
+                new_view,
+            );
+            acc.sparse.values_buffer_view = remapView(
+                acc.sparse.values_buffer_view,
+                old_view,
+                old_view_n,
+                new_view,
+            );
+        }
+    }
+    for (sl(c.cgltf_image, data.images, data.images_count)) |*im| {
+        im.buffer_view = remapView(im.buffer_view, old_view, old_view_n, new_view);
+    }
+}
+
+/// Grow both pools by the appended entries and remap every reference.
+/// No-op when the pool staged nothing.
+pub fn commitPools(data: *c.cgltf_data, pool: *Pool) !void {
+    const old_acc = data.accessors;
+    const old_acc_n: usize = data.accessors_count;
+    const old_view = data.buffer_views;
+    const old_view_n: usize = data.buffer_views_count;
+
+    const new_acc_n = old_acc_n + pool.acc.items.len;
+    const new_view_n = old_view_n + pool.view.items.len;
+    if (new_acc_n == old_acc_n and new_view_n == old_view_n) return;
+
+    var new_acc: [*c]c.cgltf_accessor = old_acc;
+    var new_view: [*c]c.cgltf_buffer_view = old_view;
+
+    if (pool.acc.items.len != 0) {
+        const bytes = allocRaw(data, new_acc_n * @sizeOf(c.cgltf_accessor)) orelse return error.OutOfMemory;
+        new_acc = @ptrCast(@alignCast(bytes));
+        if (old_acc_n != 0) @memcpy(new_acc[0..old_acc_n], old_acc[0..old_acc_n]);
+        @memcpy(new_acc[old_acc_n..new_acc_n], pool.acc.items);
+    }
+    errdefer if (pool.acc.items.len != 0) freeRaw(data, new_acc);
+
+    if (pool.view.items.len != 0) {
+        const bytes = allocRaw(data, new_view_n * @sizeOf(c.cgltf_buffer_view)) orelse return error.OutOfMemory;
+        new_view = @ptrCast(@alignCast(bytes));
+        if (old_view_n != 0) @memcpy(new_view[0..old_view_n], old_view[0..old_view_n]);
+        @memcpy(new_view[old_view_n..new_view_n], pool.view.items);
+    }
+    errdefer if (pool.view.items.len != 0) freeRaw(data, new_view);
+
+    // pool counts are already updated below, remapRefs needs the *new* count
+    data.accessors = new_acc;
+    data.accessors_count = new_acc_n;
+    data.buffer_views = new_view;
+    data.buffer_views_count = new_view_n;
+
+    remapRefs(data, old_acc, old_acc_n, new_acc, old_view, old_view_n, new_view);
+
+    // appended entries are paired 1:1 (each new accessor owns one new view);
+    // wire them up now that the final array addresses are known
+    std.debug.assert(pool.acc.items.len == pool.view.items.len);
+    for (0..pool.acc.items.len) |k| {
+        data.accessors[old_acc_n + k].buffer_view = data.buffer_views + (old_view_n + k);
+    }
+
+    // old arrays only held copies now: release them
+    if (pool.acc.items.len != 0 and @intFromPtr(old_acc) != 0) freeRaw(data, old_acc);
+    if (pool.view.items.len != 0 and @intFromPtr(old_view) != 0) freeRaw(data, old_view);
 }
 
 // ---------------------------------------------------------------------------

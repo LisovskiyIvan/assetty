@@ -13,6 +13,7 @@ pub fn main(init: std.process.Init) !u8 {
         var nanoui_flag = false;
         {
             var probe = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+            defer probe.deinit();
             _ = probe.skip();
             while (probe.next()) |a| {
                 if (std.mem.startsWith(u8, a, "--nanoui-")) nanoui_flag = true;

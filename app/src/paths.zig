@@ -4,7 +4,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 
+/// Written once by `prepare()` before any worker thread spawns, read-only
+/// afterwards: `app.main` calls `prepare` before the window (and therefore any
+/// background job) exists, so no worker can observe a half-written value.
+/// Assign only in `prepare()` — never from a worker or a binding.
 pub var output_dir: []const u8 = ".zig-cache/assetty-app";
+/// Same contract as `output_dir`: set once in `prepare()`, only read later.
 pub var settings_file: []const u8 = "assetty.settings.json";
 
 pub fn prepare(init: std.process.Init) !void {

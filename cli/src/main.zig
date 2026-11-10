@@ -15,7 +15,7 @@ const usage =
     \\  assetty optimize <a.glb> <b.glb> ... --preset <name|path.zon|path.json> [--out-dir <dir>] [--report <r.json>] [--strip-animations]
     \\
     \\Batch: multiple inputs are processed one by one from their sources into
-    \\--out-dir (default: each input's own directory) as <stem>_opt.glb; an
+    \\--out-dir (default: each input's own directory) as <stem>.opt.glb; an
     \\output equal to its input is refused. -o/--out is single-input only.
     \\--report with one input writes that file's report object; with several it
     \\writes {"count","succeeded","failed","total_secs","files":[...]} where each
@@ -25,42 +25,22 @@ const usage =
     \\Exit codes: 0 ok, 2 error
 ;
 
-fn jsonStr(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => {
-            if (ch < 0x20) {
-                try w.print("\\u{x:0>4}", .{ch});
-            } else try w.writeByte(ch);
-        },
-    };
-    try w.writeByte('"');
-}
-
-fn jsonStrOpt(w: anytype, s: ?[]const u8) !void {
-    if (s) |v| try jsonStr(w, v) else try w.writeAll("null");
-}
-
-fn idxList(w: anytype, list: []const u32) !void {
-    try w.writeByte('[');
-    for (list, 0..) |v, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("{d}", .{v});
-    }
-    try w.writeByte(']');
-}
+/// Shared JSON primitives (see core/src/json_util.zig): aliased so every
+/// writer below emits byte-identical output to the app backend.
+const jsonStr = core.json_util.jsonStr;
+const jsonStrOpt = core.json_util.jsonStrOpt;
+const idxList = core.json_util.idxList;
+const deltaPct = core.json_util.deltaPct;
+const deltaJson = core.json_util.deltaJson;
 
 pub fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer it.deinit();
     _ = it.skip(); // argv[0] = program name
     var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(gpa);
     while (it.next()) |arg| try args_list.append(gpa, arg);
     const args = args_list.items;
 
@@ -71,7 +51,7 @@ pub fn run(init: std.process.Init) !u8 {
     const code: u8 = switch (cmdId(args[0])) {
         .info => try cmdInfo(init, args[1..]),
         .textures => try cmdTextures(init, args[1..]),
-        .presets => try cmdPresets(),
+        .presets => try cmdPresets(init),
         .optimize => try cmdOptimize(init, args[1..]),
         .version => blk: {
             var stdout_buf: [256]u8 = undefined;
@@ -92,7 +72,19 @@ pub fn run(init: std.process.Init) !u8 {
             break :blk 2;
         },
     };
-    std.process.exit(code);
+    // Returned, not exited: the caller (and its defers) owns process exit.
+    return code;
+}
+
+/// Common file-load failures get an actionable message; everything else keeps
+/// `@errorName`. `cmd` is the invoking subcommand (`info`, `textures`, ...).
+fn reportLoadErr(cmd: []const u8, path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.FileNotFound => std.debug.print("{s}: no such file: {s}\n", .{ cmd, path }),
+        error.AccessDenied, error.PermissionDenied => std.debug.print("{s}: permission denied: {s}\n", .{ cmd, path }),
+        error.NotGltf, error.InvalidGlb => std.debug.print("{s}: not a glTF/GLB file: {s}\n", .{ cmd, path }),
+        else => std.debug.print("{s}: {s}: {s}\n", .{ cmd, path, @errorName(err) }),
+    }
 }
 
 const Cmd = enum { info, textures, presets, optimize, version, help, unknown };
@@ -129,7 +121,7 @@ fn cmdInfo(init: std.process.Init, args: []const []const u8) !u8 {
     const as_json = hasFlag(args, "--json");
 
     var loaded = core.parse.loadFile(init.io, gpa, file_path) catch |err| {
-        std.debug.print("info: {s}: {s}\n", .{ file_path, @errorName(err) });
+        reportLoadErr("info", file_path, err);
         return 2;
     };
     defer loaded.deinit();
@@ -271,12 +263,6 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn mipLevelsFor(w: u32, h: u32) u32 {
-    const m = @max(w, h);
-    if (m == 0) return 1;
-    return @as(u32, 32 - @clz(m)) + 1; // floor(log2(m)) + 1
-}
-
 fn cmdTextures(init: std.process.Init, args: []const []const u8) !u8 {
     const gpa = init.gpa;
     var path: ?[]const u8 = null;
@@ -315,7 +301,7 @@ fn cmdTextures(init: std.process.Init, args: []const []const u8) !u8 {
     };
 
     var loaded = core.parse.loadFile(init.io, gpa, file_path) catch |err| {
-        std.debug.print("textures: {s}: {s}\n", .{ file_path, @errorName(err) });
+        reportLoadErr("textures", file_path, err);
         return 2;
     };
     defer loaded.deinit();
@@ -391,7 +377,7 @@ fn runEncode(a: std.mem.Allocator, img: core.model.Image, idx: u32) !?EncodeResu
         return null;
     }
 
-    const levels = mipLevelsFor(dec.width, dec.height);
+    const levels = core.formats.mipLevels(dec.width, dec.height);
     const vram_before = core.formats.mipChainBytes(dec.width, dec.height, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
     return .{
         .index = idx,
@@ -541,13 +527,72 @@ fn printTexturesJson(
     try w.writeAll("\n}\n");
 }
 
-fn cmdPresets() !u8 {
-    // step 4: read presets/*.zon; built-ins for now
-    const builtins = [_][]const u8{ "mobile", "desktop", "web" };
-    for (builtins) |p| {
-        std.debug.print("{s}\n", .{p});
+fn cmdPresets(init: std.process.Init) !u8 {
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Live presets: every readable candidate dir (cwd first, then installed
+    // layouts next to the binary), names de-duplicated and sorted — the same
+    // `presets/<name>.zon|json` layout `Backend.presetsIn` lists.
+    var names: std.ArrayList([]const u8) = .empty;
+    collectPresetNames(init.io, a, &names, "presets");
+    if (std.process.executablePathAlloc(init.io, a) catch null) |exe| {
+        if (std.fs.path.dirname(exe)) |dir| {
+            collectPresetNames(init.io, a, &names, std.fmt.allocPrint(a, "{s}/presets", .{dir}) catch dir);
+            collectPresetNames(init.io, a, &names, std.fmt.allocPrint(a, "{s}/../presets", .{dir}) catch dir);
+            collectPresetNames(init.io, a, &names, std.fmt.allocPrint(a, "{s}/../share/assetty/presets", .{dir}) catch dir);
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+
+    var prev: ?[]const u8 = null;
+    var shown: usize = 0;
+    for (names.items) |n| {
+        if (prev) |p| if (std.mem.eql(u8, p, n)) continue;
+        prev = n;
+        std.debug.print("{s}\n", .{n});
+        shown += 1;
+    }
+    if (shown == 0) {
+        // Last-resort fallback: the dir scan yielded nothing, so the command
+        // never regresses to empty.
+        for ([_][]const u8{ "mobile", "desktop", "web" }) |p| {
+            std.debug.print("{s}\n", .{p});
+        }
     }
     return 0;
+}
+
+/// Append the valid preset stems found in `dir` to `out`; a missing or
+/// unreadable dir contributes nothing (callers fall back to built-ins).
+fn collectPresetNames(io: std.Io, a: std.mem.Allocator, out: *std.ArrayList([]const u8), dir: []const u8) void {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file and e.kind != .sym_link) continue;
+        const stem: ?[]const u8 = if (std.mem.endsWith(u8, e.name, ".zon"))
+            e.name[0 .. e.name.len - ".zon".len]
+        else if (std.mem.endsWith(u8, e.name, ".json"))
+            e.name[0 .. e.name.len - ".json".len]
+        else
+            continue;
+        if (!validPresetName(stem.?)) continue;
+        out.append(a, a.dupe(u8, stem.?) catch continue) catch continue;
+    }
+}
+
+fn validPresetName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,46 +608,77 @@ fn cmdPresets() !u8 {
 ///   `test/<name>.zon` (the test presets live there), and finally falls back
 ///   to the built-in platform defaults when the name is
 ///   `mobile` / `desktop` / `web`.
+///
+/// Only a missing candidate file (`FileNotFound`) falls through to the next
+/// one: any other error (unreadable/invalid file, bad spec) is returned with
+/// the candidate path attached via `detail`, so the caller can report it.
 fn resolvePreset(io: std.Io, a: std.mem.Allocator, spec: []const u8, detail: *[]const u8) !core.preset.Preset {
     if (std.mem.endsWith(u8, spec, ".json")) {
-        return core.spec_json.parseSpecFile(io, a, spec, detail);
+        return core.spec_json.parseSpecFile(io, a, spec, detail) catch |err| {
+            if (detail.*.len == 0) detail.* = spec;
+            return err;
+        };
     }
     if (std.mem.indexOfScalar(u8, spec, '/') != null or std.mem.endsWith(u8, spec, ".zon")) {
-        return core.preset.loadFile(io, a, spec);
+        return core.preset.loadFile(io, a, spec) catch |err| {
+            detail.* = spec;
+            return err;
+        };
     }
 
     var buf: [256]u8 = undefined;
     const jpath = std.fmt.bufPrint(&buf, "presets/{s}.json", .{spec}) catch "";
     if (jpath.len > 0) {
-        if (core.spec_json.parseSpecFile(io, a, jpath, detail)) |p| {
-            return p;
-        } else |_| {}
+        if (std.Io.Dir.cwd().statFile(io, jpath, .{})) |_| {
+            return core.spec_json.parseSpecFile(io, a, jpath, detail) catch |err| {
+                if (detail.*.len == 0) {
+                    detail.* = jpath;
+                } else {
+                    detail.* = std.fmt.allocPrint(a, "{s} ({s})", .{ jpath, detail.* }) catch jpath;
+                }
+                return err;
+            };
+        } else |err| {
+            if (err != error.FileNotFound) {
+                detail.* = jpath;
+                return err;
+            }
+        }
     }
 
     const path = core.preset.defaultPath(spec, &buf);
     if (path.len > 0) {
-        if (core.preset.loadFile(io, a, path)) |p| {
-            return p;
-        } else |_| {}
+        if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| {
+            return core.preset.loadFile(io, a, path) catch |err| {
+                detail.* = path;
+                return err;
+            };
+        } else |err| {
+            if (err != error.FileNotFound) {
+                detail.* = path;
+                return err;
+            }
+        }
     }
 
     var test_buf: [256]u8 = undefined;
     const test_path = std.fmt.bufPrint(&test_buf, "test/{s}.zon", .{spec}) catch "";
     if (test_path.len > 0) {
-        if (core.preset.loadFile(io, a, test_path)) |p| {
-            return p;
-        } else |_| {}
+        if (std.Io.Dir.cwd().statFile(io, test_path, .{})) |_| {
+            return core.preset.loadFile(io, a, test_path) catch |err| {
+                detail.* = test_path;
+                return err;
+            };
+        } else |err| {
+            if (err != error.FileNotFound) {
+                detail.* = test_path;
+                return err;
+            }
+        }
     }
 
     const target = std.meta.stringToEnum(core.preset.Target, spec) orelse return error.UnknownPreset;
     return core.preset.platformDefaults(target);
-}
-
-fn deltaPct(before: u64, after: u64) ?f64 {
-    if (before == 0) return if (after == 0) @as(f64, 0) else null;
-    const b: f64 = @floatFromInt(before);
-    const af: f64 = @floatFromInt(after);
-    return (af - b) / b * 100.0;
 }
 
 fn printPct(w: anytype, before: u64, after: u64) !void {
@@ -667,16 +743,6 @@ fn printOptimizeHuman(
     try printNumRow(w, "draw calls", rep.before.draw_calls, rep.after.draw_calls);
     try printByteRow(w, "vram est", rep.before.vram_total, rep.after.vram_total);
     try printByteRow(w, "disk size", rep.before.disk_total, rep.after.disk_total);
-}
-
-fn deltaJson(w: anytype, before: u64, after: u64) !void {
-    try w.print("{{\"before\":{d},\"after\":{d},\"pct\":", .{ before, after });
-    if (deltaPct(before, after)) |p| {
-        try w.print("{d:.2}", .{p});
-    } else {
-        try w.writeAll("null");
-    }
-    try w.writeByte('}');
 }
 
 /// Same shape as the app's `writeOptimize` (see app/src/json.zig), so one
@@ -793,7 +859,7 @@ fn renderErrorEntry(a: std.mem.Allocator, file_path: []const u8, err_name: []con
     return aw.toOwnedSlice();
 }
 
-/// `<stem>_opt.glb` inside `out_dir` (or the input's own directory when null).
+/// `<stem>.opt.glb` inside `out_dir` (or the input's own directory when null).
 fn batchOutPath(a: std.mem.Allocator, input: []const u8, out_dir: ?[]const u8) ![]u8 {
     const base = std.fs.path.basename(input);
     const stem = std.fs.path.stem(base);
@@ -802,10 +868,10 @@ fn batchOutPath(a: std.mem.Allocator, input: []const u8, out_dir: ?[]const u8) !
         "model"
     else
         stem;
-    if (out_dir) |d| return std.fmt.allocPrint(a, "{s}/{s}_opt.glb", .{ d, clean });
+    if (out_dir) |d| return std.fmt.allocPrint(a, "{s}/{s}.opt.glb", .{ d, clean });
     const dir = std.fs.path.dirname(input);
-    if (dir == null or dir.?.len == 0) return std.fmt.allocPrint(a, "{s}_opt.glb", .{clean});
-    return std.fmt.allocPrint(a, "{s}/{s}_opt.glb", .{ dir.?, clean });
+    if (dir == null or dir.?.len == 0) return std.fmt.allocPrint(a, "{s}.opt.glb", .{clean});
+    return std.fmt.allocPrint(a, "{s}/{s}.opt.glb", .{ dir.?, clean });
 }
 
 fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
@@ -942,7 +1008,7 @@ fn runSingle(
         .preset = p,
         .out_path = out_path,
     }) catch |err| {
-        std.debug.print("optimize: {s}: {s}\n", .{ file_path, @errorName(err) });
+        reportLoadErr("optimize", file_path, err);
         return 2;
     };
 
@@ -964,7 +1030,7 @@ fn runSingle(
 }
 
 /// Many files: each runs from its own source into `--out-dir` (or the input's
-/// directory) as `<stem>_opt.glb`. Failures are collected and reported, the
+/// directory) as `<stem>.opt.glb`. Failures are collected and reported, the
 /// rest of the batch still runs; the exit code is 0 only when all succeed.
 fn runBatch(
     init: std.process.Init,
@@ -1008,7 +1074,7 @@ fn runBatch(
             .preset = p,
             .out_path = out_path,
         }) catch |err| {
-            std.debug.print("optimize: {s}: {s}\n", .{ file_path, @errorName(err) });
+            reportLoadErr("optimize", file_path, err);
             try entries.append(a, try renderErrorEntry(a, file_path, @errorName(err)));
             failed += 1;
             continue;
@@ -1053,15 +1119,15 @@ fn runBatch(
 
 const testing = std.testing;
 
-test "batch out path uses the input dir and the _opt stem" {
+test "batch out path uses the input dir and the .opt stem" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    try testing.expectEqualStrings("models/box_opt.glb", try batchOutPath(a, "models/box.glb", null));
-    try testing.expectEqualStrings("box_opt.glb", try batchOutPath(a, "box.glb", null));
-    try testing.expectEqualStrings("/tmp/batch/box_opt.glb", try batchOutPath(a, "models/box.glb", "/tmp/batch"));
-    try testing.expectEqualStrings("model_opt.glb", try batchOutPath(a, ".glb", null));
+    try testing.expectEqualStrings("models/box.opt.glb", try batchOutPath(a, "models/box.glb", null));
+    try testing.expectEqualStrings("box.opt.glb", try batchOutPath(a, "box.glb", null));
+    try testing.expectEqualStrings("/tmp/batch/box.opt.glb", try batchOutPath(a, "models/box.glb", "/tmp/batch"));
+    try testing.expectEqualStrings("model.opt.glb", try batchOutPath(a, ".glb", null));
 }
 
 test "single report carries secs, total_secs and always texture_images" {

@@ -32,52 +32,13 @@ pub fn errorRaw(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !
     return raw(try aw.toOwnedSlice());
 }
 
-pub fn jsonStr(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => {
-            if (ch < 0x20) {
-                try w.print("\\u{x:0>4}", .{ch});
-            } else try w.writeByte(ch);
-        },
-    };
-    try w.writeByte('"');
-}
-
-pub fn jsonStrOpt(w: anytype, s: ?[]const u8) !void {
-    if (s) |v| try jsonStr(w, v) else try w.writeAll("null");
-}
-
-pub fn idxList(w: anytype, list: []const u32) !void {
-    try w.writeByte('[');
-    for (list, 0..) |v, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("{d}", .{v});
-    }
-    try w.writeByte(']');
-}
-
-fn deltaPct(before: u64, after: u64) ?f64 {
-    if (before == 0) return if (after == 0) @as(f64, 0) else null;
-    const b: f64 = @floatFromInt(before);
-    const af: f64 = @floatFromInt(after);
-    return (af - b) / b * 100.0;
-}
-
-fn deltaJson(w: anytype, before: u64, after: u64) !void {
-    try w.print("{{\"before\":{d},\"after\":{d},\"pct\":", .{ before, after });
-    if (deltaPct(before, after)) |p| {
-        try w.print("{d:.2}", .{p});
-    } else {
-        try w.writeAll("null");
-    }
-    try w.writeByte('}');
-}
+/// Shared JSON primitives (see core/src/json_util.zig): re-exported so the
+/// backend keeps calling `json.jsonStr` while the bytes stay identical.
+pub const jsonStr = core.json_util.jsonStr;
+pub const jsonStrOpt = core.json_util.jsonStrOpt;
+pub const idxList = core.json_util.idxList;
+pub const deltaPct = core.json_util.deltaPct;
+pub const deltaJson = core.json_util.deltaJson;
 
 /// `assetty info <file> --json` (see cli/src/main.zig).
 pub fn writeInfo(w: anytype, path: []const u8, asset: core.model.Asset, st: core.stats.Stats) !void {

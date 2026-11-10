@@ -262,8 +262,9 @@ pub const Backend = struct {
     /// PSNR, the VRAM it now needs and paths to the before/after PNGs.
     /// `settings` is a JSON object string with per-call overrides for this one
     /// image — `{"format":"etc1s"|"uastc","quality":N,"max_size":N,
-    /// "generate_mips":bool,"normal_map":bool}`; omitted keys keep the host
-    /// defaults (the Textures tab sends the row's effective params).
+    /// "generate_mips":bool,"normal_map":bool,"supercompression":"none"|"zstd"}`;
+    /// omitted keys keep the host defaults (the Textures tab sends the row's
+    /// effective params).
     pub fn textureEncode(
         self: *Backend,
         call: *Call,
@@ -2224,11 +2225,13 @@ const EncodeOverride = struct {
     max_size: ?u32 = null,
     generate_mips: ?bool = null,
     normal_map: ?bool = null,
+    supercompression: ?core.encode_ktx.Supercompression = null,
 };
 
 /// Parses the `settings` argument of `textureEncode`: a JSON object string
 /// with `format` ("etc1s"/"uastc"; "auto" and unknown strings keep the
-/// default), `quality`, `max_size`, `generate_mips`, `normal_map`. Lenient
+/// default), `quality`, `max_size`, `generate_mips`, `normal_map`,
+/// `supercompression` ("none"/"zstd"; unknown strings keep the default). Lenient
 /// like the step specs: invalid JSON, wrong types or unknown keys leave the
 /// default in place instead of failing the encode.
 fn parseEncodeOverride(a: std.mem.Allocator, text: ?[]const u8) EncodeOverride {
@@ -2271,6 +2274,12 @@ fn parseEncodeOverride(a: std.mem.Allocator, text: ?[]const u8) EncodeOverride {
     if (fields.get("normal_map")) |nm| {
         switch (nm) {
             .bool => |b| ov.normal_map = b,
+            else => {},
+        }
+    }
+    if (fields.get("supercompression")) |sc| {
+        switch (sc) {
+            .string => |s| ov.supercompression = std.meta.stringToEnum(core.encode_ktx.Supercompression, s),
             else => {},
         }
     }
@@ -2463,277 +2472,19 @@ fn resolvePreset(io: std.Io, a: std.mem.Allocator, spec: []const u8) !core.prese
 
 const SpecError = error{ OutOfMemory, InvalidSpec, NoSteps, UnknownStep, BadParam };
 
-/// Canonical execution order: a spec may list its steps in any order.
-const step_order = [_]core.preset.StepKind{
-    .prune, .dedup, .weld, .join, .textures, .quantize, .simplify,
-};
-
-fn isStepName(name: []const u8) bool {
-    for (step_order) |kind| {
-        if (std.mem.eql(u8, name, @tagName(kind))) return true;
-    }
-    return false;
-}
-
 /// Build a preset from the frontend's per-step JSON spec. `spec` is either the
 /// JSON text itself (`{"steps":[...]}`) or a JSON string holding that text
 /// (`"{\"steps\":[...]}"`), whichever form the bridge delivers. `detail`
 /// receives the offending step name for `UnknownStep`/`BadParam`.
 ///
-/// Shared with the CLI: the parse lives in `core.spec_json`, this is a thin
-/// error-set alias so the call sites below keep their `SpecError` type.
-/// TODO(cleanup): retire the dead parser helpers left below
-/// (`presetFromSpecValue`, `stepFromSpec`, `SpecParams`,
-/// `parseTextureOverrides`) once the app's spec tests move to core.
+/// The parse lives in `core.spec_json`; this is a thin error-set alias so the
+/// call sites below keep their `SpecError` type.
 fn customPresetFromSpec(
     a: std.mem.Allocator,
     spec: []const u8,
     detail: *[]const u8,
 ) SpecError!core.preset.Preset {
     return core.spec_json.parseSpec(a, spec, detail);
-}
-
-fn presetFromSpecValue(
-    a: std.mem.Allocator,
-    v: std.json.Value,
-    detail: *[]const u8,
-) SpecError!core.preset.Preset {
-    const obj = switch (v) {
-        .object => |o| o,
-        else => return error.InvalidSpec,
-    };
-    const raw_steps = obj.get("steps") orelse return error.NoSteps;
-    const items = switch (raw_steps) {
-        .array => |arr| arr.items,
-        else => return error.InvalidSpec,
-    };
-    if (items.len == 0) return error.NoSteps;
-
-    // Validate every entry up front so an unknown kind is reported with its
-    // name instead of failing halfway through an ordered build.
-    for (items) |item| {
-        const fields = switch (item) {
-            .object => |o| o,
-            else => return error.InvalidSpec,
-        };
-        var seen = false;
-        var it = fields.iterator();
-        while (it.next()) |entry| {
-            if (!isStepName(entry.key_ptr.*)) {
-                detail.* = try a.dupe(u8, entry.key_ptr.*);
-                return error.UnknownStep;
-            }
-            seen = true;
-        }
-        if (!seen) {
-            detail.* = "step";
-            return error.UnknownStep;
-        }
-    }
-
-    const steps = try a.alloc(core.preset.Step, items.len);
-    var n: usize = 0;
-    for (step_order) |kind| {
-        for (items) |item| {
-            const params = item.object.get(@tagName(kind)) orelse continue;
-            steps[n] = try stepFromSpec(a, kind, params, detail);
-            n += 1;
-        }
-    }
-    return .{ .name = "custom", .target = .desktop, .steps = steps[0..n] };
-}
-
-/// Typed readers over one step's params object. Omitted fields yield `null`,
-/// which the caller turns into the param struct's own default.
-const SpecParams = struct {
-    kind: core.preset.StepKind,
-    fields: ?std.json.ObjectMap,
-    detail: *[]const u8,
-
-    fn bad(self: *SpecParams) SpecError {
-        self.detail.* = @tagName(self.kind);
-        return error.BadParam;
-    }
-
-    fn get(self: *SpecParams, name: []const u8) ?std.json.Value {
-        const fields = self.fields orelse return null;
-        return fields.get(name);
-    }
-
-    fn boolField(self: *SpecParams, name: []const u8) SpecError!?bool {
-        return switch (self.get(name) orelse return null) {
-            .bool => |b| b,
-            else => self.bad(),
-        };
-    }
-
-    fn intField(self: *SpecParams, comptime T: type, name: []const u8) SpecError!?T {
-        return switch (self.get(name) orelse return null) {
-            .integer => |i| std.math.cast(T, i) orelse self.bad(),
-            else => self.bad(),
-        };
-    }
-
-    fn floatField(self: *SpecParams, name: []const u8) SpecError!?f32 {
-        return switch (self.get(name) orelse return null) {
-            .float => |f| std.math.lossyCast(f32, f),
-            .integer => |i| @floatFromInt(i),
-            else => self.bad(),
-        };
-    }
-
-    /// `"auto"`/`"etc1s"`/`"uastc"` (and the other preset formats); anything
-    /// unrecognised falls back to `.auto`.
-    fn formatField(self: *SpecParams, name: []const u8) SpecError!?core.preset.TextureFormat {
-        const s = switch (self.get(name) orelse return null) {
-            .string => |s| s,
-            else => return self.bad(),
-        };
-        return std.meta.stringToEnum(core.preset.TextureFormat, s) orelse .auto;
-    }
-
-    /// `"none"`/`"zstd"`; anything unrecognised falls back to `.none` (the
-    /// byte-compat default).
-    fn supercompressionField(self: *SpecParams, name: []const u8) SpecError!?core.encode_ktx.Supercompression {
-        const s = switch (self.get(name) orelse return null) {
-            .string => |s| s,
-            else => return self.bad(),
-        };
-        return std.meta.stringToEnum(core.encode_ktx.Supercompression, s) orelse .none;
-    }
-};
-
-/// Parse the textures step's `overrides` array (see the pipeline contract).
-/// Lenient on purpose: a missing/non-array value means no overrides, a
-/// non-object item is skipped, and a mistyped field keeps its default.
-/// Unknown keys are ignored, like the step params themselves. An unknown
-/// format string leaves the override's format unset (it must not silently
-/// become `.auto`, which is a real value here).
-fn parseTextureOverrides(a: std.mem.Allocator, v: ?std.json.Value) SpecError![]core.preset.TextureOverride {
-    const items = switch (v orelse return &.{}) {
-        .array => |arr| arr.items,
-        else => return &.{},
-    };
-    var out: std.ArrayList(core.preset.TextureOverride) = .empty;
-    for (items) |item| {
-        const fields = switch (item) {
-            .object => |o| o,
-            else => continue,
-        };
-        var o: core.preset.TextureOverride = .{};
-        if (fields.get("image")) |iv| {
-            if (iv == .integer) o.image = std.math.cast(u32, iv.integer);
-        }
-        if (fields.get("name")) |nv| {
-            if (nv == .string) o.name = try a.dupe(u8, nv.string);
-        }
-        if (fields.get("skip")) |sv| {
-            if (sv == .bool) o.skip = sv.bool;
-        }
-        if (fields.get("format")) |fv| {
-            if (fv == .string) {
-                if (std.meta.stringToEnum(core.preset.TextureFormat, fv.string)) |f| o.format = f;
-            }
-        }
-        if (fields.get("quality")) |qv| {
-            if (qv == .integer) o.quality = std.math.cast(u8, qv.integer);
-        }
-        if (fields.get("max_size")) |mv| {
-            if (mv == .integer) o.max_size = std.math.cast(u32, mv.integer);
-        }
-        if (fields.get("generate_mips")) |gv| {
-            if (gv == .bool) o.generate_mips = gv.bool;
-        }
-        if (fields.get("normal_map")) |nmv| {
-            if (nmv == .bool) o.normal_map = nmv.bool;
-        }
-        if (fields.get("supercompression")) |scv| {
-            if (scv == .string) {
-                if (std.meta.stringToEnum(core.encode_ktx.Supercompression, scv.string)) |s| o.supercompression = s;
-            }
-        }
-        try out.append(a, o);
-    }
-    if (out.items.len == 0) return &.{};
-    return try out.toOwnedSlice(a);
-}
-
-fn stepFromSpec(
-    a: std.mem.Allocator,
-    kind: core.preset.StepKind,
-    v: std.json.Value,
-    detail: *[]const u8,
-) SpecError!core.preset.Step {
-    var r: SpecParams = .{ .kind = kind, .fields = null, .detail = detail };
-    switch (v) {
-        .object => |o| r.fields = o,
-        .null => {}, // `{"prune": null}` == `{"prune": {}}`
-        else => {
-            detail.* = @tagName(kind);
-            return error.BadParam;
-        },
-    }
-
-    return switch (kind) {
-        .prune => blk: {
-            const d = core.preset.PruneParams{};
-            break :blk .{ .prune = .{
-                .unused_nodes = (try r.boolField("unused_nodes")) orelse d.unused_nodes,
-                .unused_materials = (try r.boolField("unused_materials")) orelse d.unused_materials,
-                .unused_textures = (try r.boolField("unused_textures")) orelse d.unused_textures,
-                .animations = (try r.boolField("animations")) orelse d.animations,
-            } };
-        },
-        .dedup => blk: {
-            const d = core.preset.DedupParams{};
-            break :blk .{ .dedup = .{
-                .accessors = (try r.boolField("accessors")) orelse d.accessors,
-                .meshes = (try r.boolField("meshes")) orelse d.meshes,
-                .materials = (try r.boolField("materials")) orelse d.materials,
-            } };
-        },
-        .weld => blk: {
-            const d = core.preset.WeldParams{};
-            break :blk .{ .weld = .{
-                .tolerance = (try r.floatField("tolerance")) orelse d.tolerance,
-            } };
-        },
-        .join => .{ .join = .{} },
-        .textures => blk: {
-            const d = core.preset.TextureParams{};
-            break :blk .{ .textures = .{
-                .format = (try r.formatField("format")) orelse d.format,
-                .quality = (try r.intField(u8, "quality")) orelse d.quality,
-                .rdo_lambda = (try r.floatField("rdo_lambda")) orelse d.rdo_lambda,
-                .normal_maps_renormalize = (try r.boolField("normal_maps_renormalize")) orelse d.normal_maps_renormalize,
-                .generate_mips = (try r.boolField("generate_mips")) orelse d.generate_mips,
-                .max_size = (try r.intField(u32, "max_size")) orelse d.max_size,
-                .supercompression = (try r.supercompressionField("supercompression")) orelse d.supercompression,
-                .overrides = try parseTextureOverrides(a, r.get("overrides")),
-            } };
-        },
-        .quantize => blk: {
-            const d = core.preset.QuantizeParams{};
-            break :blk .{ .quantize = .{
-                .position_bits = (try r.intField(u5, "position_bits")) orelse d.position_bits,
-                .normal_oct = (try r.boolField("normal_oct")) orelse d.normal_oct,
-                .uv_bits = (try r.intField(u5, "uv_bits")) orelse d.uv_bits,
-                .compress = (try r.boolField("compress")) orelse d.compress,
-            } };
-        },
-        .simplify => blk: {
-            const d = core.preset.SimplifyParams{};
-            break :blk .{ .simplify = .{
-                .target_ratio = (try r.floatField("target_ratio")) orelse d.target_ratio,
-                .error_tolerance = (try r.floatField("error_tolerance")) orelse d.error_tolerance,
-                .aggressive = (try r.boolField("aggressive")) orelse d.aggressive,
-                .lock_borders = (try r.boolField("lock_borders")) orelse d.lock_borders,
-                .use_attributes = (try r.boolField("use_attributes")) orelse d.use_attributes,
-                .weight_normal = (try r.floatField("weight_normal")) orelse d.weight_normal,
-                .weight_uv = (try r.floatField("weight_uv")) orelse d.weight_uv,
-            } };
-        },
-    };
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -2744,12 +2495,6 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
-}
-
-fn mipLevelsFor(w: u32, h: u32) u32 {
-    const m = @max(w, h);
-    if (m == 0) return 1;
-    return @as(u32, 32 - @clz(m)) + 1;
 }
 
 /// RGBA8 pixels plus their dimensions. Arena-owned in `encodeImage`.
@@ -2783,6 +2528,7 @@ fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32, ov: Encode
     if (ov.quality) |q| opts.quality = q;
     if (ov.max_size) |ms| opts.max_size = ms;
     if (ov.generate_mips) |g| opts.generate_mips = g;
+    if (ov.supercompression) |s| opts.supercompression = s;
 
     // `max_size` is a downscale: fit here so the round-trip check below can
     // compare against the *encoded* dimensions (core encode() would resize
@@ -2803,7 +2549,7 @@ fn encodeImage(a: std.mem.Allocator, img: core.model.Image, idx: u32, ov: Encode
     const rt = try core.encode_ktx.decodeToRgba(a, out.ktx2);
     if (rt.width != w or rt.height != h) return null;
 
-    const levels = mipLevelsFor(w, h);
+    const levels = core.formats.mipLevels(w, h);
     const vram_before = core.formats.mipChainBytes(w, h, 37, levels); // VK_FORMAT_R8G8B8A8_UNORM
     return .{
         .result = .{
@@ -3697,13 +3443,14 @@ test "custom spec ignores malformed override items gracefully" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Non-object items dropped; mistyped fields keep defaults; unknown keys
-    // and unknown format strings ignored; out-of-range ints ignored.
+    // Non-object items dropped; mistyped fields keep defaults; unknown format
+    // strings and out-of-range ints ignored. Unknown keys are an error
+    // (named in `detail`) instead of a silent no-op.
     const spec =
         \\{"steps":[{
         \\  "textures":{"overrides":[
         \\    42,
-        \\    {"image":"two","quality":"high","bogus_key":1,"format":"bogus"},
+        \\    {"image":"two","quality":"high","format":"bogus"},
         \\    {"image":9999999999,"quality":300},
         \\    {"name":"ok","skip":true}
         \\  ]}
@@ -3724,6 +3471,16 @@ test "custom spec ignores malformed override items gracefully" {
     // Third kept item is intact.
     try testing.expectEqualStrings("ok", tex.overrides[2].name);
     try testing.expect(tex.overrides[2].skip);
+
+    // Unknown keys are rejected, naming the offending key.
+    for ([_][]const u8{
+        "{\"steps\":[{\"textures\":{\"overrides\":[{\"image\":0,\"bogus_key\":1}]}}]}",
+        "{\"steps\":[{\"textures\":{\"rules\":[{\"slot\":\"normal\",\"bogus_key\":true}]}}]}",
+    }) |s| {
+        var d: []const u8 = "";
+        try testing.expectError(error.BadParam, customPresetFromSpec(a, s, &d));
+        try testing.expectEqualStrings("bogus_key", d);
+    }
 
     // Non-array overrides and null both mean "none", not an error.
     for ([_][]const u8{
@@ -4734,6 +4491,22 @@ test "textureEncode honors the settings payload" {
     try testing.expectEqual(@as(u8, 200), got.quality);
     try testing.expectEqual(@as(u32, 64), got.max_size);
     try testing.expect(!got.mips);
+}
+
+test "parseEncodeOverride parses supercompression leniently" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const z = parseEncodeOverride(a, "{\"supercompression\":\"zstd\"}");
+    try testing.expectEqual(core.encode_ktx.Supercompression.zstd, z.supercompression.?);
+    const none = parseEncodeOverride(a, "{\"supercompression\":\"none\"}");
+    try testing.expectEqual(core.encode_ktx.Supercompression.none, none.supercompression.?);
+    // unknown strings, wrong types and garbage leave the default in place
+    try testing.expect(parseEncodeOverride(a, "{\"supercompression\":\"bogus\"}").supercompression == null);
+    try testing.expect(parseEncodeOverride(a, "{\"supercompression\":5}").supercompression == null);
+    try testing.expect(parseEncodeOverride(a, "not json").supercompression == null);
+    try testing.expect(parseEncodeOverride(a, null).supercompression == null);
 }
 
 test "textureEncode without settings keeps the defaults" {

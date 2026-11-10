@@ -110,7 +110,6 @@ pub fn encode(a: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, opts: Opti
         @intCast(err_buf.len),
     );
     if (rc != 0 or out_ptr == null or out_len == 0) {
-        std.debug.print("basisu encode: {s}\n", .{errSlice(&err_buf)});
         if (out_ptr) |p| c.basset_basisu_free(p);
         return error.BasisuEncode;
     }
