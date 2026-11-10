@@ -10,7 +10,9 @@ import { t } from "../i18n";
 import { toast } from "../ui";
 import { findNative, rawCall } from "./host";
 import {
+  asRecord,
   cleanEncodeArgs,
+  isRecord,
   isStartedAck,
   normalizeEncodeDone,
   normalizeEncodeResult,
@@ -47,6 +49,7 @@ import type {
   UpdateApply,
   UpdateCheck,
 } from "../types";
+import { errMessage } from "../guards";
 
 export class Bridge {
   readonly native: NativeBackend | null;
@@ -74,14 +77,14 @@ export class Bridge {
 
   async info(path: string): Promise<Info> {
     if (!this.live) return this.demo.info(path);
-    return parseMaybeJson<Info>(await this.raw("info", [path]));
+    return asRecord(parseMaybeJson(await this.raw("info", [path]))) as unknown as Info;
   }
 
   async loadBytes(path: string): Promise<string> {
     if (!this.live) return "";
-    const res = parseMaybeJson<unknown>(await this.raw("loadBytes", [path]));
+    const res = parseMaybeJson(await this.raw("loadBytes", [path]));
     if (typeof res === "string") return res;
-    const obj = (res ?? {}) as Record<string, unknown>;
+    const obj = asRecord(res);
     return String(obj.b64 ?? obj.base64 ?? obj.data ?? "");
   }
 
@@ -142,7 +145,7 @@ export class Bridge {
     } catch (err) {
       if (isMissingMethodError(err)) {
         notify(
-          t("toast.customFallback", { message: (err as Error).message, preset: fallbackPreset }),
+          t("toast.customFallback", { message: errMessage(err), preset: fallbackPreset }),
           "error",
         );
         return this.optimize(path, fallbackPreset, onProgress);
@@ -207,9 +210,9 @@ export class Bridge {
     }
     const extra = cleanEncodeArgs(settings);
     const args = extra ? [path, index, JSON.stringify(extra)] : [path, index];
-    const res = parseMaybeJson<Record<string, unknown>>(await this.raw("texturePreview", args));
+    const res = parseMaybeJson(await this.raw("texturePreview", args));
     if (isStartedAck(res)) return { started: true };
-    const event = normalizePreviewDone({ ...res, ok: true });
+    const event = normalizePreviewDone({ ...asRecord(res), ok: true });
     if (!event.ok) throw new Error(event.error);
     return { started: false, result: event.result };
   }
@@ -241,10 +244,10 @@ export class Bridge {
     }
     const extra = cleanEncodeArgs(settings);
     const args = extra ? [path, index, JSON.stringify(extra)] : [path, index];
-    const res = parseMaybeJson<Record<string, unknown>>(await this.raw("textureEncode", args));
+    const res = parseMaybeJson(await this.raw("textureEncode", args));
     if (isStartedAck(res)) return { started: true };
-    const payload =
-      res.result && typeof res.result === "object" ? (res.result as Record<string, unknown>) : res;
+    const rec = asRecord(res);
+    const payload = isRecord(rec.result) ? rec.result : rec;
     return { started: false, result: normalizeEncodeResult(payload) };
   }
 
@@ -260,8 +263,8 @@ export class Bridge {
 
   async presets(): Promise<PresetEntry[]> {
     if (!this.live) return this.demo.presets();
-    const res = parseMaybeJson<unknown>(await this.raw("presets", []));
-    const list = Array.isArray(res) ? res : ((res ?? {}) as Record<string, unknown>).presets;
+    const res = parseMaybeJson(await this.raw("presets", []));
+    const list = Array.isArray(res) ? res : asRecord(res).presets;
     const items = Array.isArray(list) ? list : [];
     return items
       .map((entry) => normalizePresetEntry(entry))
@@ -277,9 +280,8 @@ export class Bridge {
     if (!this.live) return this.demo.presetLoad(name);
     const res = await this.raw("presetLoad", [name]);
     if (typeof res === "string") return res;
-    if (res && typeof res === "object" && !Array.isArray(res)) {
-      const obj = res as Record<string, unknown>;
-      const wrapped = obj.zon ?? obj.text ?? obj.source;
+    if (isRecord(res)) {
+      const wrapped = res.zon ?? res.text ?? res.source;
       if (typeof wrapped === "string") return wrapped;
       return JSON.stringify(res);
     }
@@ -323,7 +325,7 @@ export class Bridge {
       const trimmed = res.trim();
       if (trimmed.startsWith("{")) {
         try {
-          const obj = JSON.parse(trimmed) as Record<string, unknown>;
+          const obj = asRecord(JSON.parse(trimmed));
           const wrapped = obj.text ?? obj.json ?? obj.settings;
           if (typeof wrapped === "string") return wrapped;
         } catch {
@@ -333,9 +335,8 @@ export class Bridge {
       }
       return res;
     }
-    if (res && typeof res === "object" && !Array.isArray(res)) {
-      const obj = res as Record<string, unknown>;
-      const wrapped = obj.text ?? obj.json ?? obj.settings;
+    if (isRecord(res)) {
+      const wrapped = res.text ?? res.json ?? res.settings;
       if (typeof wrapped === "string") return wrapped;
       return JSON.stringify(res);
     }
@@ -355,7 +356,7 @@ export class Bridge {
   async appInfo(): Promise<AppInfo> {
     if (!this.live) return this.demo.appInfo();
     if (!this.native?.methods.includes("appInfo")) throw new Error("backend has no appInfo()");
-    return parseMaybeJson<AppInfo>(await this.raw("appInfo", []));
+    return asRecord(parseMaybeJson(await this.raw("appInfo", []))) as unknown as AppInfo;
   }
 
   /**
@@ -367,7 +368,7 @@ export class Bridge {
     if (!this.live) return this.demo.updateCheck();
     if (!this.native?.methods.includes("updateCheck"))
       throw new Error("backend has no updateCheck()");
-    return parseMaybeJson<UpdateCheck>(await this.raw("updateCheck", []));
+    return asRecord(parseMaybeJson(await this.raw("updateCheck", []))) as unknown as UpdateCheck;
   }
 
   /**
@@ -380,7 +381,7 @@ export class Bridge {
     if (!this.live) return this.demo.updateApply();
     if (!this.native?.methods.includes("updateApply"))
       throw new Error("backend has no updateApply()");
-    return parseMaybeJson<UpdateApply>(await this.raw("updateApply", []));
+    return asRecord(parseMaybeJson(await this.raw("updateApply", []))) as unknown as UpdateApply;
   }
 
   /**
@@ -396,10 +397,10 @@ export class Bridge {
       toast(t("toast.noOpenDialog"), "error");
       return { path: null };
     }
-    const res = parseMaybeJson<unknown>(await this.raw("openDialog", []));
+    const res = parseMaybeJson(await this.raw("openDialog", []));
     if (res == null) return { path: null };
     if (typeof res === "string") return { path: res.trim() || null };
-    const obj = res as Record<string, unknown>;
+    const obj = asRecord(res);
     const p = obj.path ?? obj.file;
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
   }
@@ -407,9 +408,10 @@ export class Bridge {
   /** Paths supplied by Finder, the Dock, or a desktop launcher. */
   async pendingOpenFiles(): Promise<string[]> {
     if (!this.native?.methods.includes("pendingOpenFiles")) return [];
-    const result = parseMaybeJson<{ paths?: unknown }>(await this.raw("pendingOpenFiles", []));
-    return Array.isArray(result?.paths)
-      ? result.paths.filter((path): path is string => typeof path === "string")
+    const result = parseMaybeJson(await this.raw("pendingOpenFiles", []));
+    const paths = isRecord(result) ? result.paths : undefined;
+    return Array.isArray(paths)
+      ? paths.filter((path): path is string => typeof path === "string")
       : [];
   }
 
@@ -420,10 +422,10 @@ export class Bridge {
     }
     if (this.native && this.native.methods.includes("openDialogAt")) {
       const seed = dir?.trim() ? dir.trim() : null;
-      const res = parseMaybeJson<unknown>(await this.raw("openDialogAt", [seed ?? ""]));
+      const res = parseMaybeJson(await this.raw("openDialogAt", [seed ?? ""]));
       if (res == null) return { path: null };
       if (typeof res === "string") return { path: res.trim() || null };
-      const obj = res as Record<string, unknown>;
+      const obj = asRecord(res);
       const p = obj.path ?? obj.file;
       return { path: p == null || String(p).trim() === "" ? null : String(p) };
     }
@@ -442,10 +444,10 @@ export class Bridge {
     if (!this.native || !this.native.methods.includes("dropFile")) {
       throw new Error("backend has no dropFile()");
     }
-    const res = parseMaybeJson<unknown>(await this.raw("dropFile", [name, b64]));
+    const res = parseMaybeJson(await this.raw("dropFile", [name, b64]));
     if (res == null) return { path: null };
     if (typeof res === "string") return { path: res.trim() || null };
-    const obj = res as Record<string, unknown>;
+    const obj = asRecord(res);
     const p = obj.path ?? obj.file;
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
   }
@@ -454,13 +456,12 @@ export class Bridge {
   async listDir(dir: string): Promise<string[]> {
     if (!this.live) return [];
     if (!this.native || !this.native.methods.includes("listDir")) return [];
-    const res = parseMaybeJson<unknown>(await this.raw("listDir", [dir]));
+    const res = parseMaybeJson(await this.raw("listDir", [dir]));
     const pick = (v: unknown): string[] => {
       if (Array.isArray(v)) return v.map(String);
-      if (v && typeof v === "object") {
-        const o = v as Record<string, unknown>;
+      if (isRecord(v)) {
         for (const key of ["files", "entries", "paths", "children"]) {
-          if (Array.isArray(o[key])) return (o[key] as unknown[]).map(String);
+          if (Array.isArray(v[key])) return (v[key] as unknown[]).map(String);
         }
       }
       return [];
@@ -483,10 +484,10 @@ export class Bridge {
       return { path: null };
     }
     const suggestion = name?.trim() ? name : "model.opt.glb";
-    const res = parseMaybeJson<unknown>(await this.raw("pickSavePath", [suggestion]));
+    const res = parseMaybeJson(await this.raw("pickSavePath", [suggestion]));
     if (res == null) return { path: null };
     if (typeof res === "string") return { path: res.trim() || null };
-    const obj = res as Record<string, unknown>;
+    const obj = asRecord(res);
     const p = obj.path ?? obj.file;
     return { path: p == null || String(p).trim() === "" ? null : String(p) };
   }
@@ -498,7 +499,7 @@ export class Bridge {
    */
   async exportTo(src: string, dst: string): Promise<{ started: true }> {
     if (!this.live) throw new Error(t("toast.demoExport"));
-    const res = parseMaybeJson<unknown>(await this.raw("exportTo", [src, dst]));
+    const res = parseMaybeJson(await this.raw("exportTo", [src, dst]));
     if (isStartedAck(res)) return { started: true };
     throw new Error("export not acknowledged by the host");
   }
@@ -514,9 +515,9 @@ export class Bridge {
   async cancelJob(): Promise<{ cancelled: boolean }> {
     if (!this.live) return { cancelled: false };
     if (!this.native?.methods.includes("cancelJob")) return { cancelled: false };
-    const res = parseMaybeJson<unknown>(await this.raw("cancelJob", []));
-    if (res && typeof res === "object" && !Array.isArray(res)) {
-      return { cancelled: (res as Record<string, unknown>).cancelled === true };
+    const res = parseMaybeJson(await this.raw("cancelJob", []));
+    if (isRecord(res)) {
+      return { cancelled: res.cancelled === true };
     }
     return { cancelled: false };
   }
@@ -565,24 +566,49 @@ function normalizePresetEntry(value: unknown): PresetEntry | null {
     if (!name) return null;
     return { name, kind: "builtin", file: `${name}.zon` };
   }
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const obj = value as Record<string, unknown>;
-    const name = String(obj.name ?? "").trim();
+  if (isRecord(value)) {
+    const name = String(value.name ?? "").trim();
     if (!name) return null;
     return {
       name,
-      kind: obj.kind === "user" ? "user" : "builtin",
-      file: String(obj.file ?? `${name}.zon`),
+      kind: value.kind === "user" ? "user" : "builtin",
+      file: String(value.file ?? `${name}.zon`),
     };
   }
   return null;
 }
 
+/**
+ * Base64 model bytes → Uint8Array. Validates the charset up front (atob
+ * silently drops some bad input), surfaces decode failures as Errors, and
+ * copies out in 4 KB chunks to keep long per-char loops interruptible.
+ */
 export function b64ToBytes(b64: string): Uint8Array {
   const clean = b64.replace(/\s+/g, "");
-  const bin = atob(clean);
+  if (clean.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) {
+    throw new Error(`b64ToBytes: invalid base64 (length ${clean.length})`);
+  }
+  const fromBase64 = (Uint8Array as unknown as { fromBase64?: (alphabet: string) => Uint8Array })
+    .fromBase64;
+  if (typeof fromBase64 === "function") {
+    try {
+      return fromBase64.call(Uint8Array, clean);
+    } catch {
+      // Fall through to the atob path below.
+    }
+  }
+  let bin: string;
+  try {
+    bin = atob(clean);
+  } catch {
+    throw new Error("b64ToBytes: invalid base64 payload");
+  }
   const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  const CHUNK = 4096;
+  for (let off = 0; off < bin.length; off += CHUNK) {
+    const end = Math.min(off + CHUNK, bin.length);
+    for (let i = off; i < end; i++) out[i] = bin.charCodeAt(i) & 0xff;
+  }
   return out;
 }
 

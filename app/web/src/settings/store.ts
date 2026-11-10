@@ -17,6 +17,7 @@ import type {
   TextureOverride,
   ThemeMode,
 } from "./schema";
+import { errMessage } from "../guards";
 let current = defaultSettings();
 /** Canonical text last written to (or read from) disk. */
 let lastSaved = "";
@@ -118,6 +119,30 @@ function scheduleSave(): void {
   }, SAVE_DEBOUNCE_MS);
 }
 
+/** Flushes a pending debounced save now (page hide/close path). */
+function flushPendingSave(): void {
+  if (saveTimer === null) return;
+  void saveSettings();
+}
+
+/**
+ * Debounced edits coalesce in memory; flush them when the page hides or
+ * unloads so rapid edits are never lost. No-op without a DOM (bun tests).
+ */
+function wireFlushOnHide(): void {
+  if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
+  const flush = (): void => {
+    flushPendingSave();
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flush();
+  });
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("pagehide", flush);
+  }
+}
+wireFlushOnHide();
+
 /**
  * Writes the current state now (cancels a pending debounce). Resolves true when
  * the file matches the in-app state afterwards.
@@ -146,7 +171,7 @@ export async function saveSettings(): Promise<boolean> {
         lastSaved = text;
         setStatus({ state: "saved", message: "saved" });
       } catch (err) {
-        setStatus({ state: "error", message: (err as Error).message });
+        setStatus({ state: "error", message: errMessage(err) });
         return false;
       }
       if (!savePending) return true;
@@ -353,7 +378,7 @@ export async function loadSettings(options: { announce?: boolean } = {}): Promis
     text = await bridge.settingsLoad();
   } catch (err) {
     applyTheme(current.theme);
-    setStatus({ state: "error", message: `load failed: ${(err as Error).message}` });
+    setStatus({ state: "error", message: `load failed: ${errMessage(err)}` });
     return false;
   }
   let next: Settings;
@@ -361,7 +386,7 @@ export async function loadSettings(options: { announce?: boolean } = {}): Promis
     next = text.trim() ? mergeSettings(JSON.parse(text), false) : defaultSettings();
   } catch (err) {
     applyTheme(current.theme);
-    setStatus({ state: "error", message: `invalid settings file: ${(err as Error).message}` });
+    setStatus({ state: "error", message: `invalid settings file: ${errMessage(err)}` });
     return false;
   }
   current = next;

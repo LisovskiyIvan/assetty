@@ -4,6 +4,7 @@
  */
 import { app } from "../../app";
 import {
+  errMessage,
   isBusyError,
   isCancelledError,
   isFormTarget,
@@ -711,7 +712,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     try {
       await app.bridge.discardFile(outPath);
     } catch (err) {
-      notify(t("opt.discardFail", { message: (err as Error).message }), "error");
+      notify(t("opt.discardFail", { message: errMessage(err) }), "error");
       return;
     }
     deps.onDiscarded(outPath);
@@ -751,7 +752,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       accepted = (await app.bridge.cancelJob()).cancelled;
     } catch (err) {
       failed = true;
-      notify(t("job.cancelFail", { message: (err as Error).message }), "error");
+      notify(t("job.cancelFail", { message: errMessage(err) }), "error");
     }
     if (!running || jobKind !== kind) return; // finished while the RPC flew
     if (!accepted) {
@@ -815,7 +816,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     try {
       await deps.dual.loadRightLive(await app.bridge.loadBytes(outPath));
     } catch (err) {
-      notify(t("opt.loadOptFail", { message: (err as Error).message }), "error");
+      notify(t("opt.loadOptFail", { message: errMessage(err) }), "error");
     }
   }
 
@@ -1051,14 +1052,19 @@ export function createRunFlow(deps: RunDeps): RunApi {
   }
 
   /** Clicks outside the row close the open menu (and disarm a delete). */
-  document.addEventListener("click", (ev) => {
-    if (!menuOpen && confirmDelete == null) return;
-    const target = ev.target as Node | null;
-    if (target && presetRow.contains(target)) return;
-    menuOpen = false;
-    confirmDelete = null;
-    renderPresetRow();
-  });
+  const menuCloser = new AbortController();
+  document.addEventListener(
+    "click",
+    (ev) => {
+      if (!menuOpen && confirmDelete == null) return;
+      const target = ev.target as Node | null;
+      if (target && presetRow.contains(target)) return;
+      menuOpen = false;
+      confirmDelete = null;
+      renderPresetRow();
+    },
+    { signal: menuCloser.signal },
+  );
 
   /** Copies one step's params from a loaded spec (tolerant: wrong types keep current). */
   function applySpecSteps(entries: unknown[]): void {
@@ -1206,7 +1212,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     try {
       text = await app.bridge.presetLoad(name);
     } catch (err) {
-      notify(t("opt.presetLoadFail", { message: (err as Error).message }), "error");
+      notify(t("opt.presetLoadFail", { message: errMessage(err) }), "error");
       return;
     }
     let spec: unknown;
@@ -1244,7 +1250,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     try {
       await app.bridge.presetSaveJson(name, JSON.stringify({ name, steps: specSteps }));
     } catch (err) {
-      notify(t("opt.presetSaveFail", { message: (err as Error).message }), "error");
+      notify(t("opt.presetSaveFail", { message: errMessage(err) }), "error");
       return;
     }
     activePreset = name;
@@ -1260,7 +1266,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     try {
       await app.bridge.presetDelete(name);
     } catch (err) {
-      notify(t("opt.presetDeleteFail", { message: (err as Error).message }), "error");
+      notify(t("opt.presetDeleteFail", { message: errMessage(err) }), "error");
       await loadPresets();
       return;
     }
@@ -1285,7 +1291,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       else deps.dual.loadLeftDemo();
       deps.dual.hideOpenHint();
     } catch (err) {
-      notify(t("opt.loadFail", { message: (err as Error).message }), "error");
+      notify(t("opt.loadFail", { message: errMessage(err) }), "error");
       deps.dual.showOpenHint();
     }
     syncControls();
@@ -1426,7 +1432,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       } else {
         freezeClock();
         setProgress(t("common.failed"), 0);
-        notify(t("opt.failedMsg", { message: (err as Error).message }), "error");
+        notify(t("opt.failedMsg", { message: errMessage(err) }), "error");
       }
     }
   }
@@ -1541,7 +1547,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
       } else {
         freezeClock();
         setProgress(t("common.failed"), 0);
-        notify(t("opt.lodsFailedMsg", { message: (err as Error).message }), "error");
+        notify(t("opt.lodsFailedMsg", { message: errMessage(err) }), "error");
       }
     }
   }
@@ -1574,6 +1580,7 @@ export function createRunFlow(deps: RunDeps): RunApi {
     discardResult,
     viewResult,
     dispose: () => {
+      menuCloser.abort();
       document.removeEventListener("keydown", onKey);
       offDone();
       offLodsDone();

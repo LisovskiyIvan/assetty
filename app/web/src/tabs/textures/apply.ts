@@ -8,6 +8,7 @@ import { t } from "../../i18n";
 import { el, fmtBytes, fmtSecs, clear, displayName } from "../../ui";
 import { bannerButton, revealButton } from "../../ui/banner";
 import {
+  errMessage,
   createSeq,
   isCancelledError,
   notifyExportError,
@@ -191,6 +192,11 @@ export function createApplyFlow(nodes: ApplyBarNodes): ApplyFlow {
       max_size: override?.max_size ?? b.max_size,
     };
     if (b.supercompression !== "none") spec.supercompression = b.supercompression;
+    if (override?.supercompression !== undefined) {
+      // an override beats the base step setting, mirroring normal_map
+      if (override.supercompression === "none") delete spec.supercompression;
+      else spec.supercompression = override.supercompression;
+    }
     if (override?.normal_map !== undefined) spec.normal_map = override.normal_map;
     const src = app.sourcePath;
     const list = getTextureOverrides(src);
@@ -500,7 +506,7 @@ export function createApplyFlow(nodes: ApplyBarNodes): ApplyFlow {
       accepted = (await app.bridge.cancelJob()).cancelled;
     } catch (err) {
       failed = true;
-      notify(t("job.cancelFail", { message: (err as Error).message }), "error");
+      notify(t("job.cancelFail", { message: errMessage(err) }), "error");
     }
     if (!applyRunning) return; // finished while the RPC flew
     if (!accepted) {

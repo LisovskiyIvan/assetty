@@ -9,6 +9,7 @@ import { el, emptyState } from "../../ui";
 import { fieldHelpButton } from "../../optimizeForm";
 import { ViewerScene, linkCameras } from "../../viewer";
 import type { OptimizeResult } from "../../types";
+import { errMessage } from "../../guards";
 
 /** Before/after view mode. "side" is the classic two canvases; "split"
  * stacks both scenes in one viewport with a draggable wipe divider (the
@@ -17,7 +18,8 @@ export type CompareMode = "side" | "split";
 
 export interface DualScenes {
   left: ViewerScene;
-  right: ViewerScene;
+  /** Null until the first split-view/result use (created lazily). */
+  right: ViewerScene | null;
 }
 
 export interface DualApi {
@@ -27,8 +29,10 @@ export interface DualApi {
   compareMode(): CompareMode;
   splitPos(): number;
   setCompareMode(mode: CompareMode): void;
-  /** Creates the scenes on first call; resumes afterwards. False on WebGL failure. */
+  /** Creates the left pane on first call (the right pane stays lazy until
+   * the first split-view/result use); resumes afterwards. False on WebGL failure. */
   ensureScenes(): boolean;
+  /** Left pane always present once ensured; right null until lazily created. */
   scenes(): DualScenes | null;
   pause(): void;
   disposeScenes(): void;
@@ -138,7 +142,8 @@ export function createDualView(main: HTMLElement): DualApi {
 
   let left: ViewerScene | null = null;
   let right: ViewerScene | null = null;
-  let linked = false;
+  /** Bidirectional orbit-link teardown (null until both panes exist). */
+  let stopLink: (() => void) | null = null;
   /** Removes the split-mode master→slave camera sync (null when inactive). */
   let stopSplitSync: (() => void) | null = null;
 
@@ -220,6 +225,9 @@ export function createDualView(main: HTMLElement): DualApi {
 
   function setCompareMode(mode: CompareMode): void {
     if (mode === "split" && lastResult === null) return;
+    // Split view needs the result pane: create it on first activation and
+    // keep it for the tab lifetime (disposeScenes drops it).
+    if (mode === "split") ensureRight();
     compareMode = mode;
     syncCompareUI();
   }
@@ -308,24 +316,53 @@ export function createDualView(main: HTMLElement): DualApi {
     syncCompareUI();
   }
 
-  function ensureScenes(): boolean {
-    if (left && right) {
+  /** Links the panes once both exist (the orbit sync returned by linkCameras). */
+  function linkIfReady(): void {
+    if (left && right && !stopLink) {
+      stopLink = linkCameras(left, right);
+    }
+  }
+
+  /** Creates the left (source) pane on first call; resumes afterwards. */
+  function ensureLeft(): boolean {
+    if (left) {
       left.resume();
-      right.resume();
       return true;
     }
     try {
       left = new ViewerScene(leftPane.canvas, "original");
-      right = new ViewerScene(rightPane.canvas, "optimized");
-      if (!linked) {
-        linked = true;
-        linkCameras(left, right);
-      }
+      linkIfReady();
       return true;
     } catch (err) {
-      notify(t("viewer.webglFail", { reason: (err as Error).message }), "error");
+      notify(t("viewer.webglFail", { reason: errMessage(err) }), "error");
       return false;
     }
+  }
+
+  /**
+   * Creates the right (result) pane on first split-view/result use and keeps
+   * it for the tab lifetime, so an idle Optimize tab costs one engine instead
+   * of two. Resumes afterwards.
+   */
+  function ensureRight(): boolean {
+    if (right) {
+      right.resume();
+      return true;
+    }
+    try {
+      right = new ViewerScene(rightPane.canvas, "optimized");
+      linkIfReady();
+      return true;
+    } catch (err) {
+      notify(t("viewer.webglFail", { reason: errMessage(err) }), "error");
+      return false;
+    }
+  }
+
+  function ensureScenes(): boolean {
+    if (!ensureLeft()) return false;
+    right?.resume();
+    return true;
   }
 
   return {
@@ -335,13 +372,15 @@ export function createDualView(main: HTMLElement): DualApi {
     splitPos: () => splitPos,
     setCompareMode,
     ensureScenes,
-    scenes: () => (left && right ? { left, right } : null),
+    scenes: () => (left ? { left, right } : null),
     pause: () => {
       left?.pause();
       right?.pause();
     },
     disposeScenes: () => {
       setSplitSync(false);
+      stopLink?.();
+      stopLink = null;
       left?.dispose();
       right?.dispose();
       left = null;
@@ -352,15 +391,21 @@ export function createDualView(main: HTMLElement): DualApi {
       right?.forceResize();
     },
     loadLeftLive: (b64: string) => {
-      if (!left) return Promise.resolve();
-      return left.loadBase64(b64);
+      if (!left && !ensureLeft()) return Promise.resolve();
+      return (left as ViewerScene).loadBase64(b64);
     },
-    loadLeftDemo: () => left?.loadDemo(),
+    loadLeftDemo: () => {
+      if (!left && !ensureLeft()) return;
+      left?.loadDemo();
+    },
     loadRightLive: (b64: string) => {
-      if (!right) return Promise.resolve();
-      return right.loadBase64(b64);
+      if (!right && !ensureRight()) return Promise.resolve();
+      return (right as ViewerScene).loadBase64(b64);
     },
-    loadRightDemo: () => right?.loadDemo(),
+    loadRightDemo: () => {
+      if (!right && !ensureRight()) return;
+      right?.loadDemo();
+    },
     showOpenHint: () => {
       openHint.hidden = false;
     },

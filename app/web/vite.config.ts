@@ -12,8 +12,17 @@ export default defineConfig({
     target: "es2022",
     sourcemap: false,
     assetsInlineLimit: 4096,
-    chunkSizeWarningLimit: 1500,
+    chunkSizeWarningLimit: 600,
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "babylon-core": ["@babylonjs/core"],
+          "babylon-loaders": ["@babylonjs/loaders"],
+          "babylon-inspector": ["@babylonjs/inspector"],
+        },
+      },
+    },
   },
   server: {
     port: 5178,

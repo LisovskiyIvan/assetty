@@ -113,7 +113,16 @@ export function renderTextureList(
           class: `clickable ${img.index === selected ? "selected" : ""} ${
             img.index === previewing ? "previewing" : ""
           } ${img.index === activeEncodeIndex ? "encoding" : ""} ${img.skipped ? "skipped" : ""}`,
+          tabIndex: 0,
+          role: "button",
+          "aria-label": img.name ?? `image ${img.index}`,
           onclick: () => onSelect(img.index),
+          onkeydown: (ev: KeyboardEvent) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              onSelect(img.index);
+            }
+          },
         },
         el("td", { class: "mono", text: String(img.index) }),
         el("td", null, el("span", { text: img.name ?? "—" }), " ", deviationBadge(img)),

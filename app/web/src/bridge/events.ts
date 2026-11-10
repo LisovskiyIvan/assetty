@@ -18,17 +18,27 @@ import type {
   TexturePreviewDoneEvent,
 } from "./types";
 
-export function parseMaybeJson<T>(value: unknown): T {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return undefined as unknown as T;
+export function parseMaybeJson(raw: unknown): unknown {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
     try {
-      return JSON.parse(trimmed) as T;
+      return JSON.parse(trimmed);
     } catch {
-      return trimmed as unknown as T;
+      return trimmed;
     }
   }
-  return value as T;
+  return raw;
+}
+
+/** True when `v` is a plain JSON-ish object (records only, never arrays/null). */
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** `v` as a record, or `{}` when it is not one (arrays, null, primitives). */
+export function asRecord(v: unknown): Record<string, unknown> {
+  return isRecord(v) ? v : {};
 }
 
 export function asNumber(v: unknown, fallback = 0): number {
@@ -36,7 +46,7 @@ export function asNumber(v: unknown, fallback = 0): number {
 }
 
 function normalizeStats(raw: unknown): Stats {
-  const s = (raw ?? {}) as Record<string, unknown>;
+  const s = asRecord(raw);
   return {
     triangles: asNumber(s.triangles),
     vertices: asNumber(s.vertices),
@@ -47,12 +57,12 @@ function normalizeStats(raw: unknown): Stats {
 }
 
 export function normalizeOptimize(raw: unknown): OptimizeResult {
-  const r = (raw ?? {}) as Record<string, unknown>;
-  const rep = (r.report ?? r) as Record<string, unknown>;
+  const r = asRecord(raw);
+  const rep = asRecord(r.report ?? r);
   const out_path = String(r.out_path ?? r.output ?? r.outPath ?? r.path ?? "");
   const stepsRaw = Array.isArray(rep.steps) ? rep.steps : [];
   const steps = stepsRaw.map((s) => {
-    const st = (s ?? {}) as Record<string, unknown>;
+    const st = asRecord(s);
     return {
       kind: String(st.kind ?? st.name ?? "step"),
       applied: Boolean(st.applied),
@@ -78,37 +88,35 @@ export function normalizeOptimize(raw: unknown): OptimizeResult {
 }
 
 export function normalizeImages(raw: unknown): TexturesResult {
-  const obj = (raw ?? {}) as Record<string, unknown>;
+  const obj = asRecord(raw);
   const images = Array.isArray(obj.images) ? obj.images : Array.isArray(raw) ? raw : [];
   return { images: images as TexturesResult["images"] };
 }
 
 /** New hosts acknowledge a job with `{"started":true}` instead of blocking. */
 export function isStartedAck(raw: unknown): boolean {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-  return (raw as Record<string, unknown>).started === true;
+  if (!isRecord(raw)) return false;
+  return raw.started === true;
 }
 
 export function normalizeOptimizeDone(raw: unknown): OptimizeDoneEvent {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
   if (!ok) return { ok: false, error: String(r.error ?? "optimize failed") };
   // Accept both the flat contract and a `{ ok, result }` wrapper.
-  const payload =
-    r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
+  const payload = isRecord(r.result) ? r.result : r;
   return { ok: true, result: normalizeOptimize(payload) };
 }
 
 /** Normalizes the `lodsDone` payload (flat contract or `{ ok, results }` wrapper). */
 export function normalizeLodsDone(raw: unknown): LodsDoneEvent {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
   if (!ok) return { ok: false, error: String(r.error ?? "lods failed") };
-  const payload =
-    r.results !== undefined ? r : r.result && typeof r.result === "object" ? r.result : r;
-  const list = (payload as Record<string, unknown>).results;
+  const payload = r.results !== undefined ? r : isRecord(r.result) ? r.result : r;
+  const list = asRecord(payload).results;
   const items = (Array.isArray(list) ? list : []).map((entry) => {
-    const e = (entry ?? {}) as Record<string, unknown>;
+    const e = asRecord(entry);
     return {
       ratio: asNumber(e.ratio),
       out_path: String(e.out_path ?? e.path ?? ""),
@@ -121,14 +129,14 @@ export function normalizeLodsDone(raw: unknown): LodsDoneEvent {
 }
 
 export function normalizeExportDone(raw: unknown): ExportDoneEvent {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   const ok = r.ok === undefined ? r.error == null : Boolean(r.ok);
   if (!ok) return { ok: false, error: String(r.error ?? "export failed") };
   return { ok: true, src: String(r.src ?? ""), dst: String(r.dst ?? "") };
 }
 
 export function normalizeEncodeDone(raw: unknown): TextureEncodeDoneEvent {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   const index = asNumber(r.index, -1);
   if (r.ok === false || (r.error != null && r.ok !== true)) {
     return { ok: false, index, error: String(r.error ?? "encode failed") };
@@ -145,8 +153,8 @@ function optString(v: unknown): string | undefined {
 }
 
 function normalizeSettings(raw: unknown): EncodeSettings | undefined {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const s = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const s = raw;
   const out: EncodeSettings = {
     format: optString(s.format),
     quality: optNumber(s.quality),
@@ -171,12 +179,15 @@ export function cleanEncodeArgs(settings?: EncodeSettings): Record<string, unkno
   if (settings.max_size != null) out.max_size = settings.max_size;
   if (settings.generate_mips != null) out.generate_mips = settings.generate_mips;
   if (settings.normal_map != null) out.normal_map = settings.normal_map;
+  if (settings.supercompression === "zstd" || settings.supercompression === "none") {
+    out.supercompression = settings.supercompression;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Normalizes both the event payload and the legacy synchronous reply. */
 export function normalizeEncodeResult(raw: unknown): EncodeResult {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   return {
     ktx2_size: asNumber(r.ktx2_size ?? r.size),
     psnr: asNumber(r.psnr),
@@ -192,13 +203,12 @@ export function normalizeEncodeResult(raw: unknown): EncodeResult {
 }
 
 export function normalizePreviewDone(raw: unknown): TexturePreviewDoneEvent {
-  const r = (raw ?? {}) as Record<string, unknown>;
+  const r = asRecord(raw);
   const index = asNumber(r.index, -1);
   if (r.ok === false || (r.error != null && r.ok !== true)) {
     return { ok: false, index, error: String(r.error ?? "preview failed") };
   }
-  const payload =
-    r.result && typeof r.result === "object" ? (r.result as Record<string, unknown>) : r;
+  const payload = isRecord(r.result) ? r.result : r;
   return {
     ok: true,
     index,
@@ -236,13 +246,13 @@ export function watchProgress(
 ): () => void {
   if (!onProgress) return () => {};
   return subscribe("progress", (payload) => {
-    const p = (payload ?? {}) as Record<string, unknown>;
+    const p = asRecord(payload);
     const event: ProgressEvent = {
       step: String(p.step ?? ""),
       pct: asNumber(p.pct ?? p.progress),
     };
-    const sub = p.sub as Record<string, unknown> | undefined;
-    if (sub && typeof sub === "object") {
+    const sub = p.sub;
+    if (isRecord(sub)) {
       const done = asNumber(sub.done, NaN);
       const total = asNumber(sub.total, NaN);
       if (Number.isFinite(done) && Number.isFinite(total)) {

@@ -5,6 +5,7 @@ import { toast } from "./ui";
 import { getRecentDirs, recordRecentDirFor } from "./settings";
 import type { Info } from "./types";
 import type { ViewerScene } from "./viewer";
+import { errMessage } from "./guards";
 
 export interface BusEvents {
   /** legacy: optimize source changed (same payload as "source") */
@@ -59,7 +60,7 @@ export class App {
       const res = await this.bridge.openDialogAt(dir);
       return res.path;
     } catch (err) {
-      toast(t("toast.openFailed", { message: (err as Error).message }), "error");
+      toast(t("toast.openFailed", { message: errMessage(err) }), "error");
       return null;
     }
   }

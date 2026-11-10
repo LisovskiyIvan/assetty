@@ -11,6 +11,7 @@ import type {
 } from "./types";
 import type { PresetEntry } from "./bridge/types";
 import type { ProgressEvent } from "./bridge/types";
+import { errMessage } from "./guards";
 
 const helmetImages = [
   {
@@ -420,7 +421,7 @@ export class DemoBackend {
     try {
       JSON.parse(text);
     } catch (err) {
-      throw new Error(`invalid settings JSON: ${(err as Error).message}`);
+      throw new Error(`invalid settings JSON: ${errMessage(err)}`);
     }
     try {
       window.localStorage.setItem(DEMO_SETTINGS_KEY, text);

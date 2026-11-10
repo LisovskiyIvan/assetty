@@ -19,6 +19,7 @@ import type { Language, SettingsStatus, ThemeMode } from "../settings";
 import { clear, el } from "../ui";
 import type { PresetEntry } from "../bridge";
 import type { TabHandle } from "./types";
+import { errMessage } from "../guards";
 
 /**
  * Settings tab: a UI-first editor for `assetty.settings.json`.
@@ -209,7 +210,7 @@ export function mountSettings(): TabHandle {
     } catch (err) {
       if (seq !== updInfoSeq) return;
       updInfo = null;
-      updView = { kind: "error", message: t("upd.loadFail", { message: (err as Error).message }) };
+      updView = { kind: "error", message: t("upd.loadFail", { message: errMessage(err) }) };
     }
     renderUpd();
   }
@@ -233,7 +234,7 @@ export function mountSettings(): TabHandle {
         app.toast(t("upd.demo"), "error");
         updView = { kind: "error", message: t("upd.demo") };
       } else {
-        const message = (err as Error).message;
+        const message = errMessage(err);
         app.toast(t("upd.checkFail", { message }), "error");
         updView = { kind: "error", message: t("upd.checkFail", { message }) };
       }
@@ -264,7 +265,7 @@ export function mountSettings(): TabHandle {
         app.toast(t("upd.demo"), "error");
         updView = { kind: "error", message: t("upd.demo") };
       } else {
-        const message = (err as Error).message;
+        const message = errMessage(err);
         app.toast(t("upd.applyFail", { message }), "error");
         updView = { kind: "error", message: t("upd.applyFail", { message }) };
       }
@@ -378,7 +379,7 @@ export function mountSettings(): TabHandle {
       jsonError.textContent = "";
       defaultsForm.sync();
     } catch (err) {
-      jsonError.textContent = (err as Error).message;
+      jsonError.textContent = errMessage(err);
     }
   });
 
@@ -532,7 +533,7 @@ export function mountSettings(): TabHandle {
     try {
       entries = await app.bridge.presets();
     } catch (err) {
-      app.toast(t("set.presetsFail", { message: (err as Error).message }), "error");
+      app.toast(t("set.presetsFail", { message: errMessage(err) }), "error");
       entries = [];
     }
     active = null;
@@ -548,7 +549,7 @@ export function mountSettings(): TabHandle {
     try {
       presetZon.value = await app.bridge.presetLoad(name);
     } catch (err) {
-      presetZon.value = t("set.presetLoadFail", { message: (err as Error).message });
+      presetZon.value = t("set.presetLoadFail", { message: errMessage(err) });
     } finally {
       presetZon.disabled = false;
       presetSaveBtn.disabled = !app.bridge.live || presetBusy;
@@ -570,7 +571,7 @@ export function mountSettings(): TabHandle {
       }
       setPresetStatus(t("set.presetSaved", { name: active }));
     } catch (err) {
-      setPresetStatus(t("set.presetSaveFail", { message: (err as Error).message }), true);
+      setPresetStatus(t("set.presetSaveFail", { message: errMessage(err) }), true);
     } finally {
       presetBusy = false;
       presetSaveBtn.disabled = !app.bridge.live;

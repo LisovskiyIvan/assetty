@@ -126,6 +126,9 @@ export interface EncodeSettings {
   max_size?: number;
   generate_mips?: boolean;
   normal_map?: boolean;
+  supercompression?: "none" | "zstd";
+  /** Row-level "do not encode" marker from optimize overrides. */
+  skip?: boolean;
 }
 
 export interface EncodeResult {

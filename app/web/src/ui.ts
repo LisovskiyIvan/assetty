@@ -1,5 +1,5 @@
 /** Tiny DOM helpers — keeps the tab modules readable without a framework. */
-import { t } from "./i18n";
+import { lang, t } from "./i18n";
 
 type Attrs = Record<string, unknown>;
 
@@ -14,7 +14,6 @@ export function el<K extends keyof HTMLElementTagNameMap>(
       if (value == null || value === false) continue;
       if (key === "class") node.className = String(value);
       else if (key === "text") node.textContent = String(value);
-      else if (key === "html") node.innerHTML = String(value);
       else if (key === "dataset") Object.assign(node.dataset, value as object);
       else if (key.startsWith("on") && typeof value === "function") {
         node.addEventListener(key.slice(2).toLowerCase(), value as EventListener);
@@ -53,7 +52,7 @@ export function fmtBytes(n: number | undefined | null): string {
 
 export function fmtNum(n: number | undefined | null): string {
   if (n == null || !Number.isFinite(n)) return "—";
-  return n.toLocaleString("en-US");
+  return n.toLocaleString(lang() === "ru" ? "ru-RU" : "en-US");
 }
 
 /** Compact integer for the status bar: 948, 15.4K, 1.2M. */
@@ -148,17 +147,39 @@ export function kv(pairs: Array<[string, string | HTMLElement]>): HTMLElement {
 }
 
 let toastHost: HTMLElement | null = null;
+/** Pending auto-dismiss timers, cleared on manual dismiss or cap eviction. */
+const toastTimers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+const TOAST_LIMIT = 3;
 
 export function toast(message: string, kind: "info" | "ok" | "error" = "info", ms = 3600): void {
   if (!toastHost) {
     toastHost = el("div", { class: "toasts" });
     document.body.append(toastHost);
   }
+  const remove = (node: HTMLElement): void => {
+    const timer = toastTimers.get(node);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      toastTimers.delete(node);
+    }
+    node.remove();
+  };
+  while (toastHost.children.length >= TOAST_LIMIT) {
+    remove(toastHost.children[0] as HTMLElement);
+  }
   const node = el("div", { class: `toast ${kind === "info" ? "" : kind}`, text: message });
+  if (kind === "error") {
+    node.setAttribute("role", "alert");
+  } else {
+    node.setAttribute("role", "status");
+    node.setAttribute("aria-live", "polite");
+  }
   toastHost.append(node);
-  const remove = () => node.remove();
-  setTimeout(remove, ms);
-  node.addEventListener("click", remove);
+  toastTimers.set(
+    node,
+    setTimeout(() => remove(node), ms),
+  );
+  node.addEventListener("click", () => remove(node));
 }
 
 export function spinner(label: string): HTMLElement {

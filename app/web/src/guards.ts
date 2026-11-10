@@ -12,6 +12,14 @@ export function isBusyError(err: unknown): boolean {
   return /\bbusy\b|already running|job in progress/i.test(text);
 }
 
+/** Best-effort message for anything thrown (Error, string, or other). */
+export function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err === null || err === undefined) return "unknown error";
+  return String(err);
+}
+
 /** Re-exported from jobs.ts (DOM-free, unit-testable); guards.ts keeps the import path. */
 export { isCancelledError } from "./jobs";
 
@@ -43,7 +51,7 @@ export function notifyJobError(
   busyText: string,
   failText: (message: string) => string,
 ): void {
-  notify(isBusyError(err) ? busyText : failText((err as Error).message), "error");
+  notify(isBusyError(err) ? busyText : failText(errMessage(err)), "error");
 }
 
 /**
@@ -111,7 +119,7 @@ export async function pickSaveTarget(outPath: string): Promise<string | null> {
   try {
     pick = await app.bridge.pickSavePath(basename(outPath));
   } catch (err) {
-    notify(t("opt.saveDlgFail", { message: (err as Error).message }), "error");
+    notify(t("opt.saveDlgFail", { message: errMessage(err) }), "error");
     return null;
   }
   if (!pick.path) return null; // cancel
@@ -129,6 +137,6 @@ export function notifyExportError(err: unknown): void {
   } else if (isMissingMethodError(err)) {
     notify(t("opt.exportNoHost"), "error");
   } else {
-    notify(t("opt.exportFail", { message: (err as Error).message }), "error");
+    notify(t("opt.exportFail", { message: errMessage(err) }), "error");
   }
 }

@@ -21,6 +21,7 @@ import type { Scene } from "@babylonjs/core/scene";
 import { t } from "./i18n";
 import { notify } from "./notify";
 import { themeMode } from "./settings";
+import { errMessage } from "./guards";
 
 interface InspectorToken {
   dispose(): Promise<void>;
@@ -91,7 +92,7 @@ export class InspectorDock {
       this.token = null;
       this.scene = null;
       this.onChange?.(false);
-      notify(t("toast.inspectorFail", { message: (err as Error).message }), "error");
+      notify(t("toast.inspectorFail", { message: errMessage(err) }), "error");
       return false;
     } finally {
       this.busy = false;
@@ -111,7 +112,7 @@ export class InspectorDock {
       try {
         await token.dispose();
       } catch (err) {
-        notify(t("toast.inspectorCloseFail", { message: (err as Error).message }), "error");
+        notify(t("toast.inspectorCloseFail", { message: errMessage(err) }), "error");
       }
     }
     this.onChange?.(false);

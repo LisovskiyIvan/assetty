@@ -11,6 +11,14 @@ import { onLang, t } from "../i18n";
 import { ViewerScene } from "../viewer";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { TabHandle } from "./types";
+import { errMessage } from "../guards";
+
+/**
+ * Generation counter: every `view` event / loadPath entry bumps it, and each
+ * async reply checks its own id before touching the UI, so a stale
+ * loadBytes/info reply can never overwrite a newer file's view.
+ */
+let viewSeq = 0;
 
 export function mountViewer(): TabHandle {
   const root = el("div", { class: "tab-body canvas-only" });
@@ -48,6 +56,8 @@ export function mountViewer(): TabHandle {
   }
 
   async function loadPath(path: string): Promise<void> {
+    const seq = ++viewSeq;
+    const stale = (): boolean => seq !== viewSeq;
     const v = viewer;
     if (!v) return;
     label.textContent = path;
@@ -55,28 +65,37 @@ export function mountViewer(): TabHandle {
     try {
       if (app.bridge.live) {
         const b64 = await app.bridge.loadBytes(path);
+        if (stale()) return;
         await v.loadBase64(b64);
+        if (stale()) return;
         // Successful viewer model load: the shell opens the inspector.
         // (Demo and failed loads stay quiet.)
         window.dispatchEvent(new CustomEvent("assetty:viewer-loaded"));
       } else {
         v.loadDemo();
       }
+      if (stale()) return;
       openHint.hidden = true;
       label.textContent = app.bridge.live ? path : t("viewer.demoScenePath", { path });
     } catch (err) {
-      app.toast(t("viewer.loadFailedMsg", { message: (err as Error).message }), "error");
+      if (stale()) return;
+      app.toast(t("viewer.loadFailedMsg", { message: errMessage(err) }), "error");
       label.textContent = t("viewer.loadFailed");
       openHint.hidden = false;
     } finally {
-      showLoading(false);
+      // A superseded reply must not hide the newer load's spinner.
+      if (!stale()) showLoading(false);
     }
 
+    if (stale()) return;
     try {
-      app.setInfo(await app.bridge.info(path));
+      const info = await app.bridge.info(path);
+      if (stale()) return;
+      app.setInfo(info);
     } catch (err) {
+      if (stale()) return;
       app.setInfo(null);
-      app.toast(t("viewer.infoFailed", { message: (err as Error).message }), "error");
+      app.toast(t("viewer.infoFailed", { message: errMessage(err) }), "error");
     }
 
     if (!pickedBound) {
@@ -111,7 +130,7 @@ export function mountViewer(): TabHandle {
             openHint.hidden = false;
           }
         } catch (err) {
-          const reason = (err as Error).message;
+          const reason = errMessage(err);
           wrap.append(el("div", { class: "empty", text: t("viewer.webglFail", { reason }) }));
           app.toast(t("viewer.webglFail", { reason }), "error");
         }

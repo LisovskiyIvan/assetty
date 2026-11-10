@@ -4,6 +4,7 @@ import { isMissingMethodError, notify } from "../../notify";
 import { onLang, t } from "../../i18n";
 import { el, fmtBytes } from "../../ui";
 import {
+  errMessage,
   createSeq,
   createSettingsEdit,
   isBusyError,
@@ -208,7 +209,7 @@ export function mountTextures(): TabHandle {
       clearPreviewTimer();
       const missing = isMissingMethodError(err);
       const busy = isBusyError(err);
-      const message = busy ? t("tex.previewBusy") : (err as Error).message;
+      const message = busy ? t("tex.previewBusy") : errMessage(err);
       previewError = missing ? t("tex.notSupported") : message;
       previewErrorIndex = index;
       notify(
@@ -305,7 +306,7 @@ export function mountTextures(): TabHandle {
       accepted = (await app.bridge.cancelJob()).cancelled;
     } catch (err) {
       failed = true;
-      notify(t("job.cancelFail", { message: (err as Error).message }), "error");
+      notify(t("job.cancelFail", { message: errMessage(err) }), "error");
     }
     if (activeEncode?.token !== token) return; // finished while the RPC flew
     if (!accepted) {
@@ -358,6 +359,12 @@ export function mountTextures(): TabHandle {
     const path = app.viewPath;
     const img = images.find((i) => i.index === selected);
     if (!path || !img || activeEncode) return;
+    if (effectiveFor(img).skip) {
+      // the row is marked "skip" in optimize overrides — encoding it anyway
+      // would ship exactly what the user excluded from the optimize step
+      notify(t("tex.skipped"), "info");
+      return;
+    }
     const other = getJob();
     if (other.kind !== null) {
       notify(t("job.busyNote", { job: t(jobLabelKey(other.kind)) }), "error");
@@ -483,7 +490,7 @@ export function mountTextures(): TabHandle {
         const res = await app.bridge.textures(path ?? "/demo/DamagedHelmet.glb");
         images = res.images.slice().sort((a, b) => a.index - b.index);
       } catch (err) {
-        notify(t("tex.texturesFail", { message: (err as Error).message }), "error");
+        notify(t("tex.texturesFail", { message: errMessage(err) }), "error");
       }
     }
     /* Keep the selection when the same image survives the reload, else deselect. */

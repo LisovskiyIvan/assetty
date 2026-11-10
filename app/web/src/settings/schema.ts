@@ -1,6 +1,7 @@
 /** Settings schema: types, defaults, and tolerant/strict file normalization (no I/O, no DOM). */
 import { detectLanguage } from "../i18n";
 import type { Lang } from "../i18n";
+import { errMessage } from "../guards";
 export type ThemeMode = "dark" | "light";
 export type Language = Lang;
 export type TextureFormat = "auto" | "etc1s" | "uastc";
@@ -911,7 +912,7 @@ export function parseSettingsText(text: string): Settings {
   try {
     raw = JSON.parse(trimmed);
   } catch (err) {
-    throw new SettingsError(`invalid JSON: ${(err as Error).message}`);
+    throw new SettingsError(`invalid JSON: ${errMessage(err)}`);
   }
   return mergeSettings(raw, true);
 }

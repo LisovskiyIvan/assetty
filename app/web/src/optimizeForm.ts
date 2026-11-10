@@ -25,80 +25,6 @@ export interface OptimizeForm {
   sync(): void;
 }
 
-/**
- * One-liner help for every property in the step forms (single source: the
- * Optimize step blocks and the Settings defaults both render from here; the
- * compare-mode toggle and the texture override editors reuse it too).
- * Pattern: what it does + what it affects (quality / disk / VRAM / draws).
- */
-export const FIELD_HELP: Record<string, string> = {
-  "prune.unused_nodes":
-    "Drops nodes unreachable from any scene at serialize time. Smaller file and a shorter node hierarchy; rendering is unchanged.",
-  "prune.unused_materials":
-    "Drops materials no mesh references. Smaller file and a shorter material list; rendering is unchanged.",
-  "prune.unused_textures":
-    "Drops images and samplers no material references. Smaller file and less texture memory reserved; rendering is unchanged.",
-  "prune.animations":
-    "Strips every animation track from the output. Animated nodes stay as static scene nodes and skeleton/skin data is kept; the file is smaller and loads faster. Re-run from the source to get animations back — results never mutate the source.",
-  "dedup.accessors":
-    "Merges byte-identical GPU buffers so they are stored once. Smaller disk size and less VRAM; rendering is unchanged.",
-  "dedup.meshes":
-    "Merges meshes with identical primitives into a single definition. Smaller file; rendering is unchanged.",
-  "dedup.materials":
-    "Merges materials with identical parameters into one. Smaller file and fewer state changes, which can reduce draw calls; rendering is unchanged.",
-  "weld.tolerance":
-    "Merges vertices closer than this distance (0 = exact matches only). Higher values close tiny cracks and shrink the vertex buffer, but may weld UV seams and shift positions slightly.",
-  join: "Merges mesh primitives that share a material into fewer draw calls. Fewer draws, but coarser per-mesh culling — distant parts of a joined mesh stay resident.",
-  "simplify.target_ratio":
-    "Fraction of triangles to keep (0.5 = half). Fewer triangles render faster and use less memory, at some loss of silhouette detail.",
-  "simplify.error_tolerance":
-    "Maximum allowed visual error for the decimation. Higher values let the simplifier remove more at the same ratio, trading fidelity for size.",
-  "simplify.aggressive":
-    "Allows topology changes during decimation. Simplifies more aggressively (smaller file, fewer triangles) but accepts larger local error.",
-  "simplify.lock_borders":
-    "Keeps UV-shell and mesh borders fixed during decimation. Prevents seams cracking open; the mesh compresses slightly less.",
-  "simplify.use_attributes":
-    "Weighs normal and UV error during decimation (seam-aware). Preserves shading and UV islands better, at the cost of keeping more triangles.",
-  "simplify.weight_normal":
-    "How strongly normal distortion is penalized when seam-aware mode is on. Higher values protect shading smoothness but keep more triangles.",
-  "simplify.weight_uv":
-    "How strongly UV distortion is penalized when seam-aware mode is on. Higher values protect texture mapping but keep more triangles.",
-  "textures.format":
-    "GPU texture codec: auto picks per target, ETC1S is smallest with fast transcode (lossy), UASTC is higher quality but a bigger file. Affects disk size and GPU decode cost.",
-  "textures.quality":
-    "ETC1S encoder quality, 1–255. Higher values preserve detail but compress worse (bigger KTX2); lower values trade visible artifacts for disk savings.",
-  "textures.max_size":
-    "Downscales the longest side to this many pixels (0 = original). Halving each side quarters VRAM and disk use, at a loss of texture sharpness.",
-  "textures.generate_mips":
-    "Generates the mip chain for minified sampling. Sharper, shimmer-free minification at ~33% more VRAM; almost always keep on.",
-  "textures.normal_map":
-    "Encodes with normal-map settings (renormalization, no sRGB). Required for correct lighting on normal maps; using it on color textures washes them out.",
-  "textures.supercompression":
-    "Zstd-compresses the UASTC KTX2 payload (supercompressionScheme=2). 20–40% smaller files at the same pixels — no VRAM change — but the loader must support KTX2 zstd supercompression (Babylon.js does). UASTC only; ignored for ETC1S.",
-  "quantize.position_bits":
-    "Quantizes vertex positions to this many bits (14 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
-  "quantize.uv_bits":
-    "Quantizes texture coordinates to this many bits (12 ≈ near-lossless). Big VRAM and disk win for a tiny precision loss; needs KHR_mesh_quantization support.",
-  "quantize.normal_oct":
-    "Packs normals with octahedral encoding (2×8/16-bit instead of 3 floats). Much smaller vertex buffers; needs extension support — very old viewers may render it wrong.",
-  compress:
-    "Meshopt-compresses every eligible vertex and index buffer view (EXT_meshopt_compression, gltfpack -cc style) — including plain float geometry the quantize step left untouched. Much smaller disk size at identical vertices; the loader must support EXT_meshopt_compression.",
-  "animops.remove_constant_tracks":
-    "Drops animation channels whose every keyframe is identical, baking the value into the static node transform. Smaller file and faster load; the motion is unchanged. Re-run from the source to get the tracks back.",
-  "animops.epsilon":
-    "Per-component tolerance for the constant-track check. Larger values drop more tracks but risk flattening subtle motion; 0.00001 keeps only truly static tracks.",
-  "compare.mode":
-    "Side by side shows source and result next to each other; split slider stacks them with a draggable wipe. Both views stay camera-synced while you orbit.",
-  "textures.overrides_note":
-    "Per-texture overrides replace the base params for single images of this model only, and merge into the textures step on Run. Edit them per image in the Textures tab.",
-  "textures.apply_rules":
-    "First-match-wins auto rules: each image is classified by its material slot (normal, arm, occlusion, emissive, base color) and name suffix, and the first matching rule replaces the base params. Per-image overrides still win over rules.",
-  "textures.reencode_ktx2":
-    "Transcode already-KTX2 sources and re-encode them like any image. Off = KTX2 images are skipped as today.",
-  "textures.rules":
-    "Editable JSON array of auto rules (first match wins per image). Reset restores the project-derived table. Saved into settings and every JSON preset.",
-};
-
 /* ------------------------------------------------- help popover (singleton) */
 
 let helpPop: HTMLElement | null = null;
@@ -149,10 +75,11 @@ function toggleFieldHelp(anchor: HTMLElement, id: string): void {
     return;
   }
   closeFieldHelp();
-  if (!FIELD_HELP[id]) return;
-  // Localized at open time, so a language switch applies to the next open
-  // even without a rebuild (the tabs also rebuild the form on `lang`).
-  const text = t(`help.${id}`);
+  // Single source is i18n `help.*` (FIELD_HELP was a stale EN duplicate):
+  // t() falls back to the key itself, so unknown ids stay closed.
+  const key = `help.${id}`;
+  const text = t(key);
+  if (!text || text === key) return;
   wireHelpOnce();
   const pop = el("div", { class: "field-help-pop", text });
   pop.setAttribute("role", "note");
@@ -181,7 +108,7 @@ function toggleFieldHelp(anchor: HTMLElement, id: string): void {
   helpAnchor = anchor;
 }
 
-/** Small "?" icon-button; opens the FIELD_HELP popover for `id` on click. */
+/** Small "?" icon-button; opens the i18n `help.*` popover for `id` on click. */
 export function fieldHelpButton(id: string): HTMLElement {
   wireHelpOnce();
   const btn = el("button", {

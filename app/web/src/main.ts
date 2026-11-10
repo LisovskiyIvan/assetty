@@ -26,6 +26,7 @@ import { mountOptimize } from "./tabs/optimize";
 import { mountTextures } from "./tabs/textures";
 import { mountSettings } from "./tabs/settings";
 import type { TabHandle } from "./tabs/types";
+import { errMessage } from "./guards";
 
 configureKtx2();
 configureMeshopt();
@@ -168,11 +169,13 @@ async function renderRecentMenu(): Promise<void> {
             );
           }
         })
-        .catch(() => {
+        .catch((err) => {
           loading = false;
           loaded = false;
           clear(filesHost);
           filesHost.append(el("div", { class: "recent-empty", text: t("topbar.noModelsInDir") }));
+          console.error("listDir failed:", err);
+          notify(t("toast.openFailed", { message: errMessage(err) }), "error");
         });
     });
     recentMenu.append(el("div", { class: "recent-group" }, row, filesHost));
@@ -258,6 +261,12 @@ async function handleDroppedFile(file: File): Promise<void> {
     notify(t("drop.badExt", { name: file.name }), "error");
     return;
   }
+  // The whole file is base64-encoded into one host string: refuse absurdly
+  // large drops instead of ballooning the message (~4/3 of the file).
+  if (file.size > 64 * 1024 * 1024) {
+    notify(t("drop.failed", { message: `${file.name} (${fmtBytes(file.size)})` }), "error");
+    return;
+  }
   let slowTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     slowTimer = null;
     notify(t("drop.opening", { name: file.name }), "info");
@@ -269,7 +278,7 @@ async function handleDroppedFile(file: File): Promise<void> {
     if (!res.path) return; // cancel-ish
     app.openSource(res.path);
   } catch (err) {
-    notify(t("drop.failed", { message: (err as Error).message }), "error");
+    notify(t("drop.failed", { message: errMessage(err) }), "error");
   } finally {
     if (slowTimer) {
       clearTimeout(slowTimer);
@@ -380,11 +389,20 @@ async function toggleInspector(): Promise<void> {
     selectTab("viewer");
   }
   const scene = app.viewer?.scene ?? null;
-  await inspectorDock.toggle(scene);
-  // A manual toggle is an explicit preference: persist it (a no-scene toggle
-  // only reports the missing model and must not clobber the stored value).
-  if (scene) setInspectorOpenPref(inspectorDock.isOpen);
-  syncInspectorChrome();
+  // The inspector lazy-loads its bundle: show the busy state so a second
+  // click during the import isn't silently swallowed.
+  inspectorBtn.disabled = true;
+  inspectorBtn.setAttribute("aria-busy", "true");
+  try {
+    await inspectorDock.toggle(scene);
+    // A manual toggle is an explicit preference: persist it (a no-scene toggle
+    // only reports the missing model and must not clobber the stored value).
+    if (scene) setInspectorOpenPref(inspectorDock.isOpen);
+  } finally {
+    inspectorBtn.disabled = false;
+    inspectorBtn.removeAttribute("aria-busy");
+    syncInspectorChrome();
+  }
 }
 
 const status = {
@@ -548,7 +566,7 @@ function selectTab(id: TabId): void {
       content.append(
         el("div", {
           class: "empty",
-          text: t("topbar.mountFailed", { id, message: (err as Error).message }),
+          text: t("topbar.mountFailed", { id, message: errMessage(err) }),
         }),
       );
       return;
@@ -666,6 +684,9 @@ app.on("context", () => updateStatusBar());
 
 // Apply the persisted theme + optimize defaults before the first tab mounts.
 const settingsReady = loadSettings();
+// i18n sets <html lang> on setLang, but the first paint happens before the
+// settings round-trip resolves: pin it now so RU users get `ru` immediately.
+document.documentElement.lang = lang();
 
 selectTab("viewer");
 

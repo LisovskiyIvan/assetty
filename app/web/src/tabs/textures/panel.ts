@@ -77,6 +77,7 @@ export function effectiveFor(img: ImageInfo): EncodeSettings {
       quality: b.quality,
       max_size: b.max_size,
       generate_mips: b.generate_mips,
+      supercompression: b.supercompression,
     };
   }
   const eff = effectiveTextureParams(src, img.index, img.name);
@@ -87,6 +88,8 @@ export function effectiveFor(img: ImageInfo): EncodeSettings {
     generate_mips: eff.generate_mips,
   };
   if (eff.normal_map !== undefined) out.normal_map = eff.normal_map;
+  if (eff.supercompression !== undefined) out.supercompression = eff.supercompression;
+  if (eff.skip) out.skip = true;
   return out;
 }
 

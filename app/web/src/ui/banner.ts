@@ -19,7 +19,7 @@ export function copyPathButton(path: string): HTMLElement {
   });
 }
 
-/** "Reveal" button that copies the path (the Textures apply-result style). */
+/** "Copy path" button for the Textures apply-result style. */
 export function revealButton(path: string): HTMLElement {
   return el("button", {
     class: "small",

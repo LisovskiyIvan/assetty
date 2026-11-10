@@ -14,14 +14,27 @@ import { CubeTexture } from "@babylonjs/core/Materials/Textures/cubeTexture";
 import type { AnimationGroup } from "@babylonjs/core/Animations/animationGroup";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { Material } from "@babylonjs/core/Materials/material";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
+import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
-// Full 2.0 extension set (viewer previews arbitrary user GLBs: unlit,
-// texture transform, punctual lights, quantization, etc.) + the SceneLoader
-// plugin. Drops only the legacy glTF 1.0 loader and validation. Meshopt and
-// KHR_texture_basisu stay registered (meshopt also via meshopt.ts).
+// Curated glTF 2.0 extensions (viewer previews arbitrary user GLBs: unlit,
+// texture transform, punctual lights, quantization, spec-gloss legacy,
+// instancing, webp/avif, meshopt, basisu/KTX2) + the SceneLoader plugin.
+// Drops the legacy glTF 1.0 loader, validation, and KHR_draco_mesh_compression:
+// no Draco decoder is wired (see meshopt.ts/ktx2.ts), so Draco files cannot
+// decode either way. Meshopt is also registered via meshopt.ts (duplicate
+// side-effect imports are deduped and keep this module self-sufficient).
 import "@babylonjs/loaders/glTF/glTFFileLoader";
-import "@babylonjs/loaders/glTF/2.0";
+import "@babylonjs/loaders/glTF/2.0/Extensions/EXT_meshopt_compression";
+import "@babylonjs/loaders/glTF/2.0/Extensions/EXT_mesh_gpu_instancing";
+import "@babylonjs/loaders/glTF/2.0/Extensions/EXT_texture_webp";
+import "@babylonjs/loaders/glTF/2.0/Extensions/EXT_texture_avif";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_texture_basisu";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_texture_transform";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_mesh_quantization";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_materials_unlit";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_materials_emissive_strength";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_materials_pbrSpecularGlossiness";
+import "@babylonjs/loaders/glTF/2.0/Extensions/KHR_lights_punctual";
 import { b64ToBytes } from "./bridge";
 import { t } from "./i18n";
 import { notify } from "./notify";
@@ -70,8 +83,14 @@ export class ViewerScene {
     return this.loadedModel;
   }
   private envWatchdog: ReturnType<typeof setTimeout> | null = null;
+  /** Fallback that starts the IBL upload when no frame was ever rendered. */
+  private setupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Pending texture-audit timers (cleared on dispose). */
+  private auditTimers: Array<ReturnType<typeof setTimeout>> = [];
+  /** Bumped on dispose: audit callbacks holding a stale id exit silently. */
+  private auditGen = 0;
 
-  onProgress?: (label: string) => void;
+  onProgress?: (label: string | null) => void;
 
   constructor(canvas: HTMLCanvasElement, label = "scene") {
     this.canvas = canvas;
@@ -145,8 +164,7 @@ export class ViewerScene {
     this.requestRender(30);
 
     // Snapshot the engine's per-frame draw call counter (otherwise it accumulates).
-    const drawCounter = (this.engine as unknown as { _drawCalls?: { fetchNewFrame?: () => void } })
-      ._drawCalls;
+    const drawCounter = this.engineDrawCounter();
     if (drawCounter?.fetchNewFrame) {
       this.scene.onBeforeRenderObservable.add(() => drawCounter.fetchNewFrame?.());
     }
@@ -181,10 +199,14 @@ export class ViewerScene {
     const start = (): void => {
       if (started || this.disposed) return;
       started = true;
+      if (this.setupTimer !== null) {
+        clearTimeout(this.setupTimer);
+        this.setupTimer = null;
+      }
       this.setupEnvironment();
     };
     this.scene.onAfterRenderObservable.addOnce(start);
-    setTimeout(start, 400);
+    this.setupTimer = setTimeout(start, 400);
   }
 
   private setupEnvironment(): void {
@@ -289,15 +311,15 @@ export class ViewerScene {
 
   async loadBytes(bytes: Uint8Array): Promise<void> {
     this.clearScene();
-    this.loadedModel = true;
     SceneLoader.ShowLoadingScreen = false;
     this.onProgress?.("parsing glb…");
     const container = await LoadAssetContainerAsync(bytes, this.scene, { pluginExtension: ".glb" });
     container.addAllToScene();
+    this.loadedModel = true;
     container.animationGroups.forEach((g) => g.stop());
     this.frameAll();
     this.forceResize();
-    this.onProgress?.(undefined as unknown as string);
+    this.onProgress?.(null);
     this.requestRender(30);
     this.scheduleTextureAudit();
   }
@@ -309,14 +331,22 @@ export class ViewerScene {
    * surface the names.
    */
   private scheduleTextureAudit(): void {
+    const gen = this.auditGen;
+    const later = (fn: () => void, ms: number): void => {
+      const id = setTimeout(() => {
+        this.auditTimers = this.auditTimers.filter((t) => t !== id);
+        fn();
+      }, ms);
+      this.auditTimers.push(id);
+    };
     const check = (attempt: number): void => {
-      if (this.disposed) return;
+      if (this.disposed || gen !== this.auditGen) return;
       const bad = this.scene.textures.filter(
         (t) => t.getClassName() !== "RenderTargetTexture" && !t.isReady(),
       );
       if (bad.length === 0) return;
       if (attempt < 2) {
-        setTimeout(() => check(attempt + 1), 2000);
+        later(() => check(attempt + 1), 2000);
         return;
       }
       const names =
@@ -332,7 +362,7 @@ export class ViewerScene {
         "error",
       );
     };
-    setTimeout(() => check(0), 1500);
+    later(() => check(0), 1500);
   }
 
   /** Snapshot used by the debug hook and the inspector-less diagnostics. */
@@ -466,11 +496,30 @@ export class ViewerScene {
     };
   }
 
+  /** Babylon's private per-frame draw-call counter (shape varies by build):
+   * single choke point, so no call site pokes `engine._drawCalls` directly. */
+  private engineDrawCounter(): { fetchNewFrame?: () => void; current?: number } | undefined {
+    try {
+      return (
+        this.engine as unknown as {
+          _drawCalls?: { fetchNewFrame?: () => void; current?: number };
+        }
+      )._drawCalls;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Current-frame draw calls, when the engine exposes its private counter. */
+  private drawCalls(): number | undefined {
+    const current = this.engineDrawCounter()?.current;
+    return typeof current === "number" ? current : undefined;
+  }
+
   getStats(): ViewerStats {
     const active = this.scene.getActiveMeshes();
     const indices = this.scene.getActiveIndices();
-    const engineAny = this.engine as unknown as { _drawCalls?: { current?: number } };
-    const drawCalls = engineAny._drawCalls?.current ?? active.length;
+    const drawCalls = this.drawCalls() ?? active.length;
     const materials = new Set<Material>();
     for (const mesh of this.scene.meshes) {
       if (mesh.material) materials.add(mesh.material);
@@ -509,7 +558,8 @@ export class ViewerScene {
     }
     const color = new Color3(0.31, 0.64, 1);
     // HighlightLayer only accepts concrete meshes; instanced/abstract nodes are skipped.
-    const asMesh = (m: AbstractMesh) => (m.getTotalVertices() > 0 ? (m as unknown as Mesh) : null);
+    const asMesh = (m: AbstractMesh): Mesh | null =>
+      m instanceof Mesh && m.getTotalVertices() > 0 ? m : null;
     const target = asMesh(mesh);
     if (target) this.highlight.addMesh(target, color);
     for (const child of mesh.getChildMeshes(false)) {
@@ -538,8 +588,14 @@ export class ViewerScene {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.auditGen++;
+    for (const id of this.auditTimers) clearTimeout(id);
+    this.auditTimers = [];
+    if (this.setupTimer !== null) clearTimeout(this.setupTimer);
+    this.setupTimer = null;
     if (this.envWatchdog) clearTimeout(this.envWatchdog);
     this.envWatchdog = null;
+    (this.camera as ArcRotateCamera | null)?.detachControl();
     this.inputAbort.abort();
     window.removeEventListener("resize", this.resize);
     this.resizeObserver.disconnect();
@@ -549,8 +605,10 @@ export class ViewerScene {
   }
 }
 
-/** Links two scenes so panning/zooming one mirrors on the other. */
-export function linkCameras(a: ViewerScene, b: ViewerScene): void {
+/** Links two scenes so panning/zooming one mirrors on the other.
+ * Returns an unlink function; call it before disposing either scene so
+ * repeated scene switches don't accumulate observers. */
+export function linkCameras(a: ViewerScene, b: ViewerScene): () => void {
   let busy = false;
   const mirror = (from: ViewerScene, to: ViewerScene) => {
     if (busy) return;
@@ -566,6 +624,10 @@ export function linkCameras(a: ViewerScene, b: ViewerScene): void {
       busy = false;
     }
   };
-  a.camera.onViewMatrixChangedObservable.add(() => mirror(a, b));
-  b.camera.onViewMatrixChangedObservable.add(() => mirror(b, a));
+  const o1 = a.camera.onViewMatrixChangedObservable.add(() => mirror(a, b));
+  const o2 = b.camera.onViewMatrixChangedObservable.add(() => mirror(b, a));
+  return () => {
+    a.camera.onViewMatrixChangedObservable.remove(o1);
+    b.camera.onViewMatrixChangedObservable.remove(o2);
+  };
 }
