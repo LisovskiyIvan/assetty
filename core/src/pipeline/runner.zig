@@ -53,6 +53,11 @@ pub const StepStatus = struct {
     note: []const u8 = "", // e.g. "not implemented, skipped"
     /// Wall time spent inside this step's dispatch, in seconds.
     secs: f32 = 0,
+    /// True when the step ran but could not do its job (the textures step
+    /// failed to encode, for example). The run continues and the file is
+    /// written, but the caller must not read the output as "everything the
+    /// preset asked for happened": the textures stay uncompressed.
+    failed: bool = false,
 };
 
 pub const Report = struct {
@@ -276,9 +281,14 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
                     .index = i,
                     .n_steps = n_steps,
                 }) catch |err| {
+                    // The step failed but the run goes on: the file is still
+                    // written (geometry work is not lost). The step is marked
+                    // failed so the caller can tell "the textures stayed
+                    // PNG" apart from "the textures step was skipped".
                     break :blk .{
                         .kind = kind,
                         .applied = false,
+                        .failed = true,
                         .note = try std.fmt.allocPrint(a, "failed: {s}", .{@errorName(err)}),
                     };
                 };
@@ -307,9 +317,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     // before the after-stats reload maps + parses the file again, instead of
     // sitting in the caller's arena next to a second copy of the model.
     var ser_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    // The arena holds the whole serialized output: it must be released on
+    // every path, including a failing write (a leaked arena leaks the tens
+    // of MiB it holds).
+    defer ser_arena.deinit();
     const bytes = try write.serialize(ser_arena.allocator(), loaded.cdata, loaded.map);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = opts.out_path, .data = bytes });
-    ser_arena.deinit();
     // A cancel that landed mid-run must not leave a half-adopted output
     // behind — unless the file predates this run (see above).
     if (isCancelled(opts)) {
