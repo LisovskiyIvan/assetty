@@ -127,6 +127,26 @@ describe("normalizeOptimize", () => {
     expect(out.report.before.draw_calls).toBe(2);
     expect(out.report.after.vertices).toBe(6);
   });
+
+  test("throws on malformed step images instead of rendering wrong rows", () => {
+    const bad = (images: unknown) => ({
+      out_path: "a.glb",
+      report: { steps: [{ kind: "textures", applied: true, images }] },
+    });
+    const throws = (images: unknown): boolean => {
+      try {
+        normalizeOptimize(bad(images));
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    expect(throws("nope")).toBe(true);
+    expect(throws([{ index: "0" }])).toBe(true);
+    expect(normalizeOptimize(bad([{ index: 0, skipped: true }])).report.steps[0].images).toEqual([
+      { index: 0, skipped: true },
+    ]);
+  });
 });
 
 describe("normalizeImages", () => {

@@ -112,8 +112,8 @@ export function createReport(cbs: ReportCbs): ReportApi {
         list.append(
           el(
             "div",
-            { class: `step ${s.applied ? "applied" : ""}` },
-            el("span", { class: "mark", text: s.applied ? "✓" : "–" }),
+            { class: `step ${s.applied ? "applied" : ""} ${s.failed ? "failed" : ""}` },
+            el("span", { class: "mark", text: s.applied ? "✓" : s.failed ? "!" : "–" }),
             el("span", { text: s.kind }),
             el("span", { class: "secs", text: fmtSecs(s.secs) }),
             s.note && s.note !== "ok" ? el("span", { class: "note", text: s.note }) : null,

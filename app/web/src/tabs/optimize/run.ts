@@ -1381,8 +1381,12 @@ export function createRunFlow(deps: RunDeps): RunApi {
     const specJson = JSON.stringify({ steps: specSteps });
     stopProgress?.();
     stopProgress = null;
+    if (!claimJob("optimize")) {
+      const owner = getJob().kind;
+      notify(t("job.busyNote", { job: t(jobLabelKey(owner ?? "optimize")) }), "error");
+      return;
+    }
     jobKind = "optimize";
-    claimJob("optimize");
     setRunning(true);
     /* The previous result stays until the new one lands: a cancelled run
      * must not lose it (deps.onRunStarted no longer clears). */
@@ -1494,8 +1498,12 @@ export function createRunFlow(deps: RunDeps): RunApi {
     const specJson = JSON.stringify({ steps: specSteps });
     stopProgress?.();
     stopProgress = null;
+    if (!claimJob("lods")) {
+      const owner = getJob().kind;
+      notify(t("job.busyNote", { job: t(jobLabelKey(owner ?? "lods")) }), "error");
+      return;
+    }
     jobKind = "lods";
-    claimJob("lods");
     setRunning(true);
     deps.onLodsStarted();
     resetSub();

@@ -66,6 +66,8 @@ export interface OptimizeStep {
   kind: string;
   applied: boolean;
   note?: string;
+  /** The step ran but failed (e.g. textures could not be encoded). */
+  failed?: boolean;
   /** Wall-clock seconds this step took (newer hosts). */
   secs?: number;
   /** Per-image rows for the textures step (newer hosts): skipped + effective format. */

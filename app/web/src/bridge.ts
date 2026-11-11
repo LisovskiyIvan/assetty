@@ -28,7 +28,7 @@
  *   discardFile(path)       -> {"ok":true} (only under .zig-cache/assetty-app; missing counts as discarded)
  *   presets()               -> [{ name, kind: "builtin"|"user", file }] (legacy hosts: ["desktop", ...])
  *   presetLoad(name)        -> raw text: zon for built-ins, {"name","steps"} JSON for user presets
- *   presetSave(name, zon)   -> anything (legacy zon write, kept for compat)
+ *   presetSave(name, zon)   -> {"ok":true} | {"error":".."} (legacy zon write, kept for compat)
  *   presetSaveJson(name, json) -> {"ok":true} | {"error":"..."} (validates + writes presets/<name>.json)
  *   presetDelete(name)      -> {"ok":true} | {"error":"..."} (user presets only; built-ins refused)
  *   settingsLoad()          -> raw JSON text of assetty.settings.json (cwd) or "{}"

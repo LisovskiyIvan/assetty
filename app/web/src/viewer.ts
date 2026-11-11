@@ -313,15 +313,21 @@ export class ViewerScene {
     this.clearScene();
     SceneLoader.ShowLoadingScreen = false;
     this.onProgress?.("parsing glb…");
-    const container = await LoadAssetContainerAsync(bytes, this.scene, { pluginExtension: ".glb" });
-    container.addAllToScene();
-    this.loadedModel = true;
-    container.animationGroups.forEach((g) => g.stop());
-    this.frameAll();
-    this.forceResize();
-    this.onProgress?.(null);
-    this.requestRender(30);
-    this.scheduleTextureAudit();
+    try {
+      const container = await LoadAssetContainerAsync(bytes, this.scene, {
+        pluginExtension: ".glb",
+      });
+      container.addAllToScene();
+      this.loadedModel = true;
+      container.animationGroups.forEach((g) => g.stop());
+      this.frameAll();
+      this.forceResize();
+      this.scheduleTextureAudit();
+    } finally {
+      // A throw must not leave the spinner + dark pane stuck on.
+      this.onProgress?.(null);
+      this.requestRender(30);
+    }
   }
 
   /**
@@ -600,6 +606,17 @@ export class ViewerScene {
     window.removeEventListener("resize", this.resize);
     this.resizeObserver.disconnect();
     this.engine.stopRenderLoop();
+    // The inspector dock keeps a token bound to this scene: tell the shell to
+    // detach it first so a disposed scene is never kept alive (main.ts hides
+    // the dock when the event's scene is the bound one; sync dispatch, so the
+    // token/scene refs are cleared before `scene.dispose()` below).
+    try {
+      window.dispatchEvent(
+        new CustomEvent("assetty:scene-disposing", { detail: { scene: this.scene } }),
+      );
+    } catch {
+      // No DOM (bun tests) — nothing bound to detach.
+    }
     this.scene.dispose();
     this.engine.dispose();
   }

@@ -17,6 +17,10 @@ import type {
   TextureEncodeDoneEvent,
   TexturePreviewDoneEvent,
 } from "./types";
+// From the pure leaf, not guards.ts: this module stays free of the app graph
+// (notify/i18n/ui touch `window`) so the normalizers remain unit-testable
+// without a window stub.
+import { assertTextureImageReports } from "../hostShapes";
 
 export function parseMaybeJson(raw: unknown): unknown {
   if (typeof raw === "string") {
@@ -63,14 +67,20 @@ export function normalizeOptimize(raw: unknown): OptimizeResult {
   const stepsRaw = Array.isArray(rep.steps) ? rep.steps : [];
   const steps = stepsRaw.map((s) => {
     const st = asRecord(s);
+    // A present-but-malformed images array is host-contract breakage: throw
+    // instead of silently rendering wrong per-image rows.
+    const rawImages = (st.images ?? undefined) as unknown;
+    const images =
+      rawImages === undefined || assertTextureImageReports(rawImages).length === 0
+        ? undefined
+        : (rawImages as TextureImageReport[]);
     return {
       kind: String(st.kind ?? st.name ?? "step"),
       applied: Boolean(st.applied),
+      failed: st.failed === undefined ? undefined : Boolean(st.failed),
       note: st.note == null ? undefined : String(st.note),
       secs: optNumber(st.secs ?? st.seconds ?? st.duration),
-      images: (Array.isArray(st.images) && st.images.length > 0
-        ? st.images
-        : undefined) as unknown as TextureImageReport[] | undefined,
+      images,
     };
   });
   const before = normalizeStats(rep.before ?? r.before);

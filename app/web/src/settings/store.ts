@@ -24,6 +24,8 @@ let lastSaved = "";
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let saveInflight = false;
 let savePending = false;
+/** Resolvers of saveSettings() callers waiting on the in-flight save. */
+let saveWaiters: Array<() => void> = [];
 let status: SettingsStatus = { state: "idle" };
 
 const SAVE_DEBOUNCE_MS = 500;
@@ -153,8 +155,12 @@ export async function saveSettings(): Promise<boolean> {
     saveTimer = null;
   }
   if (saveInflight) {
+    // A save is already writing: mark the pending flush and wait for it
+    // instead of reporting success early, so the returned boolean reflects
+    // whether the file matches the in-app state when this call returns.
     savePending = true;
-    return true;
+    await new Promise<void>((resolve) => saveWaiters.push(resolve));
+    return settingsToJson(current) === lastSaved;
   }
   saveInflight = true;
   try {
@@ -178,6 +184,9 @@ export async function saveSettings(): Promise<boolean> {
     }
   } finally {
     saveInflight = false;
+    const waiters = saveWaiters;
+    saveWaiters = [];
+    for (const resolve of waiters) resolve();
   }
 }
 

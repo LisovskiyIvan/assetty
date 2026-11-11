@@ -5,6 +5,7 @@
  */
 import { el } from "./ui";
 import { t } from "./i18n";
+import { assertTextureRules } from "./guards";
 import { DEFAULT_TEXTURE_RULES } from "./settings";
 import type { OptimizeSteps, TextureFormat, TextureRule } from "./settings";
 
@@ -639,11 +640,18 @@ export function buildOptimizeForm(host: HTMLElement, opts: OptimizeFormOptions):
               err.textContent = t("opt.rulesInvalid");
               return;
             }
+            let rules;
+            try {
+              rules = assertTextureRules(parsed);
+            } catch {
+              err.textContent = t("opt.rulesInvalid");
+              return;
+            }
             err.textContent = "";
             edit((steps) => {
-              steps.textures.rules = parsed as TextureRule[];
+              steps.textures.rules = rules;
             });
-            count.textContent = t("opt.rulesCount", { n: parsed.length });
+            count.textContent = t("opt.rulesCount", { n: rules.length });
           },
         }) as unknown as HTMLTextAreaElement;
         const reset = el("button", {

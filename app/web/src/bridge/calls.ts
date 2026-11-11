@@ -49,7 +49,13 @@ import type {
   UpdateApply,
   UpdateCheck,
 } from "../types";
-import { errMessage } from "../guards";
+import {
+  errMessage,
+  assertAppInfo,
+  assertInfo,
+  assertUpdateApply,
+  assertUpdateCheck,
+} from "../guards";
 
 export class Bridge {
   readonly native: NativeBackend | null;
@@ -77,7 +83,7 @@ export class Bridge {
 
   async info(path: string): Promise<Info> {
     if (!this.live) return this.demo.info(path);
-    return asRecord(parseMaybeJson(await this.raw("info", [path]))) as unknown as Info;
+    return assertInfo(asRecord(parseMaybeJson(await this.raw("info", [path]))));
   }
 
   async loadBytes(path: string): Promise<string> {
@@ -124,8 +130,10 @@ export class Bridge {
   /**
    * Per-step optimization: `specJson` is a JSON *string* like
    * `{"steps":[{"prune":{}},{"textures":{"format":"auto","quality":128}}]}`.
-   * Older hosts only expose `optimize(path, preset)`; in that case we say so
-   * and fall back to the named preset instead of failing the whole run.
+   * Older hosts only expose `optimize(path, preset)`: in that case this
+   * throws (after notifying) instead of silently running a different
+   * preset — the caller's error path surfaces the failure and the tab
+   * leaves its running state through the normal error flow.
    */
   async optimizeCustom(
     path: string,
@@ -137,23 +145,24 @@ export class Bridge {
       return { started: false, result: await this.demo.optimizeCustom(path, specJson, onProgress) };
     }
     if (!this.native?.methods.includes("optimizeCustom")) {
-      notify(t("toast.noOptimizeCustom", { preset: fallbackPreset }), "error");
-      return this.optimize(path, fallbackPreset, onProgress);
+      const message = t("toast.noOptimizeCustom", { preset: fallbackPreset });
+      notify(message, "error");
+      throw new Error(message);
     }
     try {
       return await this.callOptimize("optimizeCustom", [path, specJson], onProgress);
     } catch (err) {
       if (isMissingMethodError(err)) {
-        notify(
-          t("toast.customFallback", { message: errMessage(err), preset: fallbackPreset }),
-          "error",
-        );
-        return this.optimize(path, fallbackPreset, onProgress);
+        const message = t("toast.customFallback", {
+          message: errMessage(err),
+          preset: fallbackPreset,
+        });
+        notify(message, "error");
+        throw new Error(message);
       }
       throw err;
     }
   }
-
   async textures(path: string): Promise<TexturesResult> {
     if (!this.live) return this.demo.textures();
     return normalizeImages(parseMaybeJson(await this.raw("textures", [path])));
@@ -288,6 +297,10 @@ export class Bridge {
     return String(res ?? "");
   }
 
+  /**
+   * Writes a built-in `.zon` preset. Rejects with the host's message when
+   * the write fails (the host answers `{"ok":true}` or `{"error":".."}`).
+   */
   async presetSave(name: string, zon: string): Promise<void> {
     if (!this.live) return this.demo.presetSave();
     await this.raw("presetSave", [name, zon]);
@@ -356,7 +369,7 @@ export class Bridge {
   async appInfo(): Promise<AppInfo> {
     if (!this.live) return this.demo.appInfo();
     if (!this.native?.methods.includes("appInfo")) throw new Error("backend has no appInfo()");
-    return asRecord(parseMaybeJson(await this.raw("appInfo", []))) as unknown as AppInfo;
+    return assertAppInfo(asRecord(parseMaybeJson(await this.raw("appInfo", []))));
   }
 
   /**
@@ -368,7 +381,7 @@ export class Bridge {
     if (!this.live) return this.demo.updateCheck();
     if (!this.native?.methods.includes("updateCheck"))
       throw new Error("backend has no updateCheck()");
-    return asRecord(parseMaybeJson(await this.raw("updateCheck", []))) as unknown as UpdateCheck;
+    return assertUpdateCheck(asRecord(parseMaybeJson(await this.raw("updateCheck", []))));
   }
 
   /**
@@ -381,7 +394,7 @@ export class Bridge {
     if (!this.live) return this.demo.updateApply();
     if (!this.native?.methods.includes("updateApply"))
       throw new Error("backend has no updateApply()");
-    return asRecord(parseMaybeJson(await this.raw("updateApply", []))) as unknown as UpdateApply;
+    return assertUpdateApply(asRecord(parseMaybeJson(await this.raw("updateApply", []))));
   }
 
   /**

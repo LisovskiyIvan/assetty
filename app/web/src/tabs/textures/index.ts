@@ -371,7 +371,11 @@ export function mountTextures(): TabHandle {
       return;
     }
     const token = encodeSeq.next();
-    claimJob("encode");
+    if (!claimJob("encode")) {
+      const owner = getJob().kind;
+      notify(t("job.busyNote", { job: t(jobLabelKey(owner ?? "encode")) }), "error");
+      return;
+    }
     activeEncode = { token, index: img.index, path };
     cancellingEncode = false;
     renderList();
@@ -419,9 +423,11 @@ export function mountTextures(): TabHandle {
     if (event.index >= 0 && event.index !== active.index) return;
     if (active.path !== app.viewPath) {
       // Model changed while the job ran: the result no longer applies.
+      // Say so instead of dropping it silently.
       clearEncodeState();
       renderList();
       renderSide();
+      notify(t("tex.encodeStale", { path: active.path }), "info");
       return;
     }
     if (!event.ok) {

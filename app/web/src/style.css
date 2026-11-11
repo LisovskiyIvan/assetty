@@ -1356,6 +1356,16 @@ tr.selected {
   color: var(--ok);
 }
 
+/* A step that ran but failed (textures could not be encoded): the output
+ * exists, but that step did not do its job. */
+.step.failed .mark {
+  color: var(--warn, var(--error));
+}
+
+.step.failed .note {
+  color: var(--warn, var(--error));
+}
+
 .step .secs {
   grid-column: 3;
   color: var(--text-dim);

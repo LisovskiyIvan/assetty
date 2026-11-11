@@ -99,6 +99,9 @@ function closeRecentMenu(): void {
   clear(recentMenu);
 }
 
+/** Bumped on every renderRecentMenu: stale listDir replies drop out. */
+let recentMenuGen = 0;
+
 async function toggleRecentMenu(): Promise<void> {
   if (!recentMenu.hidden) {
     closeRecentMenu();
@@ -110,6 +113,9 @@ async function toggleRecentMenu(): Promise<void> {
 
 async function renderRecentMenu(): Promise<void> {
   clear(recentMenu);
+  // Generation counter: a re-render replaces every row, so a late listDir
+  // reply from a previous generation must not append to a detached node.
+  const gen = ++recentMenuGen;
   const dirs = getRecentDirs();
   if (dirs.length === 0) {
     recentMenu.append(el("div", { class: "recent-empty", text: t("topbar.noRecentDirs") }));
@@ -143,6 +149,7 @@ async function renderRecentMenu(): Promise<void> {
       void app.bridge
         .listDir(dir)
         .then((entries) => {
+          if (gen !== recentMenuGen || !filesHost.isConnected) return; // stale render
           loading = false;
           loaded = true;
           clear(filesHost);
@@ -170,6 +177,7 @@ async function renderRecentMenu(): Promise<void> {
           }
         })
         .catch((err) => {
+          if (gen !== recentMenuGen || !filesHost.isConnected) return; // stale render
           loading = false;
           loaded = false;
           clear(filesHost);
@@ -617,6 +625,16 @@ for (const def of TAB_DEFS) {
 window.addEventListener("assetty:select-tab", (ev) => {
   const id = (ev as CustomEvent).detail as TabId;
   if (TAB_DEFS.some((t) => t.id === id)) selectTab(id);
+});
+
+// A ViewerScene is going away (Viewer tab dispose, Optimize pane teardown):
+// drop the inspector binding first so its token never keeps a disposed scene
+// alive. The event carries the scene; only the bound one detaches.
+window.addEventListener("assetty:scene-disposing", (ev) => {
+  const scene = (ev as CustomEvent).detail?.scene ?? null;
+  if (scene && inspectorDock.boundScene === scene) {
+    void inspectorDock.detach().then(() => syncInspectorChrome());
+  }
 });
 
 // The Viewer tab dispatches this after a model loads successfully (failed

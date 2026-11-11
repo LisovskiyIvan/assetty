@@ -427,7 +427,11 @@ export function createApplyFlow(nodes: ApplyBarNodes): ApplyFlow {
       return;
     }
     const token = seq.next();
-    claimJob("apply");
+    if (!claimJob("apply")) {
+      const owner = getJob().kind;
+      notify(t("job.busyNote", { job: t(jobLabelKey(owner ?? "apply")) }), "error");
+      return;
+    }
     applyRunning = true;
     cancelling = false;
     applyDone = -1;
