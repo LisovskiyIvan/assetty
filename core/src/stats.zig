@@ -185,7 +185,11 @@ pub fn compute(a: std.mem.Allocator, asset: model.Asset) !Stats {
     for (used_textures, 0..) |u, i| {
         if (!u) continue;
         const tex = asset.textures[i];
-        if (tex.image) |im| used_images[im] = true;
+        // A corrupt asset can point a texture at an image index outside the
+        // pool: the index is checked like every other mark above.
+        if (tex.image) |im| {
+            if (im < used_images.len) used_images[im] = true;
+        }
     }
 
     st.garbage = .{

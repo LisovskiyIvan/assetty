@@ -221,7 +221,11 @@ pub const Bounds = struct {
 /// min/max over a tightly packed FLOAT element stream.
 pub fn f32Bounds(bytes: []const u8, elem: usize, count: usize, ncomp: usize) ?Bounds {
     if (count == 0 or ncomp == 0 or ncomp > 16) return null;
-    if (elem != ncomp * 4 or bytes.len < count * elem) return null;
+    if (elem != ncomp * 4) return null;
+    // Checked: a hostile count must not wrap the byte span into a smaller
+    // value that passes the length guard and then reads out of bounds.
+    const span = std.math.mul(usize, count, elem) catch return null;
+    if (bytes.len < span) return null;
     var out: Bounds = .{};
     for (0..ncomp) |k| {
         out.min[k] = readF32(bytes, k);

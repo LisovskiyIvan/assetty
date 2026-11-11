@@ -161,7 +161,7 @@ pub fn decodeToRgba(a: std.mem.Allocator, ktx2: []const u8) Error!Decoded {
 
     const w: u32 = @intCast(out_w);
     const h: u32 = @intCast(out_h);
-    const n: usize = @as(usize, w) * h * 4;
+    const n = mips.checkedRgbaBytes(w, h) orelse return error.InvalidKtx2;
     const pixels = try a.alloc(u8, n);
     @memcpy(pixels, out_ptr.?[0..n]);
     return .{ .pixels = pixels, .width = w, .height = h };

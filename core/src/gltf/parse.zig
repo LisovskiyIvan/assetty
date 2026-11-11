@@ -45,13 +45,16 @@ fn scanGlbChunks(bytes: []const u8) GlbChunks {
     while (off + 8 <= bytes.len) {
         const clen = std.mem.readInt(u32, bytes[off..][0..4], .little);
         const ctype = std.mem.readInt(u32, bytes[off + 4 ..][0..4], .little);
-        const body: usize = @min(@as(usize, clen), bytes.len - off - 8);
+        const remaining = bytes.len - off - 8;
+        // A chunk that claims more bytes than the file holds is truncated:
+        // stop scanning instead of walking into a misaligned header.
+        if (@as(usize, clen) > remaining) break;
         switch (ctype) {
-            0x4E4F534A => out.json = body, // JSON
-            0x004E4942 => out.bin = body, // BIN
+            0x4E4F534A => out.json = clen, // JSON
+            0x004E4942 => out.bin = clen, // BIN
             else => {},
         }
-        off += 8 + body;
+        off += 8 + @as(usize, clen);
     }
     return out;
 }
@@ -353,19 +356,22 @@ fn convMode(t: c_uint) model.Mode {
     };
 }
 
-fn convComponent(t: c_uint) model.ComponentType {
+/// cgltf stores the component type as its own enum (`r_8` = 1 … `r_32f` = 6),
+/// not as the glTF JSON number. An unknown value means a corrupt accessor:
+/// it is rejected instead of being reinterpreted as float32.
+fn convComponent(t: c.cgltf_component_type) !model.ComponentType {
     return switch (t) {
-        5120 => .i8,
-        5121 => .u8,
-        5122 => .i16,
-        5123 => .u16,
-        5125 => .u32,
-        5126 => .f32,
-        else => .f32,
+        1 => .i8, // BYTE
+        2 => .u8, // UNSIGNED_BYTE
+        3 => .i16, // SHORT
+        4 => .u16, // UNSIGNED_SHORT
+        5 => .u32, // UNSIGNED_INT
+        6 => .f32, // FLOAT
+        else => error.InvalidGlb,
     };
 }
 
-fn convDim(t: c_uint) model.Dim {
+fn convDim(t: c.cgltf_type) !model.Dim {
     return switch (t) {
         1 => .scalar,
         2 => .vec2,
@@ -374,7 +380,7 @@ fn convDim(t: c_uint) model.Dim {
         5 => .mat2,
         6 => .mat3,
         7 => .mat4,
-        else => .scalar,
+        else => error.InvalidGlb,
     };
 }
 
@@ -626,8 +632,8 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
                     .semantic = semanticOf(attr.type),
                     .semantic_index = std.math.cast(u32, @max(attr.index, 0)) orelse return error.AccessorOutOfRange,
                     .count = std.math.cast(u32, acc.*.count) orelse return error.AccessorOutOfRange,
-                    .component = convComponent(acc.*.component_type),
-                    .dim = convDim(acc.*.type),
+                    .component = try convComponent(acc.*.component_type),
+                    .dim = try convDim(acc.*.type),
                 };
                 if (attr.type == 1) vertex_count = std.math.cast(u32, acc.*.count) orelse return error.AccessorOutOfRange;
             }

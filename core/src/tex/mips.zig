@@ -12,11 +12,19 @@ pub const Error = error{
     InvalidImage,
 } || std.mem.Allocator.Error;
 
+/// `w * h * 4` without overflow: null when the byte count does not fit a
+/// `usize` (a hostile width/height must not wrap into a small allocation).
+pub fn checkedRgbaBytes(w: u32, h: u32) ?usize {
+    const px = std.math.mul(usize, @as(usize, w), @as(usize, h)) catch return null;
+    return std.math.mul(usize, px, 4) catch null;
+}
+
 /// Box-filter downscale by an integer `factor` (>= 1). Edge pixels average the
 /// clipped source region, so arbitrary dimensions are supported.
 pub fn downscaleRgba(a: std.mem.Allocator, src: []const u8, w: u32, h: u32, factor: u32) Error!Scaled {
     if (w == 0 or h == 0 or factor == 0) return error.InvalidImage;
-    const need = @as(usize, w) * h * 4;
+    // Checked multiply: a hostile image size must not wrap the byte count.
+    const need = checkedRgbaBytes(w, h) orelse return error.InvalidImage;
     if (src.len < need) return error.InvalidImage;
     if (factor == 1) {
         const pixels = try a.dupe(u8, src[0..need]);
@@ -25,7 +33,8 @@ pub fn downscaleRgba(a: std.mem.Allocator, src: []const u8, w: u32, h: u32, fact
 
     const dw: u32 = @max(1, (w + factor - 1) / factor);
     const dh: u32 = @max(1, (h + factor - 1) / factor);
-    const pixels = try a.alloc(u8, @as(usize, dw) * dh * 4);
+    const out_bytes = checkedRgbaBytes(dw, dh) orelse return error.InvalidImage;
+    const pixels = try a.alloc(u8, out_bytes);
     errdefer a.free(pixels);
 
     var dy: u32 = 0;

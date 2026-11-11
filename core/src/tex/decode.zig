@@ -1,4 +1,5 @@
 const std = @import("std");
+const mips = @import("mips.zig");
 
 pub const Info = struct { width: u32, height: u32, components: u32 };
 
@@ -79,7 +80,10 @@ pub fn decodeRgba(gpa: std.mem.Allocator, bytes: []const u8) ?Decoded {
             basset_webp_free(raw);
             return null;
         }
-        const n: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+        const n = mips.checkedRgbaBytes(@intCast(w), @intCast(h)) orelse {
+            basset_webp_free(raw);
+            return null;
+        };
         const pixels = gpa.alloc(u8, n) catch {
             basset_webp_free(raw);
             return null;
@@ -100,7 +104,10 @@ fn stbDecode(gpa: std.mem.Allocator, bytes: []const u8) ?Decoded {
         basset_image_free(raw);
         return null;
     }
-    const n: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    const n = mips.checkedRgbaBytes(@intCast(w), @intCast(h)) orelse {
+        basset_image_free(raw);
+        return null;
+    };
     const pixels = gpa.alloc(u8, n) catch {
         basset_image_free(raw);
         return null;
@@ -128,7 +135,7 @@ extern fn basset_png_free(p: [*]u8) void;
 /// The stb buffer is freed here, so the caller only ever sees a Zig slice.
 pub fn encodePngRgba(gpa: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) EncodeError![]u8 {
     if (w == 0 or h == 0) return error.InvalidImage;
-    const need = @as(usize, w) * h * 4;
+    const need = mips.checkedRgbaBytes(w, h) orelse return error.InvalidImage;
     if (rgba.len < need) return error.InvalidImage;
 
     var c_out: ?[*]u8 = null;
