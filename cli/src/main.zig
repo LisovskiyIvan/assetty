@@ -726,6 +726,10 @@ fn printOptimizeHuman(
     for (rep.steps) |st| {
         if (st.applied) {
             try w.print("  [{s}] applied — {s}\n", .{ st.kind, st.note });
+        } else if (st.failed) {
+            // A failed step is not a skipped one: the output exists, but the
+            // step did not do its job (textures stayed PNG, for example).
+            try w.print("  [{s}] FAILED — {s}\n", .{ st.kind, st.note });
         } else {
             const note = if (std.mem.eql(u8, st.note, "not implemented, skipped"))
                 "not implemented"
@@ -745,92 +749,9 @@ fn printOptimizeHuman(
     try printByteRow(w, "disk size", rep.before.disk_total, rep.after.disk_total);
 }
 
-/// Same shape as the app's `writeOptimize` (see app/src/json.zig), so one
-/// consumer parses both: per-step `"secs"`, the `"animations"` delta, the
-/// `"before"`/`"after"` snapshots and top-level `"total_secs"`. The only
-/// deliberate delta is `"texture_images"`, which is always present here (empty
-/// when the preset has no overrides) instead of omitted.
-fn printOptimizeJson(
-    w: anytype,
-    file_path: []const u8,
-    out_path: []const u8,
-    p: core.preset.Preset,
-    rep: core.runner.Report,
-) !void {
-    try w.writeAll("{\n  \"preset\": ");
-    try jsonStr(w, p.name);
-    try w.print(",\n  \"target\": \"{s}\"", .{@tagName(p.target)});
-    try w.writeAll(",\n  \"input\": ");
-    try jsonStr(w, file_path);
-    try w.writeAll(",\n  \"output\": ");
-    try jsonStr(w, out_path);
-
-    try w.writeAll(",\n  \"steps\": [");
-    for (rep.steps, 0..) |st, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.writeAll("\n    {\"kind\": ");
-        try jsonStr(w, st.kind);
-        try w.print(", \"applied\": {s}, \"note\": ", .{if (st.applied) "true" else "false"});
-        try jsonStr(w, st.note);
-        try w.print(", \"secs\": {d:.4}", .{st.secs});
-        // The textures step also carries the per-image rows (same data as the
-        // root `texture_images`, placed on the step where the page looks).
-        if (std.mem.eql(u8, st.kind, "textures") and rep.texture_images.len > 0) {
-            try w.writeAll(", \"images\": [");
-            for (rep.texture_images, 0..) |im, j| {
-                if (j > 0) try w.writeByte(',');
-                try w.print("{{\"index\":{d},\"name\":", .{im.index});
-                try jsonStrOpt(w, im.name);
-                try w.writeAll(",\"format\":");
-                try jsonStr(w, im.format);
-                try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
-            }
-            try w.writeByte(']');
-        }
-        try w.writeByte('}');
-    }
-    try w.writeAll("\n  ],\n  \"deltas\": {");
-
-    try w.writeAll("\n    \"triangles\": ");
-    try deltaJson(w, rep.before.triangles, rep.after.triangles);
-    try w.writeAll(",\n    \"vertices\": ");
-    try deltaJson(w, rep.before.vertices, rep.after.vertices);
-    try w.writeAll(",\n    \"draw_calls\": ");
-    try deltaJson(w, rep.before.draw_calls, rep.after.draw_calls);
-    try w.writeAll(",\n    \"vram_bytes\": ");
-    try deltaJson(w, rep.before.vram_total, rep.after.vram_total);
-    try w.writeAll(",\n    \"disk_bytes\": ");
-    try deltaJson(w, rep.before.disk_total, rep.after.disk_total);
-    try w.writeAll(",\n    \"animations\": ");
-    try deltaJson(w, rep.before.animations, rep.after.animations);
-    try w.writeAll("\n  },\n  \"before\": {\"triangles\":");
-    try w.print("{d},\"vertices\":{d},\"draw_calls\":{d},\"vram\":{d},\"disk\":{d}", .{
-        rep.before.triangles,
-        rep.before.vertices,
-        rep.before.draw_calls,
-        rep.before.vram_total,
-        rep.before.disk_total,
-    });
-    try w.writeAll("},\n  \"after\": {\"triangles\":");
-    try w.print("{d},\"vertices\":{d},\"draw_calls\":{d},\"vram\":{d},\"disk\":{d}", .{
-        rep.after.triangles,
-        rep.after.vertices,
-        rep.after.draw_calls,
-        rep.after.vram_total,
-        rep.after.disk_total,
-    });
-    try w.writeAll("},\n  \"texture_images\": [");
-    for (rep.texture_images, 0..) |im, i| {
-        if (i > 0) try w.writeByte(',');
-        try w.print("\n    {{\"index\":{d},\"name\":", .{im.index});
-        try jsonStrOpt(w, im.name);
-        try w.writeAll(",\"format\":");
-        try jsonStr(w, im.format);
-        try w.print(",\"skipped\":{s}}}", .{if (im.skipped) "true" else "false"});
-    }
-    try w.writeAll(if (rep.texture_images.len > 0) "\n  ]" else "]");
-    try w.print(", \n  \"total_secs\": {d:.3}\n}}\n", .{rep.total_secs});
-}
+/// The optimize report JSON — one writer shared with the app backend (see
+/// core/src/report_json.zig), so one consumer parses both.
+const printOptimizeJson = core.report_json.writeOptimize;
 
 /// Render one file's report object (see `printOptimizeJson`).
 fn renderSingleReport(
@@ -1017,6 +938,7 @@ fn runSingle(
     const w = &wtr.interface;
     try printOptimizeHuman(w, file_path, out_path, p, rep);
     try w.flush();
+    warnFailedSteps(file_path, rep);
 
     if (report_arg) |rp| {
         const doc = try renderSingleReport(a, file_path, out_path, p, rep);
@@ -1027,6 +949,17 @@ fn runSingle(
     }
 
     return 0;
+}
+
+/// A step that ran but failed (the textures could not be encoded, for
+/// example) leaves a valid file on disk, but not the one the preset asked
+/// for. Say so on stderr: stdout carries the report, stderr carries the
+/// warning a script or a human notices.
+fn warnFailedSteps(file_path: []const u8, rep: core.runner.Report) void {
+    for (rep.steps) |st| {
+        if (!st.failed) continue;
+        std.debug.print("optimize: {s}: step '{s}' failed ({s}) — the output was written, but not as the preset asked\n", .{ file_path, st.kind, st.note });
+    }
 }
 
 /// Many files: each runs from its own source into `--out-dir` (or the input's
@@ -1080,6 +1013,7 @@ fn runBatch(
             continue;
         };
         try printOptimizeHuman(w, file_path, out_path, p, rep);
+        warnFailedSteps(file_path, rep);
         try entries.append(a, try renderSingleReport(a, file_path, out_path, p, rep));
         succeeded += 1;
         total_secs += rep.total_secs;
