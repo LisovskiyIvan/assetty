@@ -33,6 +33,18 @@ jobs:
           path: app/web/dist
           if-no-files-found: error
 
+  format:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      # The project's own Zig sources must be formatted. `zig-pkg` holds
+      # vendored dependencies (not ours to format), so it is left out.
+      - name: zig fmt --check
+        run: zig fmt --check app cli core test tools main.zig build.zig
+
   test:
     needs: frontend
     strategy:
@@ -61,6 +73,32 @@ jobs:
       - run: touch app/web/dist/index.html
       - run: zig build test --summary all
 
+  fuzz:
+    # The malformed-GLB corpus: every file must be handled cleanly (an
+    # error, never a crash or a hang). The corpus is generated, not stored.
+    needs: frontend
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-fuzz-${{ hashFiles('build.zig', 'build.zig.zon', 'vendor/**') }}
+          restore-keys: zig-fuzz-
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: app/web/dist
+      - run: touch app/web/dist/index.html
+      - run: zig build -Dapp=false --summary all
+      - run: python3 test/fuzz_corpus.py
+      - run: sh test/fuzz_run.sh
+
   build-windows:
     needs: frontend
     runs-on: windows-latest
@@ -83,6 +121,10 @@ jobs:
       # Artifact mtimes can predate checkout — build.zig's staleness check
       # compares against dist/index.html, so keep it newest.
       - run: touch app/web/dist/index.html
+      # The test suite runs on Windows too: the app backend is
+      # platform-independent, and a Windows-only regression should not wait
+      # for the next release.
+      - run: zig build test --summary all
       # Explicit gnu target: same cross config the release matrix ships, and
       # it does not depend on the runner's MSVC environment.
       - run: zig build -Dtarget=x86_64-windows-gnu --summary all
