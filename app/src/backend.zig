@@ -64,9 +64,28 @@ const paths = @import("paths.zig");
 /// File name the save panel starts with when the caller suggests none.
 const default_save_name = "model.opt.glb";
 
+/// Writes `data` to `path` atomically: the bytes go into a temporary file
+/// next to the destination and are renamed over it, so a crash (or a full
+/// disk) can never leave a half-written file behind.
+fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer atomic.deinit(io);
+
+    var buf: [8192]u8 = undefined;
+    var fw = atomic.file.writer(io, &buf);
+    try fw.interface.writeAll(data);
+    try fw.flush();
+    try atomic.replace(io);
+}
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Set by `shutdown` before the windows are torn down: a delivery that
+    /// runs after it must not touch the app any more. Per instance, so two
+    /// backends in one process (the app and a test) do not shut each other
+    /// down.
+    shutting_down: std.atomic.Value(bool) = .init(false),
     /// The background run in flight, if any: `optimize`/`optimizeCustom` and
     /// `textureEncode` share this one gate.
     job: ?*Job = null,
@@ -365,8 +384,11 @@ pub const Backend = struct {
         return self.presetLoadImpl(call.arena, name);
     }
 
-    /// Writes `presets/<name>.zon`; true on success.
-    pub fn presetSave(self: *Backend, call: *Call, name: []const u8, zon: []const u8) !bool {
+    /// Writes `presets/<name>.zon`: `{"ok":true}` or `{"error":".."}`.
+    ///
+    /// The reply carries the reason on failure: the page shows it, and a
+    /// plain `false` would be swallowed (the caller has nothing to report).
+    pub fn presetSave(self: *Backend, call: *Call, name: []const u8, zon: []const u8) !json.Raw {
         return self.presetSaveImpl(call.arena, name, zon);
     }
 
@@ -722,10 +744,19 @@ pub const Backend = struct {
     fn presetsIn(self: *Backend, a: std.mem.Allocator, dir: []const u8) !json.Raw {
         const Entry = struct { name: []const u8, kind: []const u8, file: []const u8 };
         var list: std.ArrayList(Entry) = .empty;
-        var d = std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true }) catch return json.raw("[]");
+        var d = std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true }) catch |err| switch (err) {
+            // A missing directory means "no presets here"; any other failure
+            // is reported instead of being swallowed into an empty list.
+            error.FileNotFound => return json.raw("[]"),
+            else => return json.errorRaw(a, "presets {s}: {s}", .{ dir, @errorName(err) }),
+        };
         defer d.close(self.io);
         var it = d.iterate();
-        while (it.next(self.io) catch null) |e| {
+        // A read error mid-iteration ends the list — but it is an error, not
+        // an empty list: the caller must not read a partial list as complete.
+        while (it.next(self.io) catch |err| {
+            return json.errorRaw(a, "presets {s}: {s}", .{ dir, @errorName(err) });
+        }) |e| {
             if (e.kind != .file and e.kind != .sym_link) continue;
             var stem: ?[]const u8 = null;
             var kind: ?[]const u8 = null;
@@ -798,13 +829,20 @@ pub const Backend = struct {
         };
     }
 
-    fn presetSaveImpl(self: *Backend, a: std.mem.Allocator, name: []const u8, zon: []const u8) !bool {
-        _ = a;
+    fn presetSaveImpl(self: *Backend, a: std.mem.Allocator, name: []const u8, zon: []const u8) !json.Raw {
+        return self.presetSaveTo(a, "presets", name, zon);
+    }
+
+    /// Writes the `.zon` text atomically to `<dir>/<name>.zon`. `dir` is
+    /// `"presets"` live; tests inject a scratch dir.
+    fn presetSaveTo(self: *Backend, a: std.mem.Allocator, dir: []const u8, name: []const u8, zon: []const u8) !json.Raw {
         if (!validPresetName(name)) return error.InvalidPresetName;
-        var buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrint(&buf, "presets/{s}.zon", .{name});
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = zon }) catch return false;
-        return true;
+        const path = try std.fmt.allocPrint(a, "{s}/{s}.zon", .{ dir, name });
+        // Atomic write, like the JSON preset and the settings file: a crash
+        // mid-write must not leave a half-written preset behind.
+        writeFileAtomic(self.io, path, zon) catch |err|
+            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        return json.raw("{\"ok\":true}");
     }
 
     fn presetSaveJsonImpl(self: *Backend, a: std.mem.Allocator, name: []const u8, preset_json: []const u8) !json.Raw {
@@ -826,17 +864,7 @@ pub const Backend = struct {
             .err => |msg| return json.errorRaw(a, "{s}", .{msg}),
         }
         const jpath = try std.fmt.allocPrint(a, "{s}/{s}.json", .{ dir, name });
-        var atomic = std.Io.Dir.cwd().createFileAtomic(self.io, jpath, .{ .replace = true }) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
-        defer atomic.deinit(self.io);
-
-        var buf: [8192]u8 = undefined;
-        var fw = atomic.file.writer(self.io, &buf);
-        fw.interface.writeAll(preset_json) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
-        fw.flush() catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
-        atomic.replace(self.io) catch |err|
+        writeFileAtomic(self.io, jpath, preset_json) catch |err|
             return json.errorRaw(a, "{s}: {s}", .{ jpath, @errorName(err) });
         return json.raw("{\"ok\":true}");
     }
@@ -885,17 +913,7 @@ pub const Backend = struct {
             return json.errorRaw(a, "invalid settings JSON", .{});
         parsed.deinit();
 
-        var atomic = std.Io.Dir.cwd().createFileAtomic(self.io, path, .{ .replace = true }) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        defer atomic.deinit(self.io);
-
-        var buf: [8192]u8 = undefined;
-        var fw = atomic.file.writer(self.io, &buf);
-        fw.interface.writeAll(text) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        fw.flush() catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
-        atomic.replace(self.io) catch |err|
+        writeFileAtomic(self.io, path, text) catch |err|
             return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
         return json.raw("{\"ok\":true}");
     }
@@ -922,7 +940,7 @@ pub const Backend = struct {
     fn updateCheckImpl(self: *Backend, a: std.mem.Allocator, feed: ?[]const u8) !json.Raw {
         const f = feed orelse try update.feedDefault(a, config.repo);
         const c = update.check(a, self.io, f, config.repo, update.asset_name, update.comparable(config.version)) catch |err|
-            return json.errorRaw(a, "update check: {s}", .{@errorName(err)});
+            return json.errorRaw(a, "update check: {s}", .{update.errorText(err)});
         var aw: std.Io.Writer.Allocating = .init(a);
         errdefer aw.deinit();
         const w = &aw.writer;
@@ -989,7 +1007,9 @@ pub const Backend = struct {
     /// the fresh program takes over after. No-op without an app (tests).
     fn quitSoon(target: Target) void {
         const app = target.app orelse return;
-        nanoui.App.onMain(app, quitApp);
+        // nanoui 0.14: false = never queued (main loop going away) — quitting
+        // then is moot, the process is ending anyway.
+        _ = nanoui.App.onMain(app, quitApp);
     }
 
     fn quitApp(ctx: ?*anyopaque) callconv(.c) void {
@@ -1145,14 +1165,16 @@ pub const Backend = struct {
     /// Worker thread: runs the delivery, which hops to the main thread.
     fn deliver(self: *Backend, job: *Job) void {
         if (self.on_job_done) |cb| return cb(self.on_job_done_ctx, job);
-        nanoui.App.onMain(job, delivered);
+        // nanoui 0.14: false = never queued (main loop going away) — like the
+        // in-flight run shutdown skips, the process is ending anyway.
+        _ = nanoui.App.onMain(job, delivered);
     }
 
     /// Drops the app's claim on finished jobs: call before `App.destroy`.
     /// A run still in flight is not waited for (it may take a minute); its
     /// delivery is skipped and the process is ending anyway.
-    pub fn shutdown(_: *Backend) void {
-        shutting_down.store(true, .release);
+    pub fn shutdown(self: *Backend) void {
+        self.shutting_down.store(true, .release);
     }
 };
 
@@ -1183,19 +1205,28 @@ const SpawnError = error{ Busy, OutOfMemory, SpawnFailed };
 
 /// Where a job's events go: the page's window and, through it, the app. Both
 /// are null in tests, which use `Backend.on_job_done` instead.
+///
+/// The window's page and surface are captured here (while the window is
+/// certainly alive) so that liveness can be checked later without touching
+/// freed memory: a closed window is freed, and the allocator may hand its
+/// address to the next window. Comparing the page/surface identity tells the
+/// two apart.
 const Target = struct {
     window: ?*nanoui.Window = null,
     app: ?*nanoui.App = null,
+    page: ?*const anyopaque = null,
+    surface: ?*const anyopaque = null,
 
     fn of(window: ?*nanoui.Window) Target {
         const w = window orelse return .{};
-        return .{ .window = w, .app = w.app };
+        return .{
+            .window = w,
+            .app = w.app,
+            .page = if (w.page) |p| @ptrCast(p) else null,
+            .surface = if (w.surface) |s| @ptrCast(s) else null,
+        };
     }
 };
-
-/// Set by `Backend.shutdown` before the windows are torn down: a delivery that
-/// runs after it must not touch the app any more.
-var shutting_down: std.atomic.Value(bool) = .init(false);
 
 /// Sequence for unique run-owned LOD staging dirs (`lods_<nanos>_<seq>`).
 var lod_stage_seq: std.atomic.Value(u64) = .init(0);
@@ -1849,6 +1880,8 @@ const Job = struct {
             .gpa = self.gpa,
             .app = app,
             .window = window,
+            .target = self.target,
+            .shutdown = &self.backend.shutting_down,
             .step = copy,
             .pct = pct,
             .sub = if (eff_sub) |s| .{ .label = s.label, .done = s.done, .total = s.total } else null,
@@ -1865,6 +1898,8 @@ const Job = struct {
             .gpa = self.gpa,
             .app = app,
             .window = window,
+            .target = self.target,
+            .shutdown = &self.backend.shutting_down,
             .line = copy,
         });
         if (!posted) self.gpa.free(copy);
@@ -1872,7 +1907,18 @@ const Job = struct {
 
     fn fail(self: *Job, comptime fmt: []const u8, args: anytype) void {
         self.result = null;
-        const text: []const u8 = std.fmt.bufPrint(&self.err_buf, fmt, args) catch "";
+        // A message that does not fit is truncated, not dropped: the cause
+        // (the first bytes) is what the user needs to see.
+        const text: []const u8 = std.fmt.bufPrint(&self.err_buf, fmt, args) catch blk: {
+            const partial = std.fmt.bufPrint(self.err_buf[0 .. self.err_buf.len - 1], fmt, args) catch blk2: {
+                // Even the truncated form does not fit: keep a marker so the
+                // page says "the error was too long" instead of nothing.
+                const marker = "error message too long";
+                @memcpy(self.err_buf[0..marker.len], marker);
+                break :blk2 marker;
+            };
+            break :blk partial;
+        };
         self.err_len = text.len;
     }
 
@@ -1912,12 +1958,16 @@ const Job = struct {
 
 /// Runs `Msg.run` on the main thread soon: `nanoui.App.onMain` is
 /// `dispatch_async_f` on the main queue, the only thread the page (and the
-/// window list) may be touched from. False when out of memory.
+/// window list) may be touched from. False when out of memory or (nanoui
+/// 0.14) when the call was never queued — the main loop is going away. In
+/// both cases the message struct is freed here; callers free their own
+/// payload copies when told `false`.
 fn postToMain(comptime Msg: type, gpa: std.mem.Allocator, msg: Msg) bool {
     const p = gpa.create(Msg) catch return false;
     p.* = msg;
-    nanoui.App.onMain(p, Msg.run);
-    return true;
+    if (nanoui.App.onMain(p, Msg.run)) return true;
+    gpa.destroy(p);
+    return false;
 }
 
 const ProgressMsg = struct {
@@ -1925,6 +1975,10 @@ const ProgressMsg = struct {
     gpa: std.mem.Allocator,
     app: *nanoui.App,
     window: *nanoui.Window,
+    /// The window identity captured when the job started (see `Target`).
+    target: Target,
+    /// The backend's shutdown flag (see `Backend.shutting_down`).
+    shutdown: *const std.atomic.Value(bool),
     step: []u8,
     pct: f32,
     sub: ?events.ProgressSub = null,
@@ -1934,8 +1988,8 @@ const ProgressMsg = struct {
         const gpa = self.gpa;
         defer gpa.destroy(self);
         defer gpa.free(self.step);
-        if (shutting_down.load(.acquire)) return;
-        if (!windowAlive(self.app, self.window)) return;
+        if (self.shutdown.load(.acquire)) return;
+        if (!windowAlive(self.app, self.window, self.target)) return;
         events.Progress.emit(self.window, .{ .step = self.step, .pct = self.pct, .sub = self.sub });
     }
 };
@@ -1944,6 +1998,10 @@ const LogMsg = struct {
     gpa: std.mem.Allocator,
     app: *nanoui.App,
     window: *nanoui.Window,
+    /// The window identity captured when the job started (see `Target`).
+    target: Target,
+    /// The backend's shutdown flag (see `Backend.shutting_down`).
+    shutdown: *const std.atomic.Value(bool),
     line: []u8,
 
     fn run(ctx: ?*anyopaque) callconv(.c) void {
@@ -1951,8 +2009,8 @@ const LogMsg = struct {
         const gpa = self.gpa;
         defer gpa.destroy(self);
         defer gpa.free(self.line);
-        if (shutting_down.load(.acquire)) return;
-        if (!windowAlive(self.app, self.window)) return;
+        if (self.shutdown.load(.acquire)) return;
+        if (!windowAlive(self.app, self.window, self.target)) return;
         events.Log.emit(self.window, .{ .line = self.line });
     }
 };
@@ -1962,7 +2020,7 @@ fn delivered(ctx: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(ctx));
     job.backend.releaseJob(job);
     defer job.destroy();
-    if (shutting_down.load(.acquire)) return;
+    if (job.backend.shutting_down.load(.acquire)) return;
     const window = liveWindow(job) orelse return;
     if (job.result) |result| {
         switch (result) {
@@ -2057,15 +2115,26 @@ fn emitFailure(job: *Job, window: *nanoui.Window) void {
 fn liveWindow(job: *const Job) ?*nanoui.Window {
     const app = job.target.app orelse return null;
     const window = job.target.window orelse return null;
-    if (windowAlive(app, window)) return window;
+    if (windowAlive(app, window, job.target)) return window;
     return null;
 }
 
-/// Whether `window` is still in the app's list. It is removed (and freed) when
-/// it closes, so the main thread can tell without touching the window itself.
-fn windowAlive(app: *nanoui.App, window: *nanoui.Window) bool {
+/// Whether `window` is still the app's live window. It is removed (and
+/// freed) when it closes, so the main thread can tell without touching the
+/// window itself.
+///
+/// The pointer alone is not enough: a freed window's address can be handed
+/// out again to the next window, and the stale pointer would then match the
+/// new one. The page and surface captured with the job (`target`) tell the
+/// two apart: a different window has different ones.
+fn windowAlive(app: *nanoui.App, window: *nanoui.Window, target: Target) bool {
     for (app.windows.items) |live| {
-        if (live == window) return true;
+        if (live != window) continue;
+        // Same address: make sure it is the same window and not a new one
+        // that happens to sit where the old one was freed.
+        const live_page: ?*const anyopaque = if (live.page) |p| @ptrCast(p) else null;
+        const live_surface: ?*const anyopaque = if (live.surface) |s| @ptrCast(s) else null;
+        return live_page == target.page and live_surface == target.surface;
     }
     return false;
 }
@@ -2690,6 +2759,31 @@ test "user presets: save, list, load, delete round-trip" {
     try testing.expectError(error.PresetNotFound, b.presetLoadFrom(a, dir, "mine"));
 }
 
+test "builtin presets: the .zon write is atomic and reports the reason" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try seedPresetDir(a, &tmp);
+
+    const saved = try b.presetSaveTo(a, dir, "mine", ".{ .name = \"mine\" }");
+    try testing.expectEqualStrings("{\"ok\":true}", saved.text);
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.allocPrint(a, "{s}/mine.zon", .{dir}), a, .limited(max_text_bytes));
+    try testing.expectEqualStrings(".{ .name = \"mine\" }", on_disk);
+
+    // A write that cannot land reports why, instead of a bare "false" the
+    // caller cannot explain to the user.
+    const missing = try b.presetSaveTo(a, try std.fmt.allocPrint(a, "{s}/nope", .{dir}), "mine", ".{}");
+    try testing.expect(std.mem.indexOf(u8, missing.text, "\"error\"") != null);
+    try testing.expect(std.mem.indexOf(u8, missing.text, "nope") != null);
+
+    // A bad name is refused before anything is written.
+    try testing.expectError(error.InvalidPresetName, b.presetSaveTo(a, dir, "../escape", ".{}"));
+}
+
 test "user presets: garbage fails validation, builtins are read-only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2801,14 +2895,23 @@ test "appInfo reports the build version and this platform's asset" {
     try testing.expectEqualStrings(update.asset_name, o.get("asset").?.string);
 }
 
-/// A feed dir holding only `manifest.json` (check never downloads archives).
+/// A feed dir holding only a signed `manifest.json` (check never downloads
+/// archives). The signature uses the test key the updater trusts.
 fn writeFeedManifest(a: std.mem.Allocator, feed: []const u8, version: []const u8) !void {
     const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const text = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, update.asset_name, sha });
+    try writeFeedManifestText(a, feed, text);
+}
+
+/// Writes a manifest and its detached signature into the feed dir.
+fn writeFeedManifestText(a: std.mem.Allocator, feed: []const u8, text: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = text });
+    const sig = try core.update_key.signForTest(a, testing.io, text);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json.sig", .{feed}), .data = sig });
 }
 
 test "updateCheck finds a newer file feed, quiet when current" {
+    core.update_key.useTestKey();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2843,6 +2946,7 @@ test "updateCheck finds a newer file feed, quiet when current" {
 }
 
 test "updateApply reports up-to-date without touching the exe" {
+    core.update_key.useTestKey();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2865,6 +2969,7 @@ test "updateApply reports up-to-date without touching the exe" {
 }
 
 test "updateApply installs, relaunches the probe and reports restarted" {
+    core.update_key.useTestKey();
     if (builtin.os.tag == .windows) return error.SkipZigTest; // the fake program is a shell script
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2937,7 +3042,7 @@ test "updateApply installs, relaunches the probe and reports restarted" {
 /// A manifest naming one archive at `version` with the given sha hex.
 fn writeFeedManifestFor(a: std.mem.Allocator, feed: []const u8, asset: []const u8, version: []const u8, sha_hex: []const u8) !void {
     const text = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, asset, sha_hex });
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = text });
+    try writeFeedManifestText(a, feed, text);
 }
 
 test "optimize impl runs a preset and reports deltas" {
@@ -3959,8 +4064,7 @@ test "shutdown stays safe with a cancelled job outstanding" {
     try testing.expect(job.cancel_requested.load(.acquire));
     b.releaseJob(job);
     job.destroy();
-    // Global flag: put it back so no later test can observe shutdown.
-    shutting_down.store(false, .release);
+    // The flag lives on the backend, so no later test can observe it.
 }
 
 /// Progress sink that requests cancellation right after the first rung's

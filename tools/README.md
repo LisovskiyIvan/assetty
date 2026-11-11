@@ -22,3 +22,27 @@ Every platform includes `NOTES.txt`. Icon resources are reproducible with
 `python3 tools/make-icons.py`. The archive names must stay in sync with
 `assetFor` — the updater downloads exactly these names. `manifest.json` is
 `{"version":"X.Y.Z","files":{"<archive>":{"sha256":"…"}}}`.
+
+## Manifest signing
+
+`manifest.json` is published together with `manifest.json.sig`: a detached
+Ed25519 signature (hex) over the manifest's exact bytes. The app verifies
+it against the public key compiled into the binary
+(`core/src/update_key.zig`, `default_public_key_hex`) before it believes the
+manifest — a checksum alone would only prove the archive matches the
+manifest, not that either came from this project.
+
+The release workflow signs the manifest right after `tools/manifest.py`
+wrote it:
+
+```sh
+ASSETTY_UPDATE_SEED=<seed hex> zig build sign-manifest -- out/manifest.json
+```
+
+The seed comes from the repository secret `ASSETTY_UPDATE_SEED` and never
+enters the repository. The workflow fails the release when the secret is
+missing: an unsigned manifest is refused by every app build.
+
+Key management (`zig build update-keygen` prints a new pair, the public hex
+goes into `core/src/update_key.zig`, the seed becomes the secret) is
+described in the top-level README.

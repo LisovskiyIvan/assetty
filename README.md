@@ -34,6 +34,8 @@ On Linux, unpack and run `sh install.sh` to install the desktop launcher, icon a
 
 **Updates:** Settings → check for updates; on a new release the app downloads it, verifies the checksum, swaps the binary and **restarts itself** (all platforms). Releases are published per tag, not per commit.
 
+The release manifest is **signed**: every release publishes `manifest.json` next to a detached Ed25519 signature `manifest.json.sig`. The app verifies that signature against the public key compiled into it before it believes a single byte of the manifest, so a tampered or substituted feed is refused instead of installed. See [Release signing](#release-signing).
+
 ### Build from source
 
 Requires [Zig 0.17.0](https://ziglang.org) and [bun](https://bun.sh) (frontend build runs automatically):
@@ -56,6 +58,29 @@ zig build -Dstrip=false                        # keep debug info (default: strip
 | Linux | WebKitGTK 2.40+ (dlopen) | GTK 3/4 + WebKitGTK; without them a native notice opens |
 
 CLI and core compile everywhere Zig does (glibc/musl); OpenCL (basisu) is macOS-only and falls back to CPU elsewhere.
+
+## Release signing
+
+The update feed is authenticated. Every release publishes `manifest.json` (version + sha256 of each archive) next to `manifest.json.sig` — a detached Ed25519 signature over the manifest's exact bytes. The app verifies that signature against the public key compiled into it (`core/src/update_key.zig`, `default_public_key_hex`) before it trusts the manifest, so a tampered or substituted feed is refused instead of installed. A checksum alone would only prove the archive matches the manifest, not that either came from this project.
+
+One-time setup by the maintainer:
+
+```sh
+zig build update-keygen          # prints "seed = <hex>" and "pub = <hex>"
+```
+
+- Put the **public** key hex into `core/src/update_key.zig` (`default_public_key_hex`) and commit it.
+- Store the **seed** (the private half) as the repository secret `ASSETTY_UPDATE_SEED`. It never enters the repository.
+
+The release workflow signs every manifest with that secret:
+
+```sh
+zig build sign-manifest -- out/manifest.json   # writes out/manifest.json.sig
+```
+
+`.github/workflows/release.yml` runs this step right after `tools/manifest.py` wrote the manifest, and fails the release when `ASSETTY_UPDATE_SEED` is missing — an unsigned manifest would be refused by every app build.
+
+To rotate the key: generate a new pair, update `default_public_key_hex`, replace the secret, and ship a release. Apps with the old key stop trusting the feed until they update.
 
 ## Desktop app
 
@@ -85,6 +110,8 @@ assetty --version
 - `info` — triangles, vertices, draw calls, VRAM estimate (mip-chain aware), disk split, per-image table.
 - `textures` — per-image texture report; `--encode N` dry-run-encodes image N to KTX2 (writes before/after PNGs into `.zig-cache/assetty-app/`).
 - `optimize` — runs the pipeline. `--strip-animations` drops all animation tracks on top of any preset. Exit codes: `0` ok, `2` error.
+
+A step that ran but failed (the textures could not be encoded, for example) does not abort the run: the file is still written, and the geometry work is not lost. Such a step is printed as `[textures] FAILED — <reason>` on stdout, a warning goes to stderr, and the JSON report carries `"failed": true` on that step. The exit code stays `0` — the run itself succeeded — so scripts that watch the exit code are not broken by it.
 
 **Presets** are `.zon` files (`presets/mobile.zon`, `desktop.zon`, `web.zon` — or your own, passed by path):
 

@@ -30,6 +30,8 @@ pub fn run(init: std.process.Init) !u8 {
     while (args.next()) |arg| {
         if (!native_open.isSupportedPath(arg)) continue;
         const path = try std.fs.path.resolve(init.gpa, &.{ cwd, arg });
+        // The defer is scoped to the loop body: the copy is released at the
+        // end of this iteration, not when the app exits.
         defer init.gpa.free(path);
         try native_open.enqueue(init.gpa, path);
     }

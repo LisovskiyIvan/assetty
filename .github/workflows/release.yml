@@ -105,11 +105,38 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      # Only the platform archives: downloading every artifact would also
+      # drop the web dist into `out/`, where it would be published as a
+      # release asset and listed in the manifest.
       - uses: actions/download-artifact@v4
         with:
+          pattern: assetty-*
           path: out
           merge-multiple: true
+      # The signing step runs through the build system, which wants the web
+      # dist to be present; take the artifact the frontend job built.
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: app/web/dist
+      - run: touch app/web/dist/index.html
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - run: python3 tools/manifest.py "${GITHUB_REF_NAME#v}" out
+      # Sign the manifest with the release key: the app only trusts a
+      # manifest whose detached signature verifies against the public key
+      # compiled into it. The seed lives in the ASSETTY_UPDATE_SEED secret
+      # and never in the repository.
+      - name: Sign the manifest
+        env:
+          ASSETTY_UPDATE_SEED: ${{ secrets.ASSETTY_UPDATE_SEED }}
+        run: |
+          if [ -z "$ASSETTY_UPDATE_SEED" ]; then
+            echo "::error::ASSETTY_UPDATE_SEED is not set — the manifest cannot be signed and the updater would refuse it"
+            exit 1
+          fi
+          zig build sign-manifest -- out/manifest.json
       - run: gh release create "$GITHUB_REF_NAME" --generate-notes out/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

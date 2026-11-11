@@ -4,14 +4,27 @@
 //!
 //!     {"version":"0.2.0","files":{"assetty-macos-arm64.zip":{"sha256":"…"}}}
 //!
-//! next to one archive per platform (see `assetFor`). `updateCheck` fetches
-//! the manifest and compares versions; `updateApply` downloads this
-//! platform's archive, checks its sha256, unpacks it, verifies the staged
-//! program reports the new version via `--version`, swaps it over the
-//! running exe — then relaunches the new program detached and quits, so the
-//! update takes effect without a manual reopen (`relaunch`). Relaunch is
-//! best-effort: when the spawn fails the install still stands and the user
-//! relaunches by hand.
+//! next to one archive per platform (see `assetFor`) and a detached
+//! Ed25519 signature of the manifest bytes, `manifest.json.sig` (hex).
+//!
+//! The signature is what makes the feed trustworthy: the manifest (and with
+//! it every archive hash) is verified against the public key baked into this
+//! build before a single byte of the manifest is believed. A manifest
+//! without a valid signature is refused — the checksum alone only proves
+//! that the archive matches the manifest, not that either came from the
+//! project.
+//!
+//! `updateCheck` fetches the manifest, verifies the signature and compares
+//! versions; `updateApply` downloads this platform's archive, checks its
+//! sha256, unpacks it, verifies the staged program reports the new version
+//! via `--version`, swaps it over the running exe — then relaunches the new
+//! program detached and quits, so the update takes effect without a manual
+//! reopen (`relaunch`). Relaunch is best-effort: when the spawn fails the
+//! install still stands and the user relaunches by hand.
+//!
+//! The manifest is fetched exactly once per operation: `check` and `apply`
+//! share one fetch, so the version that was announced and the hashes that
+//! are verified always come from the same signed document.
 //
 //! Why not `nanoui.Updater`: on macOS it only updates signed `.app` bundles
 //! (its `detect` requires a `*.app` bundle path and a team signature), and
@@ -25,6 +38,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const nanoui = @import("nanoui");
+const core = @import("core");
+const update_key = core.update_key;
 
 /// This platform's archive in every release. The release workflow
 /// (`.github/workflows/release.yml`) must produce exactly these names.
@@ -63,6 +78,13 @@ pub fn manifestUrl(a: std.mem.Allocator, feed: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s}/manifest.json", .{feed});
 }
 
+/// The detached signature of `manifest.json`: hex-encoded Ed25519 signature
+/// over the exact manifest bytes. Published next to the manifest by the
+/// release workflow (`zig build sign-manifest`, see `tools/release_key.zig`).
+pub fn manifestSigUrl(a: std.mem.Allocator, feed: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}/manifest.json.sig", .{feed});
+}
+
 /// The immutable per-version URL (the `latest` redirect could move underfoot
 /// mid-download); mirrors `nanoui.update`.
 pub fn taggedAssetUrl(a: std.mem.Allocator, repo: []const u8, version: []const u8, asset: []const u8) ![]const u8 {
@@ -97,6 +119,78 @@ pub const Check = struct {
     notes_url: []const u8,
 };
 
+/// The feed's manifest, verified.
+pub const VerifiedManifest = struct {
+    /// The manifest bytes as fetched (arena-owned).
+    text: []const u8,
+    /// The release the manifest describes for this platform.
+    release: nanoui.update.Release,
+};
+
+/// The Ed25519 public key that release manifests are signed with.
+///
+/// Baked into the binary (see `core/src/update_key.zig`): the release
+/// workflow signs every manifest with the matching private key, so a
+/// tampered or substituted feed is rejected before any of its content is
+/// used. The private key never lives in the repository.
+pub fn publicKeyHex() []const u8 {
+    return update_key.public_key_hex;
+}
+
+/// Signs `message` with the hex seed (the release workflow's secret). Used
+/// by the tests and by the `sign-manifest` build step.
+pub fn signManifest(a: std.mem.Allocator, io: std.Io, seed_hex: []const u8, message: []const u8) ![]const u8 {
+    return update_key.sign(a, io, seed_hex, message);
+}
+
+pub const VerifyError = error{
+    /// The feed published no signature next to the manifest.
+    MissingSignature,
+    /// The signature is not valid for this manifest and key.
+    BadSignature,
+    /// The build has no public key configured: the feed cannot be trusted.
+    NoPublicKey,
+} || std.mem.Allocator.Error;
+
+/// Verifies `manifest` against `signature` (hex, 128 chars) with the
+/// build's public key. The signature covers the manifest bytes exactly as
+/// fetched, so any change to the document invalidates it.
+pub fn verifyManifest(manifest: []const u8, signature: []const u8) VerifyError!void {
+    const key = publicKeyHex();
+    if (key.len == 0) return error.NoPublicKey;
+    update_key.verify(key, manifest, signature) catch |err| switch (err) {
+        error.BadSignature => return error.BadSignature,
+        // A malformed signature is a broken feed, not a broken build.
+        error.InvalidSignature => return error.BadSignature,
+        error.InvalidKey => return error.NoPublicKey,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Fetches the manifest and its detached signature and verifies them.
+///
+/// The signature is fetched from the same feed, but it buys nothing on its
+/// own: what makes it meaningful is that the public key is compiled into
+/// this binary, so only the holder of the matching private key (the release
+/// workflow) can produce a manifest this build accepts.
+pub fn fetchVerifiedManifest(
+    a: std.mem.Allocator,
+    io: std.Io,
+    feed: []const u8,
+    asset: []const u8,
+) !VerifiedManifest {
+    const manifest = try fetchText(a, io, try manifestUrl(a, feed));
+    const sig = fetchText(a, io, try manifestSigUrl(a, feed)) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingSignature,
+        else => return err,
+    };
+    // Trim the trailing newline the release workflow's signer leaves.
+    const sig_trimmed = std.mem.trim(u8, sig, " \t\r\n");
+    verifyManifest(manifest, sig_trimmed) catch |err| return err;
+    const release = try nanoui.update.parseManifest(a, manifest, asset);
+    return .{ .text = manifest, .release = release };
+}
+
 /// Fetches the feed's manifest and compares it to `current`. `feed` defaults
 /// to the repo's latest release; pass a `file://` dir in tests.
 pub fn check(
@@ -107,8 +201,19 @@ pub fn check(
     asset: []const u8,
     current: []const u8,
 ) !Check {
-    const manifest = try fetchText(a, io, try manifestUrl(a, feed));
-    const release = try nanoui.update.parseManifest(a, manifest, asset);
+    const m = try fetchVerifiedManifest(a, io, feed, asset);
+    return checkFromManifest(a, feed, repo, asset, current, m.release);
+}
+
+/// The version comparison half of `check`, given an already verified manifest.
+fn checkFromManifest(
+    a: std.mem.Allocator,
+    feed: []const u8,
+    repo: []const u8,
+    asset: []const u8,
+    current: []const u8,
+    release: nanoui.update.Release,
+) !Check {
     const notes = try notesUrl(a, repo, release.version);
     if (!newer(release.version, current)) {
         return .{
@@ -154,17 +259,16 @@ pub fn apply(
     exe: []const u8,
     cache_dir: []const u8,
 ) ApplyOutcome {
-    const c = check(a, io, feed, repo, asset, current) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(a, "update check: {s}", .{@errorName(err)}) catch "out of memory" };
+    // One manifest, one verification: the version that is announced and the
+    // hashes that are checked always come from the same signed document.
+    const m = fetchVerifiedManifest(a, io, feed, asset) catch |err| {
+        return .{ .failed = std.fmt.allocPrint(a, "update check: {s}", .{errorText(err)}) catch "out of memory" };
+    };
+    const release = m.release;
+    const c = checkFromManifest(a, feed, repo, asset, current, release) catch |err| {
+        return .{ .failed = std.fmt.allocPrint(a, "update check: {s}", .{errorText(err)}) catch "out of memory" };
     };
     if (!c.available) return .{ .up_to_date = .{ .version = current } };
-
-    const manifest = fetchText(a, io, manifestUrl(a, feed) catch return oom(a)) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(a, "manifest: {s}", .{@errorName(err)}) catch "out of memory" };
-    };
-    const release = nanoui.update.parseManifest(a, manifest, asset) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(a, "manifest: {s}", .{@errorName(err)}) catch "out of memory" };
-    };
 
     const dir = std.fmt.allocPrint(a, "{s}{c}updates{c}{s}", .{ cache_dir, std.fs.path.sep, std.fs.path.sep, release.version }) catch return oom(a);
     std.Io.Dir.cwd().deleteTree(io, dir) catch {};
@@ -177,8 +281,8 @@ pub fn apply(
     downloadTo(a, io, c.download_url, archive) catch |err| {
         return .{ .failed = std.fmt.allocPrint(a, "download: {s}", .{@errorName(err)}) catch "out of memory" };
     };
-    verifySha256(a, io, archive, release.sha256) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(a, "checksum: {s}", .{@errorName(err)}) catch "out of memory" };
+    verifySha256(io, archive, release.sha256) catch |err| {
+        return .{ .failed = std.fmt.allocPrint(a, "checksum: {s}", .{errorText(err)}) catch "out of memory" };
     };
 
     const unpacked = std.fmt.allocPrint(a, "{s}{c}unpacked", .{ dir, std.fs.path.sep }) catch return oom(a);
@@ -186,7 +290,7 @@ pub fn apply(
         return .{ .failed = std.fmt.allocPrint(a, "unpack dir: {s}", .{@errorName(err)}) catch "out of memory" };
     };
     unpack(a, io, archive, unpacked) catch |err| {
-        return .{ .failed = std.fmt.allocPrint(a, "unpack: {s}", .{@errorName(err)}) catch "out of memory" };
+        return .{ .failed = std.fmt.allocPrint(a, "unpack: {s}", .{errorText(err)}) catch "out of memory" };
     };
     std.Io.Dir.cwd().deleteFile(io, archive) catch {};
 
@@ -210,6 +314,19 @@ fn oom(a: std.mem.Allocator) ApplyOutcome {
     return .{ .failed = "out of memory" };
 }
 
+/// A message the user can act on. The raw error name says nothing to a
+/// person ("BadSignature"); this says what went wrong with the feed.
+pub fn errorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingSignature => "the release manifest is not signed (manifest.json.sig is missing)",
+        error.BadSignature => "the release manifest signature does not match this build's key",
+        error.NoPublicKey => "this build has no release key, so it cannot trust any feed",
+        error.ChecksumMismatch => "the downloaded archive does not match the signed manifest",
+        error.UnsafeArchiveEntry => "the release archive contains an unsafe entry",
+        else => @errorName(err),
+    };
+}
+
 const windows = builtin.os.tag == .windows;
 
 /// The tools on every machine (System32 since Windows 10), as in
@@ -229,7 +346,19 @@ fn fetchText(a: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, url, "file://")) {
         return std.Io.Dir.cwd().readFileAlloc(io, url["file://".len..], a, .limited(1 << 20));
     }
-    return run(a, io, &.{ curl_bin, "-fsSL", "--max-time", "30", url });
+    const r = try std.process.run(a, io, .{ .argv = &.{ curl_bin, "-fsSL", "--max-time", "30", url }, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) });
+    if (!r.term.success()) {
+        // curl -f exits 22 when the server answered HTTP >= 400: for the
+        // signature URL that means the release published no signature (404),
+        // which callers report as a missing signature, not a transport
+        // failure. Other exits are transport failures and keep the raw name.
+        switch (r.term) {
+            .exited => |code| if (code == 22) return error.FileNotFound,
+            else => {},
+        }
+        return error.CommandFailed;
+    }
+    return r.stdout;
 }
 
 fn downloadTo(a: std.mem.Allocator, io: std.Io, url: []const u8, dst: []const u8) !void {
@@ -241,27 +370,69 @@ fn downloadTo(a: std.mem.Allocator, io: std.Io, url: []const u8, dst: []const u8
     _ = try run(a, io, &.{ curl_bin, "-fsSL", "--max-time", "900", "-o", dst, url });
 }
 
-fn verifySha256(a: std.mem.Allocator, io: std.Io, path: []const u8, want_hex: []const u8) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 30));
+/// Streams the file through SHA-256 instead of loading it into memory: a
+/// release archive is tens of megabytes, and a hostile feed should not be
+/// able to make the app allocate the whole file twice.
+fn verifySha256(io: std.Io, path: []const u8, want_hex: []const u8) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    while (true) {
+        // A short read is not the end of the file: only a zero-length read
+        // is. Stopping on the first short read would hash a prefix of the
+        // archive and reject a perfectly good download.
+        const n = reader.interface.readSliceShort(&buf) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+        };
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    hasher.final(&digest);
     if (!std.ascii.eqlIgnoreCase(&std.fmt.bytesToHex(digest, .lower), want_hex)) return error.ChecksumMismatch;
 }
 
+/// Extracts the archive into `dst`.
+///
+/// The archive itself is authenticated (its sha256 comes from the signed
+/// manifest), but the extraction is still hardened: no `-P`, so the tools
+/// refuse absolute member paths, and both refuse `..` members by default.
+/// After extraction the tree is walked: only regular files and directories
+/// are allowed, so a symlink cannot smuggle a program in from outside.
 fn unpack(a: std.mem.Allocator, io: std.Io, archive: []const u8, dst: []const u8) !void {
     if (std.mem.endsWith(u8, archive, ".tar.gz") or std.mem.endsWith(u8, archive, ".tgz")) {
-        _ = try run(a, io, &.{ tar_bin, "-xf", archive, "-C", dst });
-        return;
+        _ = try run(a, io, &.{ tar_bin, "-xf", archive, "-C", dst, "--no-same-owner", "--no-same-permissions" });
+    } else if (windows) {
+        _ = try run(a, io, &.{ tar_bin, "-xf", archive, "-C", dst, "--no-same-owner", "--no-same-permissions" });
+    } else {
+        _ = try run(a, io, &.{ "/usr/bin/unzip", "-q", "-o", archive, "-d", dst });
     }
-    if (windows) {
-        _ = try run(a, io, &.{ tar_bin, "-xf", archive, "-C", dst });
-        return;
+    try verifyExtractedTree(a, io, dst);
+}
+
+/// Rejects anything but regular files and directories in the extracted tree.
+fn verifyExtractedTree(a: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| {
+        switch (e.kind) {
+            .file, .directory => {},
+            else => return error.UnsafeArchiveEntry,
+        }
     }
-    _ = try run(a, io, &.{ "/usr/bin/unzip", "-q", "-o", archive, "-d", dst });
 }
 
 /// The file called `name` in `root` or a folder in it (archives nest the
 /// program in `<app>-<version>-<os>-<arch>/`).
+///
+/// Only regular files match: a symlink named like the program would point
+/// somewhere else on disk, and a hostile archive must not be able to make
+/// the updater swap in a file it did not ship.
 fn findProgram(a: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8) ![]const u8 {
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
@@ -404,7 +575,8 @@ test "newer follows dotted versions, never garbage" {
     try testing.expect(newer("0.2.0", comparable("0.1.0-dev")));
 }
 
-/// A feed dir on disk: `manifest.json` + one archive, like a release.
+/// A feed dir on disk: `manifest.json` + its signature + one archive, like a
+/// release. The manifest is signed with the test key the updater trusts.
 fn makeFeed(a: std.mem.Allocator, io: std.Io, root: []const u8, version: []const u8, asset: []const u8, program_text: []const u8) ![]const u8 {
     const cwd = std.Io.Dir.cwd();
     const prog_name = "assetty-test-prog";
@@ -423,11 +595,27 @@ fn makeFeed(a: std.mem.Allocator, io: std.Io, root: []const u8, version: []const
     const bytes = try cwd.readFileAlloc(io, archive, a, .limited(1 << 20));
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, asset, std.fmt.bytesToHex(digest, .lower) }) });
+    const manifest = try std.fmt.allocPrint(a, "{{\"version\":\"{s}\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ version, asset, std.fmt.bytesToHex(digest, .lower) });
+    try writeSignedManifest(a, io, feed, manifest);
     return std.fmt.allocPrint(a, "file://{s}/feed", .{root});
 }
 
+/// Writes `manifest.json` and its detached signature into the feed dir.
+fn writeSignedManifest(a: std.mem.Allocator, io: std.Io, feed: []const u8, manifest: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json", .{feed}), .data = manifest });
+    const sig = try update_key.signForTest(a, io, manifest);
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/manifest.json.sig", .{feed}), .data = sig });
+}
+
+/// Points the updater at the test key pair: the feed helper signs with it,
+/// and the verifier must trust its public half.
+fn useTestKey() void {
+    update_key.useTestKey();
+}
+
 test "check: newer release found, same version quiet" {
+    useTestKey();
     if (windows) return error.SkipZigTest; // the fake program is a shell script
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -454,7 +642,48 @@ test "check: newer release found, same version quiet" {
     try testing.expectEqualStrings("0.2.0", miss.version);
 }
 
+test "an unsigned or tampered manifest is refused" {
+    useTestKey();
+    if (windows) return error.SkipZigTest; // the fake program is a shell script
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const abs = try std.Io.Dir.cwd().realPathFileAlloc(io, root, a);
+    const asset = "assetty-test.tar.gz";
+    const feed = try makeFeed(a, io, abs, "0.2.0", asset, "#!/bin/sh\necho \"assetty 0.2.0\"\n");
+    const manifest_path = try std.fmt.allocPrint(a, "{s}/feed/manifest.json", .{abs});
+    const sig_path = try std.fmt.allocPrint(a, "{s}/feed/manifest.json.sig", .{abs});
+
+    // A manifest with no signature at all is not trusted.
+    try cwd.deleteFile(io, sig_path);
+    try testing.expectError(error.MissingSignature, check(a, io, feed, "o/r", asset, "0.1.0"));
+
+    // A signature over different bytes is not trusted either.
+    const manifest = try cwd.readFileAlloc(io, manifest_path, a, .limited(1 << 20));
+    const other_sig = try update_key.signForTest(a, io, "{\"version\":\"9.9.9\"}");
+    try cwd.writeFile(io, .{ .sub_path = sig_path, .data = other_sig });
+    try testing.expectError(error.BadSignature, check(a, io, feed, "o/r", asset, "0.1.0"));
+
+    // Garbage in the signature file is not trusted.
+    try cwd.writeFile(io, .{ .sub_path = sig_path, .data = "not a signature" });
+    try testing.expectError(error.BadSignature, check(a, io, feed, "o/r", asset, "0.1.0"));
+
+    // The right signature is accepted: the checks above did not break the
+    // feed by accident.
+    const good_sig = try update_key.signForTest(a, io, manifest);
+    try cwd.writeFile(io, .{ .sub_path = sig_path, .data = good_sig });
+    const hit = try check(a, io, feed, "o/r", asset, "0.1.0");
+    try testing.expect(hit.available);
+}
+
 test "apply refuses a bad checksum" {
+    useTestKey();
     if (windows) return error.SkipZigTest; // the fake program is a shell script
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -469,9 +698,10 @@ test "apply refuses a bad checksum" {
     const asset = "assetty-test.tar.gz";
     const feed = try makeFeed(a, io, abs, "0.3.0", asset, "#!/bin/sh\necho \"assetty 0.3.0\"\n");
 
-    // Tamper the manifest: the archive's real sum no longer matches.
-    const bad_sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/feed/manifest.json", .{abs}), .data = try std.fmt.allocPrint(a, "{{\"version\":\"0.3.0\",\"files\":{{\"{s}\":{{\"sha256\":\"{s}\"}}}}}}", .{ asset, bad_sha }) });
+    // Tamper the archive, not the manifest: the manifest stays signed and
+    // valid, so the checksum is what catches the mismatch.
+    const archive = try std.fmt.allocPrint(a, "{s}/feed/{s}", .{ abs, asset });
+    try cwd.writeFile(io, .{ .sub_path = archive, .data = "not the archive you are looking for" });
 
     const exe = try std.fmt.allocPrint(a, "{s}/assetty-test-prog", .{abs});
     try cwd.writeFile(io, .{ .sub_path = exe, .data = "#!/bin/sh\necho \"assetty 0.1.0\"\n", .flags = .{ .permissions = .fromMode(0o755) } });
@@ -488,6 +718,7 @@ test "apply refuses a bad checksum" {
 }
 
 test "apply: staged program takes the exe's place" {
+    useTestKey();
     if (windows) return error.SkipZigTest; // the fake program is a shell script
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -608,6 +839,7 @@ test "relaunch starts the program detached (probe writes its marker)" {
 }
 
 test "apply then relaunch: the staged program takes over and gets launched" {
+    useTestKey();
     if (windows) return error.SkipZigTest; // the fake program is a shell script
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

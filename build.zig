@@ -281,6 +281,41 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
 
+    // ---- release-key helper ------------------------------------------------
+    // `zig build update-keygen` prints a new Ed25519 key pair for the update
+    // feed; `zig build sign-manifest -- <file>` signs a manifest with the
+    // seed from ASSETTY_UPDATE_SEED. The tool is separate from the shipped
+    // binary: the private seed never reaches a release.
+    {
+        // The key helper is its own tiny module: the tool must not drag in
+        // the whole core (and its C dependencies) just to sign a manifest.
+        const key_mod = b.createModule(.{
+            .root_source_file = b.path("core/src/update_key.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const key_tool = b.addExecutable(.{
+            .name = "assetty-release-key",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/release_key.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "update_key", .module = key_mod }},
+            }),
+        });
+
+        const keygen_run = b.addRunArtifact(key_tool);
+        keygen_run.addArg("keygen");
+        const keygen_step = b.step("update-keygen", "Print a new update-feed key pair");
+        keygen_step.dependOn(&keygen_run.step);
+
+        const sign_run = b.addRunArtifact(key_tool);
+        sign_run.addArg("sign");
+        sign_run.addPassthruArgs();
+        const sign_step = b.step("sign-manifest", "Sign a release manifest (ASSETTY_UPDATE_SEED)");
+        sign_step.dependOn(&sign_run.step);
+    }
+
     // ---- desktop app tests -------------------------------------------------
     // Backend impls are platform-independent (the page/IPC glue works wherever
     // nanoui has a webview — macOS, Windows, Linux); they run wherever the

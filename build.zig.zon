@@ -4,8 +4,8 @@
     .version = "0.1.0",
     .dependencies = .{
         .nanoui = .{
-            .url = "git+https://github.com/justrach/nanoui?ref=v0.13.0#d17a467d55db4ff3cf765f6f0e208e6234abf4a1",
-            .hash = "nanoui-0.13.0-we0KMd1-MQBzJq1VU59oWYKF3KHhSYPj8_qjVe2icq_e",
+            .url = "git+https://github.com/justrach/nanoui?ref=v0.14.0#5f4f6fc7c00967f606d0c3220b812d78ca3c776a",
+            .hash = "nanoui-0.14.0-we0KMck7OwDwEcwt0-a6KnXZOA7S_RYckkG2J5ecYESb",
         },
     },
     .minimum_zig_version = "0.17.0",

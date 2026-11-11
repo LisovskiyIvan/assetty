@@ -7,3 +7,7 @@ app/web/dist/
 zig-pkg/
 assetty.settings.json
 test/corpus/
+# The update feed's private seed never belongs in the repository.
+update-seed.hex
+update_key.pem
+update_pubkey.hex
