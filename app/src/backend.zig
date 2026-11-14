@@ -3326,13 +3326,19 @@ test "discardFile refuses paths outside out_dir" {
     const a = arena.allocator();
 
     const refused = "only results in .zig-cache/assetty-app can be discarded";
-    for ([_][]const u8{ "test/fixtures/box.glb", "/etc", paths.output_dir }) |p| {
+    // Existing paths only: a path that cannot be resolved is reported as
+    // already gone (`{"ok":true}`), which is the idempotent contract. `/etc`
+    // used to stand in here and broke on Windows runners without it.
+    for ([_][]const u8{ "test/fixtures/box.glb", "test", paths.output_dir }) |p| {
         const r = try discardFileImpl(testing.io, a, p);
         try testing.expect(std.mem.indexOf(u8, r.text, refused) != null);
     }
     // Nothing was touched: the fixture still reads.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, "test/fixtures/box.glb", a, .limited(64 << 20));
     try testing.expect(bytes.len > 0);
+    // A path that does not exist is treated as already discarded.
+    const gone = try discardFileImpl(testing.io, a, "test/fixtures/does-not-exist.glb");
+    try testing.expectEqualStrings("{\"ok\":true}", gone.text);
     // Blank paths are refused, not deleted.
     const blank = try discardFileImpl(testing.io, a, "   ");
     try testing.expect(std.mem.indexOf(u8, blank.text, "\"error\"") != null);
