@@ -579,8 +579,20 @@ pub const Backend = struct {
     }
 
     fn loadBytesImpl(self: *Backend, a: std.mem.Allocator, path: []const u8) !json.Raw {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_load_bytes)) catch |err|
-            return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
+        // A text .gltf has external buffers/images; the webview cannot read
+        // files, so inline them here (the viewer gets one self-contained
+        // document). GLB keeps the raw bytes path.
+        const is_gltf = std.ascii.endsWithIgnoreCase(path, ".gltf");
+        const bytes = if (is_gltf)
+            core.preview.selfContained(a, self.io, path) catch |err| return switch (err) {
+                error.MissingResource => json.errorRaw(a, "{s}: external resource missing or unreadable (open the .gltf from its folder)", .{path}),
+                error.ResourceTooLarge => json.errorRaw(a, "{s}: model is too large to preview", .{path}),
+                error.NotGltf => json.errorRaw(a, "{s}: not a glTF file", .{path}),
+                else => json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) }),
+            }
+        else
+            std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(max_load_bytes)) catch |err|
+                return json.errorRaw(a, "{s}: {s}", .{ path, @errorName(err) });
 
         const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
         const encoded = std.base64.standard.Encoder.encode(b64, bytes);
@@ -715,7 +727,11 @@ pub const Backend = struct {
             .cancel = cancel,
         }) catch |err| {
             if (err == error.Cancelled) return .cancelled;
-            const msg = std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }) catch return .out_of_memory;
+            const msg = switch (err) {
+                error.InvalidData => std.fmt.allocPrint(a, "{s}: external resource missing or unreadable (is the .bin/image next to the .gltf?)", .{path}),
+                error.ResourceTooLarge => std.fmt.allocPrint(a, "{s}: resource too large", .{path}),
+                else => std.fmt.allocPrint(a, "{s}: {s}", .{ path, @errorName(err) }),
+            } catch return .out_of_memory;
             return .{ .failed = msg };
         };
         return .{ .done = rep };
@@ -3075,6 +3091,24 @@ test "loadBytes impl returns base64" {
     const r = try b.loadBytesImpl(arena.allocator(), "test/fixtures/box.glb");
     try testing.expect(std.mem.indexOf(u8, r.text, "\"size\":") != null);
     try testing.expect(std.mem.indexOf(u8, r.text, "\"b64\":\"") != null);
+}
+
+test "loadBytes impl inlines a .gltf for the viewer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b = testBackend();
+    const r = try b.loadBytesImpl(a, "test/fixtures/gltf/box/box.gltf");
+    try testing.expect(std.mem.indexOf(u8, r.text, "\"error\"") == null);
+    const key = "\"b64\":\"";
+    const start = (std.mem.indexOf(u8, r.text, key) orelse return error.TestUnexpectedResult) + key.len;
+    const end = std.mem.lastIndexOfScalar(u8, r.text, '"') orelse return error.TestUnexpectedResult;
+    const encoded = r.text[start..end];
+    const bytes = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+    try std.base64.standard.Decoder.decode(bytes, encoded);
+    // The webview receives one self-contained document.
+    try testing.expect(std.mem.indexOf(u8, bytes, "data:application/octet-stream;base64,") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "data:image/png;base64,") != null);
 }
 
 test "openDialog json shape for pick and cancel" {

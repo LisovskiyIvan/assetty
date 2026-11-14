@@ -21,12 +21,12 @@ cat > "$data/applications/assetty.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=assetty
-Comment=View and optimize GLB models
+Comment=View and optimize glTF/GLB models
 Exec="$exec_path" --app --open %F
 Icon=assetty
 Terminal=false
 Categories=Development;Graphics;3DGraphics;
-MimeType=model/gltf-binary;
+MimeType=model/gltf-binary;model/gltf+json;
 EOF
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$data/applications" || true

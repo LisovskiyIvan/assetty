@@ -3,6 +3,7 @@
  * and the options panel. Owns the job state and backend subscriptions.
  */
 import { app } from "../../app";
+import { modelExt } from "../../viewer";
 import {
   errMessage,
   isBusyError,
@@ -1287,7 +1288,8 @@ export function createRunFlow(deps: RunDeps): RunApi {
     deps.dual.syncEmptyHint();
     deps.refreshTexExtra();
     try {
-      if (app.bridge.live) await deps.dual.loadLeftLive(await app.bridge.loadBytes(path));
+      if (app.bridge.live)
+        await deps.dual.loadLeftLive(await app.bridge.loadBytes(path), modelExt(path));
       else deps.dual.loadLeftDemo();
       deps.dual.hideOpenHint();
     } catch (err) {

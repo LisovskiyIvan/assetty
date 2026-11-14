@@ -1,6 +1,7 @@
 pub const model = @import("gltf/model.zig");
 pub const parse = @import("gltf/parse.zig");
 pub const write = @import("gltf/write.zig");
+pub const preview = @import("gltf/inline.zig");
 pub const stats = @import("stats.zig");
 pub const json_util = @import("json_util.zig");
 pub const report_json = @import("report_json.zig");

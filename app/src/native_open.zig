@@ -10,8 +10,8 @@
 //!   2. when the webview is ready (polled): `take(allocator)`
 //!   3. `defer native_open.deinit()` next to `app.destroy()`
 //!
-//! Only `.glb` is queued. Pre-webview events are kept (up to `max_pending`),
-//! so cold-start opens are never lost. Main thread only.
+//! Only `.glb`/`.gltf` are queued. Pre-webview events are kept (up to
+//! `max_pending`), so cold-start opens are never lost. Main thread only.
 const std = @import("std");
 const nanoui = @import("nanoui");
 
@@ -19,19 +19,22 @@ const nanoui = @import("nanoui");
 /// rest drop instead of growing without bound.
 pub const max_pending: usize = 16;
 
-/// The only extension the viewer opens (matched case-insensitively).
-pub const supported_ext = ".glb";
+/// Extensions the viewer opens (matched case-insensitively). A `.gltf` is
+/// resolved against its own directory by the backend before preview.
+pub const supported_exts = [_][]const u8{ ".glb", ".gltf" };
 
 var queue: std.ArrayList([]u8) = .empty;
 var queue_gpa: ?std.mem.Allocator = null;
 var installed = false;
 
-/// Non-empty, NUL-free, `.glb` in any case. Pure and portable.
+/// Non-empty, NUL-free, `.glb`/`.gltf` in any case. Pure and portable.
 pub fn isSupportedPath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    if (path.len < supported_ext.len) return false;
-    return std.ascii.eqlIgnoreCase(path[path.len - supported_ext.len ..], supported_ext);
+    inline for (supported_exts) |ext| {
+        if (path.len >= ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
+    }
+    return false;
 }
 
 /// Paths currently waiting for `take`.
@@ -104,13 +107,14 @@ fn pushValidated(path: []const u8) void {
     enqueue(gpa, path) catch {};
 }
 
-test "isSupportedPath only accepts .glb" {
+test "isSupportedPath only accepts .glb and .gltf" {
     const t = std.testing;
     try t.expect(isSupportedPath("model.glb"));
     try t.expect(isSupportedPath("/tmp/Hello.GLB"));
     try t.expect(isSupportedPath("a.Glb"));
     try t.expect(isSupportedPath(".glb"));
-    try t.expect(!isSupportedPath("model.gltf"));
+    try t.expect(isSupportedPath("model.gltf"));
+    try t.expect(isSupportedPath("/tmp/Scene.GLTF"));
     try t.expect(!isSupportedPath("model.glb.bak"));
     try t.expect(!isSupportedPath("modelglb"));
     try t.expect(!isSupportedPath(""));
@@ -125,7 +129,7 @@ test "queue is bounded, keeps earliest, take transfers ownership" {
     queue_gpa = t.allocator;
     defer deinit();
 
-    pushValidated("b.gltf"); // filtered, never queued
+    pushValidated("b.gltf"); // accepted since .gltf became a source format
     var i: usize = 0;
     while (i < max_pending + 4) : (i += 1) {
         var buf: [32]u8 = undefined;
@@ -140,8 +144,8 @@ test "queue is bounded, keeps earliest, take transfers ownership" {
         t.allocator.free(got);
     }
     try t.expectEqual(max_pending, got.len);
-    try t.expectEqualStrings("m0.glb", got[0]);
-    try t.expectEqualStrings("m15.glb", got[max_pending - 1]);
+    try t.expectEqualStrings("b.gltf", got[0]);
+    try t.expectEqualStrings("m14.glb", got[max_pending - 1]);
     try t.expectEqual(@as(usize, 0), pendingCount());
 
     const again = try take(t.allocator);
@@ -154,15 +158,16 @@ test "enqueue before install owns the queue, take drains it" {
     defer deinit();
 
     try enqueue(t.allocator, "first.glb");
-    try enqueue(t.allocator, "skip.gltf"); // filtered, no slot taken
-    try t.expectEqual(@as(usize, 1), pendingCount());
+    try enqueue(t.allocator, "second.gltf");
+    try t.expectEqual(@as(usize, 2), pendingCount());
 
     const got = try take(t.allocator);
     defer {
         for (got) |p| t.allocator.free(p);
         t.allocator.free(got);
     }
-    try t.expectEqual(@as(usize, 1), got.len);
+    try t.expectEqual(@as(usize, 2), got.len);
     try t.expectEqualStrings("first.glb", got[0]);
+    try t.expectEqualStrings("second.gltf", got[1]);
     try t.expectEqual(@as(usize, 0), pendingCount());
 }

@@ -8,7 +8,7 @@
 import { app } from "../app";
 import { el, emptyState } from "../ui";
 import { onLang, t } from "../i18n";
-import { ViewerScene } from "../viewer";
+import { ViewerScene, modelExt } from "../viewer";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { TabHandle } from "./types";
 import { errMessage } from "../guards";
@@ -66,7 +66,7 @@ export function mountViewer(): TabHandle {
       if (app.bridge.live) {
         const b64 = await app.bridge.loadBytes(path);
         if (stale()) return;
-        await v.loadBase64(b64);
+        await v.loadBase64(b64, modelExt(path));
         if (stale()) return;
         // Successful viewer model load: the shell opens the inspector.
         // (Demo and failed loads stay quiet.)

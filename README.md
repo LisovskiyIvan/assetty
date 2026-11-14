@@ -15,7 +15,7 @@ Grab a build from [GitHub Releases](../../releases):
 | `assetty-linux-x64.tar.gz` | Linux x64 | needs GTK 3/4 + WebKitGTK 2.40+ (`sudo apt install libwebkitgtk-6.0-4` or `libwebkit2gtk-4.1-0`) |
 | `assetty-linux-arm64.tar.gz` | Linux ARM64 | same |
 
-On macOS, unzip and drag `assetty.app` to Applications. Double-click the app for the GUI, use **Open With → assetty** on a `.glb`, or drop a model on the Dock icon. The app remains unsigned: Gatekeeper approval may still be required on the first launch.
+On macOS, unzip and drag `assetty.app` to Applications. Double-click the app for the GUI, use **Open With → assetty** on a `.glb`/`.gltf`, or drop a model on the Dock icon. The app remains unsigned: Gatekeeper approval may still be required on the first launch.
 
 The same binary is also the CLI. To install the `assetty` command for your user (no sudo):
 
@@ -30,7 +30,7 @@ Without command installation: `/Applications/assetty.app/Contents/MacOS/assetty 
 
 On Windows, unpack and double-click `assetty.exe` for the GUI without a console. Keep the included `WebView2Loader.dll` beside it. Commands still work from a terminal; scripts that need reliable waiting/exit codes for this GUI-subsystem executable should use a process API such as PowerShell `Start-Process -Wait -PassThru`.
 
-On Linux, unpack and run `sh install.sh` to install the desktop launcher, icon and CLI for your user, without sudo. The launcher opens the GUI without a terminal and accepts `.glb` files. Running `./assetty` directly remains supported.
+On Linux, unpack and run `sh install.sh` to install the desktop launcher, icon and CLI for your user, without sudo. The launcher opens the GUI without a terminal and accepts `.glb`/`.gltf` files. Running `./assetty` directly remains supported.
 
 **Updates:** Settings → check for updates; on a new release the app downloads it, verifies the checksum, swaps the binary and **restarts itself** (all platforms). Releases are published per tag, not per commit.
 
@@ -86,7 +86,7 @@ To rotate the key: generate a new pair, update `default_public_key_hex`, replace
 
 Run `assetty` with no arguments. Tabs:
 
-- **Viewer** — Babylon.js scene with the inspector open alongside (scene tree left, properties right, model centered). Drag & drop a `.glb` anywhere to open it; `⌘O`/Open picks from your recent folders.
+- **Viewer** — Babylon.js scene with the inspector open alongside (scene tree left, properties right, model centered). Drag & drop a `.glb`/`.gltf` anywhere to open it; `⌘O`/Open picks from your recent folders. A `.gltf` opened from disk has its sibling `.bin`/textures inlined for the preview; a dropped `.gltf` can only bring the files the browser hands over.
 - **Optimize** — pick pipeline steps (prune / dedup / weld / join / simplify / quantize / textures), run, and compare. Every step has `?` help explaining what it does and what it affects. After a run: a **split slider** renders the source and the result in one viewport with frame-synced cameras — drag the divider to compare pixel-by-pixel. The report shows before/after stats, per-step timings and texture details. Results land in `.zig-cache/assetty-app/`; the banner offers **Save as…** (native save dialog) and **Discard** (deletes the result file). A pre-run guard warns when the source textures are already KTX2.
 - **Textures** — lists every texture with facts (dims, format, VRAM, disk). **Preview KTX2** is a dry-run encode (before/after, PSNR, VRAM); each texture has its own settings — format (auto/ETC1S/UASTC), quality, resize, mips, normal-map, skip — shown in a side panel on click. **Apply to model** writes the whole textures step into a new file. Auto presets (mobile/desktop/web) live on the Optimize tab.
 - **Settings** — theme (light/dark), language (EN/RU), per-step defaults, per-model texture overrides, JSON editor for the whole settings file (`assetty.settings.json`), update check.
@@ -101,9 +101,9 @@ Pipeline progress is animated: stage chips (load → geometry → textures → w
 
 ```sh
 assetty help
-assetty info <file.glb> [--json]
-assetty textures <file.glb> [--encode N] [--json]
-assetty optimize <file.glb> --preset <name|path.zon> [-o out.glb] [--report r.json] [--strip-animations]
+assetty info <file.glb|gltf> [--json]
+assetty textures <file.glb|gltf> [--encode N] [--json]
+assetty optimize <file.glb|gltf> --preset <name|path.zon> [-o out.glb] [--report r.json] [--strip-animations]
 assetty --version
 ```
 
@@ -158,4 +158,5 @@ gltfpack-`-cc`-style: every eligible vertex/index buffer view is meshopt-compres
 
 - Malformed GLBs exit with clean errors (fuzzed corpus, 600+ runs, zero crashes — ReleaseFast keeps runtime checks off, parse layer validates instead).
 - Installed macOS apps keep settings and user presets in `~/Library/Application Support/assetty/`, and temporary results in `~/Library/Caches/assetty/results/`. Existing settings/presets next to the app are copied on first launch without deleting the originals or replacing newer user data. Raw/development binaries keep `assetty.settings.json` and `.zig-cache/assetty-app/` in the working directory. Settings writes are atomic.
-- Roadmap: batch/folder mode, `.gltf` (non-binary) output, signed macOS bundles for in-app updates.
+- **Sources** are `.glb` or `.gltf`; a text `.gltf` reads external buffers/images relative to its own directory (percent-escaped uris and `data:` payloads included). Output is always a single self-contained `.glb`, so external resources are inlined and no `uri` survives. A missing sibling file fails the run with a clean message instead of writing a dangling reference. The viewer previews `.gltf` through the same inlining; `info` stays lenient and still reports counts when a payload is missing.
+- Roadmap: batch/folder mode in the app, `.gltf` (non-binary) output, signed macOS bundles for in-app updates.

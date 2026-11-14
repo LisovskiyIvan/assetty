@@ -14,7 +14,8 @@
  *                              terminal done event (ok:false, error:"Cancelled");
  *                              the gate stays busy until then (missing on old hosts)
  *   info(path)              -> Info
- *   loadBytes(path)         -> { b64, size } | string (base64)
+ *   loadBytes(path)         -> { b64, size } | string (base64); a .gltf comes
+ *                              back with external buffers/images inlined
  *   optimize(path, preset)  -> { started: true } — result arrives as "optimizeDone"
  *                              (older hosts: { out_path, report } synchronously)
  *   optimizeCustom(path, spec) -> same shape; spec is a JSON string

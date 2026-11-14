@@ -39,6 +39,15 @@ import { b64ToBytes } from "./bridge";
 import { t } from "./i18n";
 import { notify } from "./notify";
 
+/** glTF container extension the viewer feeds to Babylon's SceneLoader. */
+export type ModelExt = ".glb" | ".gltf";
+
+/** glTF container extension inferred from a file path (defaults to .glb). */
+export function modelExt(path: string): ModelExt {
+  const dot = path.lastIndexOf(".");
+  return dot >= 0 && path.slice(dot).toLowerCase() === ".gltf" ? ".gltf" : ".glb";
+}
+
 /** Vendored prefiltered IBL (specular + irradiance polynomials) in `public/env/`. */
 export const ENVIRONMENT_URL = (): string =>
   new URL("env/environmentSpecular.env", document.baseURI).href;
@@ -303,19 +312,23 @@ export class ViewerScene {
     this.requestRender();
   }
 
-  /** Loads a GLB from a base64 payload (what `loadBytes` returns). */
-  async loadBase64(b64: string): Promise<void> {
+  /** Loads a model from a base64 payload (what `loadBytes` returns). */
+  async loadBase64(b64: string, ext: ModelExt = ".glb"): Promise<void> {
     if (!b64) throw new Error("empty payload");
-    await this.loadBytes(b64ToBytes(b64));
+    await this.loadBytes(b64ToBytes(b64), ext);
   }
 
-  async loadBytes(bytes: Uint8Array): Promise<void> {
+  async loadBytes(bytes: Uint8Array, ext: ModelExt = ".glb"): Promise<void> {
     this.clearScene();
     SceneLoader.ShowLoadingScreen = false;
-    this.onProgress?.("parsing glb…");
+    this.onProgress?.("parsing model…");
     try {
-      const container = await LoadAssetContainerAsync(bytes, this.scene, {
-        pluginExtension: ".glb",
+      // Babylon treats an ArrayBufferView as GLB binary no matter the
+      // pluginExtension, so a text .gltf goes in as a data: string (its
+      // buffers/images are already inlined by the host).
+      const source = ext === ".gltf" ? "data:" + new TextDecoder().decode(bytes) : bytes;
+      const container = await LoadAssetContainerAsync(source, this.scene, {
+        pluginExtension: ext,
       });
       container.addAllToScene();
       this.loadedModel = true;

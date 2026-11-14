@@ -7,7 +7,7 @@ import { notify } from "../../notify";
 import { t } from "../../i18n";
 import { el, emptyState } from "../../ui";
 import { fieldHelpButton } from "../../optimizeForm";
-import { ViewerScene, linkCameras } from "../../viewer";
+import { ViewerScene, linkCameras, type ModelExt } from "../../viewer";
 import type { OptimizeResult } from "../../types";
 import { errMessage } from "../../guards";
 
@@ -37,9 +37,9 @@ export interface DualApi {
   pause(): void;
   disposeScenes(): void;
   forceResize(): void;
-  loadLeftLive(b64: string): Promise<void>;
+  loadLeftLive(b64: string, ext?: ModelExt): Promise<void>;
   loadLeftDemo(): void;
-  loadRightLive(b64: string): Promise<void>;
+  loadRightLive(b64: string, ext?: ModelExt): Promise<void>;
   loadRightDemo(): void;
   showOpenHint(): void;
   hideOpenHint(): void;
@@ -390,17 +390,17 @@ export function createDualView(main: HTMLElement): DualApi {
       left?.forceResize();
       right?.forceResize();
     },
-    loadLeftLive: (b64: string) => {
+    loadLeftLive: (b64: string, ext?: ModelExt) => {
       if (!left && !ensureLeft()) return Promise.resolve();
-      return (left as ViewerScene).loadBase64(b64);
+      return (left as ViewerScene).loadBase64(b64, ext ?? ".glb");
     },
     loadLeftDemo: () => {
       if (!left && !ensureLeft()) return;
       left?.loadDemo();
     },
-    loadRightLive: (b64: string) => {
+    loadRightLive: (b64: string, ext?: ModelExt) => {
       if (!right && !ensureRight()) return Promise.resolve();
-      return (right as ViewerScene).loadBase64(b64);
+      return (right as ViewerScene).loadBase64(b64, ext ?? ".glb");
     },
     loadRightDemo: () => {
       if (!right && !ensureRight()) return;

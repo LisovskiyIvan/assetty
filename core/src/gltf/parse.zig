@@ -11,7 +11,20 @@ pub const Error = error{
     InvalidGlb,
     AccessorOutOfRange,
     DecodeFailed,
+    /// An external resource declares more bytes than the reader accepts.
+    ResourceTooLarge,
 } || std.mem.Allocator.Error;
+
+/// Largest external buffer a `.gltf` may point at. cgltf allocates the
+/// declared byteLength before reading, so an untrusted file could otherwise
+/// ask for an arbitrary allocation. 2 GiB is far beyond any real asset.
+pub const max_external_buffer_bytes: usize = 2 << 30;
+
+/// Largest single external image read into the model arena.
+pub const max_external_image_bytes: usize = 512 << 20;
+
+/// Largest combined external image payload read for one model.
+pub const max_external_image_total_bytes: usize = 2 << 30;
 
 pub const Loaded = struct {
     asset: model.Asset,
@@ -89,7 +102,11 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Loaded {
 
     var options: c.cgltf_options = std.mem.zeroes(c.cgltf_options);
     var cdata: ?*c.cgltf_data = null;
-    const res = c.cgltf_parse(&options, map.ptr, map.len, &cdata);
+    // UTF-8 BOM is not JSON but appears in exported .gltf files. A GLB never
+    // carries one, so only text containers are trimmed.
+    const looks_glb = map.len >= 4 and std.mem.readInt(u32, map[0..4], .little) == 0x46546C67;
+    const parse_bytes = if (looks_glb) map else stripBom(map);
+    const res = c.cgltf_parse(&options, parse_bytes.ptr, parse_bytes.len, &cdata);
     if (res != c.cgltf_result_success or cdata == null) {
         return switch (res) {
             c.cgltf_result_unknown_format => Error.NotGltf,
@@ -98,9 +115,22 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Loaded {
     }
     errdefer c.cgltf_free(cdata);
 
-    // GLB: zero-copy (buffer->data points into map). External uris are read
-    // by cgltf; failure is non-fatal here (counts are still available).
-    _ = c.cgltf_load_buffers(&options, cdata, map.ptr);
+    // GLB: zero-copy (buffer->data points into map). `.gltf` external buffers
+    // are read by cgltf relative to `path`. A missing or unreadable external
+    // file is non-fatal here (counts and images are still available); the
+    // writer reports `InvalidData` when a payload is actually needed.
+    const pathz = try gpa.dupeSentinel(u8, path, 0);
+    defer gpa.free(pathz);
+    var external_bytes: u64 = 0;
+    for (sl(c.cgltf_buffer, cdata.?.buffers, cdata.?.buffers_count)) |*b| {
+        // cgltf allocates the declared size before reading: bound it here.
+        if (@intFromPtr(b.uri) != 0) {
+            if (b.size > max_external_buffer_bytes) return Error.ResourceTooLarge;
+            external_bytes += b.size;
+            if (external_bytes > max_external_buffer_bytes) return Error.ResourceTooLarge;
+        }
+    }
+    _ = c.cgltf_load_buffers(&options, cdata, pathz);
 
     // Meshopt-compressed input is inflated here, once, so every downstream
     // consumer (ops, writer, info) sees plain buffer views: the payload is
@@ -120,7 +150,7 @@ pub fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !Loaded {
     errdefer loaded.arena_state.deinit();
 
     const a = loaded.arena();
-    loaded.asset = try convert(a, loaded.cdata, map);
+    loaded.asset = try convert(a, io, path, loaded.cdata, map);
     return loaded;
 }
 
@@ -144,6 +174,84 @@ fn sniffMime(data: ?[]const u8, mime_type: [*c]const u8) model.Mime {
     if (std.mem.eql(u8, s, "image/webp")) return .webp;
     if (std.mem.eql(u8, s, "image/ktx2")) return .ktx2;
     return .other;
+}
+
+/// Mime of an external image from its file name, for payloads whose magic is
+/// not recognised (svg, avif, vendor formats). Null when the extension says
+/// nothing.
+fn mimeFromUri(uri: ?[]const u8) ?model.Mime {
+    const s = uri orelse return null;
+    if (s.len == 0) return null;
+    const dot = std.mem.lastIndexOfScalar(u8, s, '.') orelse return null;
+    const ext = s[dot + 1 ..];
+    if (std.ascii.eqlIgnoreCase(ext, "png")) return .png;
+    if (std.ascii.eqlIgnoreCase(ext, "jpg") or std.ascii.eqlIgnoreCase(ext, "jpeg")) return .jpeg;
+    if (std.ascii.eqlIgnoreCase(ext, "webp")) return .webp;
+    if (std.ascii.eqlIgnoreCase(ext, "ktx2")) return .ktx2;
+    return null;
+}
+
+/// Bytes behind an image `uri`: a data: URL decoded in place, or a file read
+/// relative to the .gltf. Network URIs and unreadable files yield null (the
+/// image stays dataless; `info` still works, the writer then refuses).
+fn loadExternalImage(a: std.mem.Allocator, io: std.Io, path: []const u8, uri: []const u8) !?[]const u8 {
+    if (std.mem.startsWith(u8, uri, "data:")) return try decodeDataUri(a, uri);
+    // Absolute URLs are not fetched: there is no network path here.
+    if (std.mem.indexOf(u8, uri, "://") != null) return null;
+    const decoded = try percentDecode(a, uri);
+    const dir = std.fs.path.dirname(path);
+    const full = if (dir) |d| try std.fs.path.join(a, &.{ d, decoded }) else decoded;
+    return std.Io.Dir.cwd().readFileAlloc(io, full, a, .limited(max_external_image_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return Error.ResourceTooLarge,
+        else => null,
+    };
+}
+
+/// Decodes `data:[<mime>][;base64],<payload>`. Only base64 payloads are
+/// supported; anything else (percent-encoded text) is not an image.
+fn decodeDataUri(a: std.mem.Allocator, uri: []const u8) !?[]const u8 {
+    const comma = std.mem.indexOfScalar(u8, uri, ',') orelse return null;
+    const header = uri[0..comma];
+    if (!std.mem.endsWith(u8, header, ";base64")) return null;
+    const payload = uri[comma + 1 ..];
+    const len = std.base64.standard.Decoder.calcSizeForSlice(payload) catch return null;
+    if (len > max_external_image_bytes) return Error.ResourceTooLarge;
+    const out = try a.alloc(u8, len);
+    std.base64.standard.Decoder.decode(out, payload) catch return null;
+    return out;
+}
+
+/// Percent-decodes a glTF uri into a file path (`%20` -> space). Invalid
+/// escapes are kept literally; the result belongs to `a`.
+pub fn percentDecode(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
+    const out = try a.alloc(u8, s.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                out[n] = s[i];
+                n += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                out[n] = s[i];
+                n += 1;
+                i += 1;
+                continue;
+            };
+            out[n] = (hi << 4) | lo;
+            n += 1;
+            i += 3;
+        } else {
+            out[n] = s[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return out[0..n];
 }
 
 const Maps = struct {
@@ -174,21 +282,31 @@ fn ptrIndex(comptime T: type, base: [*c]T, count: usize, p: [*c]T) ?u32 {
     return std.math.cast(u32, i);
 }
 
-/// Raw bytes of a buffer view, overflow-safe. Null when the buffer data is
-/// not loaded (external uri) or the view runs past its buffer.
-fn viewBytesChecked(v: *const c.cgltf_buffer_view) ?[]const u8 {
+/// What a buffer view points at. `unloaded` (external uri with no mapped
+/// buffer) is the only case callers may leniently skip — counts are still
+/// available for that file, and cgltf answers unpack requests with 0.
+/// `out_of_bounds` means the file is corrupt: the view runs past its buffer,
+/// and every reader that trusts it (cgltf_accessor_unpack_floats included)
+/// walks into unmapped memory. That must be a load error, not a segfault.
+const ViewBytes = union(enum) {
+    bytes: []const u8,
+    unloaded,
+    out_of_bounds,
+};
+
+fn viewBytesStatus(v: *const c.cgltf_buffer_view) ViewBytes {
     if (v.data) |d| {
         const p: [*]const u8 = @ptrCast(d);
-        return p[0..v.size];
+        return .{ .bytes = p[0..v.size] };
     }
-    if (@intFromPtr(v.buffer) == 0) return null;
-    const bd = v.buffer.*.data orelse return null;
+    if (@intFromPtr(v.buffer) == 0) return .unloaded;
+    const bd = v.buffer.*.data orelse return .unloaded;
     const bsize: usize = @intCast(v.buffer.*.size);
     const off: usize = @intCast(v.offset);
     const sz: usize = @intCast(v.size);
-    if (off > bsize or sz > bsize - off) return null;
+    if (off > bsize or sz > bsize - off) return .out_of_bounds;
     const p: [*]const u8 = @ptrCast(bd);
-    return p[off .. off + sz];
+    return .{ .bytes = p[off .. off + sz] };
 }
 
 /// Allocate decoded-view bytes through cgltf's hooks (libc malloc when the
@@ -316,30 +434,88 @@ fn trimDeadBuffers(data: *c.cgltf_data) void {
     }
 }
 
+/// UTF-8 BOM is not JSON but is common enough in exported files.
+pub fn stripBom(bytes: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bytes, "\xEF\xBB\xBF")) return bytes[3..];
+    return bytes;
+}
+
+/// Bounds of a view the way cgltf consumes it. `error.AccessorOutOfRange`
+/// when the view runs past its buffer; `null` when the buffer is unloaded
+/// (external uri) — callers skip those leniently.
+fn strictViewBytes(v: *const c.cgltf_buffer_view) Error!?[]const u8 {
+    return switch (viewBytesStatus(v)) {
+        .bytes => |b| b,
+        .unloaded => null,
+        .out_of_bounds => Error.AccessorOutOfRange,
+    };
+}
+
 /// Every accessor with plain (uncompressed, loaded) buffer data must fit in
-/// its view. Skips views that are missing, draco-compressed (payload sizes
-/// differ from decoded sizes), or extension-owned — those stay
-/// downstream-checked. (Meshopt views are inflated at load, so they validate
-/// as plain views here.)
+/// its view — and so must its sparse substitution table, whose views cgltf
+/// walks on its own. Skips views that are missing or extension-owned — those
+/// stay downstream-checked. (Meshopt views are inflated at load, so they
+/// validate as plain views here.)
 fn validateAccessors(data: *c.cgltf_data) Error!void {
     for (sl(c.cgltf_accessor, data.accessors, data.accessors_count)) |*acc| {
-        const bv_ptr = acc.buffer_view orelse continue; // viewless: nothing to bound
-        const bv: *const c.cgltf_buffer_view = @ptrCast(bv_ptr);
-        if (bv.has_meshopt_compression != 0) continue;
-        const bytes = viewBytesChecked(bv) orelse continue; // unloaded (external uri): lenient
         const count: usize = @intCast(acc.count);
         // A view-backed accessor with no elements is corrupt (the schema
         // minimum is 1); this also pins down negative JSON counts, which
         // cgltf's float-to-unsigned cast resolves differently per CPU.
-        if (count == 0) return Error.AccessorOutOfRange;
+        if (acc.buffer_view != null and count == 0) return Error.AccessorOutOfRange;
         const elem: usize = @intCast(c.cgltf_calc_size(acc.type, acc.component_type));
         if (elem == 0) continue;
         const stride: usize = if (acc.stride != 0) @intCast(acc.stride) else elem;
         if (stride < elem) return Error.AccessorOutOfRange;
-        const span = std.math.mul(usize, count - 1, stride) catch return Error.AccessorOutOfRange;
-        const need = std.math.add(usize, span, elem) catch return Error.AccessorOutOfRange;
-        const off: usize = @intCast(acc.offset);
-        if (off > bytes.len or need > bytes.len - off) return Error.AccessorOutOfRange;
+
+        var base_bytes: ?[]const u8 = null;
+        if (acc.buffer_view) |bv_ptr| {
+            const bv: *const c.cgltf_buffer_view = @ptrCast(bv_ptr);
+            if (bv.has_meshopt_compression == 0) {
+                base_bytes = try strictViewBytes(bv); // null: unloaded (external uri), lenient
+                if (base_bytes) |bytes| {
+                    const span = std.math.mul(usize, count - 1, stride) catch return Error.AccessorOutOfRange;
+                    const need = std.math.add(usize, span, elem) catch return Error.AccessorOutOfRange;
+                    const off: usize = @intCast(acc.offset);
+                    if (off > bytes.len or need > bytes.len - off) return Error.AccessorOutOfRange;
+                }
+            }
+        }
+
+        // Sparse substitution tables are walked by cgltf inside unpack: bound
+        // both views, then every index value (the writer offset is derived
+        // from it, unchecked, into the caller's output buffer).
+        if (acc.is_sparse == 0) continue; // plain accessor, nothing else to bound
+
+        const sp = &acc.sparse;
+        const sc: usize = @intCast(sp.count);
+        if (sc > count) return Error.AccessorOutOfRange;
+        const idx_cs: usize = switch (sp.indices_component_type) {
+            2 => 1, // UNSIGNED_BYTE
+            4 => 2, // UNSIGNED_SHORT
+            5 => 4, // UNSIGNED_INT
+            else => return Error.AccessorOutOfRange,
+        };
+        const ivb_ptr = sp.indices_buffer_view orelse return Error.AccessorOutOfRange;
+        const vvb_ptr = sp.values_buffer_view orelse return Error.AccessorOutOfRange;
+        const idx_bytes = (try strictViewBytes(@ptrCast(ivb_ptr))) orelse continue;
+        const val_bytes = (try strictViewBytes(@ptrCast(vvb_ptr))) orelse continue;
+        const ioff: usize = @intCast(sp.indices_byte_offset);
+        const ispan = std.math.mul(usize, sc, idx_cs) catch return Error.AccessorOutOfRange;
+        if (ioff > idx_bytes.len or ispan > idx_bytes.len - ioff) return Error.AccessorOutOfRange;
+        const voff: usize = @intCast(sp.values_byte_offset);
+        const vspan = if (sc == 0) 0 else std.math.add(usize, std.math.mul(usize, sc - 1, stride) catch return Error.AccessorOutOfRange, elem) catch return Error.AccessorOutOfRange;
+        if (voff > val_bytes.len or vspan > val_bytes.len - voff) return Error.AccessorOutOfRange;
+        var i: usize = 0;
+        while (i < sc) : (i += 1) {
+            const p = idx_bytes[ioff + i * idx_cs ..][0..idx_cs];
+            const idx: u64 = switch (idx_cs) {
+                1 => p[0],
+                2 => std.mem.readInt(u16, p[0..2], .little),
+                else => std.mem.readInt(u32, p[0..4], .little),
+            };
+            if (idx >= count) return Error.AccessorOutOfRange;
+        }
     }
 }
 
@@ -425,7 +601,7 @@ fn markExt(exts: *model.Extensions, name: [*c]const u8) void {
     }
 }
 
-fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !model.Asset {
+fn convert(a: std.mem.Allocator, io: std.Io, path: []const u8, data: *c.cgltf_data, map_bytes: []const u8) !model.Asset {
     var maps: Maps = .{};
 
     // Malformed files can declare accessor counts/offsets that no buffer
@@ -444,6 +620,7 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
     const chunks = scanGlbChunks(map_bytes);
     out.json_size = chunks.json;
     out.bin_size = chunks.bin;
+    if (!out.is_glb) out.json_size = map_bytes.len;
 
     // --- index maps (pointer -> index) ---
     for (sl(c.cgltf_node, data.nodes, data.nodes_count), 0..) |*n, i| try maps.nodes.put(a, n, @intCast(i));
@@ -511,10 +688,14 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
 
     // --- images (dims via header probe; ktx2 parsed directly) ---
     const images = try a.alloc(model.Image, data.images_count);
+    var image_bytes_total: u64 = 0;
     for (sl(c.cgltf_image, data.images, data.images_count), 0..) |*im, i| {
         var img: model.Image = .{ .name = try dupName(a, im.name) };
         if (im.uri) |uri| {
-            img.uri = try a.dupe(u8, std.mem.span(uri));
+            const s = std.mem.span(uri);
+            // A data: uri is the payload itself: keep the decoded bytes only,
+            // never duplicate the base64 text into the model/report.
+            if (!std.mem.startsWith(u8, s, "data:")) img.uri = try a.dupe(u8, s);
         }
         if (im.buffer_view) |bv| {
             const view = bv.*;
@@ -535,7 +716,22 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
                 }
             }
         }
+        // External and data: images are read here so every downstream step
+        // (info, textures, writer) sees bytes instead of a dangling uri.
+        if (img.data == null) {
+            if (im.uri) |uri| {
+                if (try loadExternalImage(a, io, path, std.mem.span(uri))) |bytes| {
+                    image_bytes_total += bytes.len;
+                    if (image_bytes_total > max_external_image_total_bytes) return Error.ResourceTooLarge;
+                    img.data = bytes;
+                    img.disk_bytes = bytes.len;
+                }
+            }
+        }
         img.mime = sniffMime(img.data, im.mime_type);
+        if (img.data != null and img.mime == .other) {
+            if (mimeFromUri(img.uri)) |m| img.mime = m;
+        }
         if (img.data) |d| {
             if (formats.parseHeader(d)) |h| {
                 img.has_ktx2 = true;
@@ -557,6 +753,18 @@ fn convert(a: std.mem.Allocator, data: *c.cgltf_data, map_bytes: []const u8) !mo
         images[i] = img;
     }
     out.images = images;
+
+    if (!out.is_glb) {
+        // A .gltf is JSON plus external payloads: count the loaded bytes so
+        // the reported disk size covers the whole asset, not just the text.
+        var payload: u64 = 0;
+        for (sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
+            if (b.data != null) payload += b.size;
+        }
+        payload += image_bytes_total;
+        out.bin_size = payload;
+        out.file_size = out.json_size + payload;
+    }
 
     // --- samplers ---
     const samplers = try a.alloc(model.Sampler, data.samplers_count);
@@ -830,6 +1038,62 @@ test "loadFile inflates meshopt views to plain data" {
     );
 }
 
+test "percentDecode decodes uris and keeps bad escapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("tex dir/a b.png", try percentDecode(a, "tex%20dir/a%20b.png"));
+    try std.testing.expectEqualStrings("100%", try percentDecode(a, "100%"));
+    try std.testing.expectEqualStrings("%zz", try percentDecode(a, "%zz"));
+}
+
+test "gltf external buffers and images load" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var loaded = try loadFile(io, a, "test/fixtures/gltf/box/box.gltf");
+    defer loaded.deinit();
+
+    try std.testing.expect(!loaded.asset.is_glb);
+    try std.testing.expect(loaded.asset.file_size > loaded.asset.json_size);
+    try std.testing.expectEqual(@as(usize, 1), loaded.asset.images.len);
+    const img = loaded.asset.images[0];
+    try std.testing.expectEqual(model.Mime.png, img.mime);
+    try std.testing.expect(img.data != null);
+    try std.testing.expectEqual(@as(usize, 69), img.data.?.len);
+    try std.testing.expect(img.has_dims);
+    try std.testing.expectEqualStrings("red.png", img.uri.?);
+    // Accessor data really resolved (the fixture has 12 triangles).
+    try std.testing.expectEqual(
+        @as(c_uint, c.cgltf_result_success),
+        @as(c_uint, c.cgltf_validate(loaded.cdata)),
+    );
+    const views = sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
+    try std.testing.expect(views.len > 0);
+    try std.testing.expect(std.meta.activeTag(viewBytesStatus(&views[0])) == .bytes);
+}
+
+test "gltf with a missing external buffer stays lenient for info" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const dir = ".zig-cache/parse-gltf-missing";
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const json =
+        \\{"asset":{"version":"2.0"},"buffers":[{"uri":"gone.bin","byteLength":12}],
+        \\"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":12}],
+        \\"accessors":[{"bufferView":0,"componentType":5126,"count":1,"type":"SCALAR"}]}
+    ;
+    const path = dir ++ "/missing.gltf";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+
+    var loaded = try loadFile(io, a, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.cdata.accessors_count);
+    const views = sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
+    try std.testing.expectEqual(std.meta.Tag(ViewBytes).unloaded, std.meta.activeTag(viewBytesStatus(&views[0])));
+}
+
 test "webp image sniffs mime and dims" {
     const io = std.testing.io;
     const a = std.testing.allocator;
@@ -940,10 +1204,15 @@ test "loadFile rejects corrupt inputs without crashing" {
         .{ .name = "huge-chunk-len", .make = &hugeChunkLenCase, .ok = false },
         .{ .name = "bad-chunk-type", .make = &badChunkTypeCase, .ok = false },
         .{ .name = "neg-count", .make = &negCountCase, .ok = false },
-        // Lenient below: corrupt but safely degradable (dataless views are
-        // skipped, the GC walk is cycle-safe, `{}` is an empty asset).
+        // cgltf refuses to map a GLB bin chunk whose declared size exceeds
+        // the actual data (returns data_too_short; ignored), so a huge
+        // byteLength yields a dataless buffer: views are skipped, no payload
+        // is ever read. Degradable, stays accepted.
         .{ .name = "huge-bytelength", .make = &hugeByteLengthCase, .ok = true },
-        .{ .name = "huge-byteoffset", .make = &hugeByteOffsetCase, .ok = true },
+        // Views that run past a *loaded* buffer are rejected outright
+        // (clean error): a lenient skip would let cgltf memcpy into
+        // unmapped memory — fuzz corpus crashes were exactly that.
+        .{ .name = "huge-byteoffset", .make = &hugeByteOffsetCase, .ok = false },
         .{ .name = "bad-buffer-view-ref", .make = &badBufferViewRefCase, .ok = false },
         // cgltf rejects self-parenting, so cycles never reach the model;
         // markSubtree stays cycle-safe as defense in depth.

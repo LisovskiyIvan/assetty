@@ -46,22 +46,41 @@ case "$os" in
 	<key>NSHighResolutionCapable</key><true/>
 	<key>CFBundleIconFile</key><string>assetty.icns</string>
 	<key>CFBundleDocumentTypes</key>
-	<array><dict>
-		<key>CFBundleTypeName</key><string>GLB 3D model</string>
-		<key>CFBundleTypeRole</key><string>Viewer</string>
-		<key>LSHandlerRank</key><string>Alternate</string>
-		<key>LSItemContentTypes</key><array><string>org.khronos.glb</string></array>
-	</dict></array>
-	<key>UTImportedTypeDeclarations</key>
-	<array><dict>
-		<key>UTTypeIdentifier</key><string>org.khronos.glb</string>
-		<key>UTTypeDescription</key><string>GLB 3D model</string>
-		<key>UTTypeConformsTo</key><array><string>public.data</string></array>
-		<key>UTTypeTagSpecification</key><dict>
-			<key>public.filename-extension</key><array><string>glb</string></array>
-			<key>public.mime-type</key><string>model/gltf-binary</string>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key><string>GLB 3D model</string>
+			<key>CFBundleTypeRole</key><string>Viewer</string>
+			<key>LSHandlerRank</key><string>Alternate</string>
+			<key>LSItemContentTypes</key><array><string>org.khronos.glb</string></array>
 		</dict>
-	</dict></array>
+		<dict>
+			<key>CFBundleTypeName</key><string>glTF 3D model</string>
+			<key>CFBundleTypeRole</key><string>Viewer</string>
+			<key>LSHandlerRank</key><string>Alternate</string>
+			<key>LSItemContentTypes</key><array><string>org.khronos.gltf</string></array>
+		</dict>
+	</array>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key><string>org.khronos.glb</string>
+			<key>UTTypeDescription</key><string>GLB 3D model</string>
+			<key>UTTypeConformsTo</key><array><string>public.data</string></array>
+			<key>UTTypeTagSpecification</key><dict>
+				<key>public.filename-extension</key><array><string>glb</string></array>
+				<key>public.mime-type</key><string>model/gltf-binary</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key><string>org.khronos.gltf</string>
+			<key>UTTypeDescription</key><string>glTF 3D model</string>
+			<key>UTTypeConformsTo</key><array><string>public.json</string></array>
+			<key>UTTypeTagSpecification</key><dict>
+				<key>public.filename-extension</key><array><string>gltf</string></array>
+				<key>public.mime-type</key><string>model/gltf+json</string>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>
 EOF
@@ -69,7 +88,7 @@ EOF
 assetty $ver for macOS 12+ ($arch).
 
 Drag assetty.app to Applications, then double-click it to open the desktop app.
-Open With assetty in Finder, or drop a .glb on its Dock icon.
+Open With assetty in Finder, or drop a .glb/.gltf on its Dock icon.
 First launch of a downloaded, unsigned app: macOS Gatekeeper may refuse —
 right-click the app and pick Open once (or: xattr -dr com.apple.quarantine assetty.app).
 
@@ -110,7 +129,7 @@ where the full toolkit stays available.
 
 Install the application launcher and CLI for your user (no sudo):
   sh install.sh
-The launcher opens the GUI without a terminal and supports .glb files.
+The launcher opens the GUI without a terminal and supports .glb/.gltf files.
 EOF
     ;;
   *) echo "package.sh: unknown os '$os' (macos|windows|linux)" >&2; exit 1 ;;

@@ -11,9 +11,11 @@ const c = @import("cgltf");
 const geom = @import("../ops/geom.zig");
 
 pub const Error = error{
-    /// External buffer uri or compressed (meshopt) buffer views.
+    /// Not representable as a single-buffer GLB (writer-produced meshopt
+    /// output without exactly one real buffer, unsupported geometry).
     Unsupported,
-    /// Buffer data has not been loaded (missing / truncated file).
+    /// Buffer or image data has not been loaded (missing / truncated file,
+    /// external uri whose payload could not be read).
     InvalidData,
 } || std.mem.Allocator.Error;
 
@@ -527,7 +529,30 @@ const Ctx = struct {
     ph_total: u64,
     placeholder_idx: u32,
     has_mc: bool,
+    /// per cgltf image index: inlined external payload, if any
+    img_extra: []const ?ImgExtra,
+    /// parse-time image metadata (mime fallback), index-aligned or empty
+    images: []const model.Image,
 };
+
+/// An image payload copied into the output BIN instead of kept as an
+/// external uri: `index` is its emitted bufferView index.
+const ImgExtra = struct {
+    index: u32,
+    off: u64,
+    len: u64,
+    mime: []const u8,
+};
+
+fn mimeString(m: model.Mime) []const u8 {
+    return switch (m) {
+        .png => "image/png",
+        .jpeg => "image/jpeg",
+        .webp => "image/webp",
+        .ktx2 => "image/ktx2",
+        .other => "application/octet-stream",
+    };
+}
 
 /// Map an old pool index to the emitted index, or null when the entry was
 /// garbage collected.
@@ -635,12 +660,10 @@ fn writeBuffer(o: *Out, ctx: *const Ctx, b: *const c.cgltf_buffer) !void {
         try o.key("name");
         try o.str(s);
     }
+    // The output is a single-buffer GLB: its bytes live in the BIN chunk, so
+    // an input uri (external .bin / data:) is never carried over.
     try o.key("byteLength");
     try o.int(ctx.bin_len);
-    if (cstr(b.uri)) |s| {
-        try o.key("uri");
-        try o.str(s);
-    }
     try writeRawExtensions(o, b.extensions, b.extensions_count);
     try writeExtras(o, &b.extras);
     try o.endObj();
@@ -883,23 +906,43 @@ fn writeAccessor(o: *Out, ctx: *const Ctx, i: usize, acc: *const c.cgltf_accesso
     try o.endObj();
 }
 
-fn writeImage(o: *Out, ctx: *const Ctx, im: *const c.cgltf_image) !void {
+fn writeImage(o: *Out, ctx: *const Ctx, im: *const c.cgltf_image, index: usize) !void {
     try o.beginObj();
     if (cstr(im.name)) |s| {
         try o.key("name");
         try o.str(s);
     }
-    if (cstr(im.uri)) |s| {
+
+    var view_index: ?u32 = null;
+    var mime: ?[]const u8 = null;
+    if (index < ctx.img_extra.len) {
+        if (ctx.img_extra[index]) |ex| {
+            view_index = ex.index;
+            mime = ex.mime;
+        }
+    }
+    if (view_index == null) {
+        if (geom.ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, im.buffer_view)) |bi| {
+            if (kept(ctx.keep.views.rank, bi)) |bv| view_index = bv;
+        }
+    }
+
+    if (view_index) |bv| {
+        // A bufferView makes the GLB self-contained; the uri is superseded
+        // (glTF allows exactly one of the two).
+        try o.key("bufferView");
+        try o.int(bv);
+    } else if (cstr(im.uri)) |s| {
+        // Only absolute URLs survive without payload (never fetched here).
         try o.key("uri");
         try o.str(s);
     }
-    if (geom.ptrIndex(c.cgltf_buffer_view, ctx.d.buffer_views, ctx.d.buffer_views_count, im.buffer_view)) |bi| {
-        if (kept(ctx.keep.views.rank, bi)) |bv| {
-            try o.key("bufferView");
-            try o.int(bv);
-        }
+
+    if (mime == null) mime = cstr(im.mime_type);
+    if (mime == null and view_index != null and index < ctx.images.len) {
+        mime = mimeString(ctx.images[index].mime);
     }
-    if (cstr(im.mime_type)) |s| {
+    if (mime) |s| {
         try o.key("mimeType");
         try o.str(s);
     }
@@ -1616,16 +1659,26 @@ fn computeBounds(a: std.mem.Allocator, acc: *const c.cgltf_accessor) !Bounds {
 
 /// Serialize `data` (parsed from `file_bytes`) into a self-contained GLB.
 ///
-/// All allocations are made with `a`.  Returns `error.Unsupported` when the
-/// asset cannot be represented as a single-buffer GLB (external buffer uri,
-/// or writer-produced meshopt output without exactly one real buffer).
+/// All allocations are made with `a`. Returns `error.Unsupported` when the
+/// asset cannot be represented as a single-buffer GLB (writer-produced
+/// meshopt output without exactly one real buffer). External buffers and
+/// images are copied into the BIN chunk; when one has no loaded payload,
+/// `error.InvalidData` is returned instead of emitting a dangling uri.
 /// Inflated meshopt input (decoded at parse) serializes as plain views.
 pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const u8) ![]u8 {
-    _ = file_bytes;
+    return serializeWithImages(a, data, file_bytes, &.{});
+}
 
-    for (geom.sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
-        if (@intFromPtr(b.uri) != 0) return error.Unsupported;
-    }
+/// `serialize` plus parse-time image metadata: image `index` in `images`
+/// (index-aligned with `data.images`) supplies payloads for external uris and
+/// a mime fallback. An empty slice keeps the plain cgltf behavior.
+pub fn serializeWithImages(
+    a: std.mem.Allocator,
+    data: *c.cgltf_data,
+    file_bytes: []const u8,
+    asset_images: []const model.Image,
+) ![]u8 {
+    _ = file_bytes;
 
     // --- reachability GC: which pool entries are actually referenced? ---
     const keep = try Keep.compute(a, data);
@@ -1656,9 +1709,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     }
     // Plain path (!has_mc): the BIN chunk below carries every kept view's
     // bytes (inflated meshopt views, concatenated multi-buffer input), so a
-    // single output buffer suffices however many inputs were parsed. Views
-    // whose bytes are unavailable still fail in the BIN loop with the same
-    // error as before.
+    // single output buffer suffices however many inputs were parsed.
 
     // --- BIN chunk: copy every kept buffer view, 4-byte aligned ---
     const view_off = try a.alloc(u64, data.buffer_views_count);
@@ -1672,8 +1723,55 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
             @memset(bin.items[bin.items.len - (4 - rem) ..], 0);
         }
         view_off[i] = bin.items.len;
-        const bytes = geom.viewBytes(v) orelse return error.Unsupported;
+        const bytes = geom.viewBytes(v) orelse return error.InvalidData;
         try bin.appendSlice(a, bytes);
+    }
+
+    // --- external image payloads: buffer views appended after the kept ones
+    const aligned_images: []const model.Image =
+        if (asset_images.len == data.images_count) asset_images else &.{};
+    const img_extra = try a.alloc(?ImgExtra, data.images_count);
+    @memset(img_extra, null);
+    var extra_views: u32 = 0;
+    for (geom.sl(c.cgltf_image, data.images, data.images_count), 0..) |*im, i| {
+        if (!keep.images.keep[i]) continue;
+        var has_view = false;
+        if (geom.ptrIndex(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count, im.buffer_view)) |bi| {
+            has_view = kept(keep.views.rank, bi) != null;
+        }
+        if (has_view) continue; // embedded payload already copied above
+
+        var payload: ?[]const u8 = null;
+        var mime: []const u8 = mimeString(.other);
+        if (i < aligned_images.len) {
+            payload = aligned_images[i].data;
+            if (aligned_images[i].mime != .other) mime = mimeString(aligned_images[i].mime);
+        }
+        if (cstr(im.mime_type)) |s| {
+            if (payload != null and std.mem.eql(u8, mime, mimeString(.other))) mime = s;
+        }
+        if (payload) |bytes| {
+            const rem = bin.items.len % 4;
+            if (rem != 0) {
+                try bin.resize(a, bin.items.len + (4 - rem));
+                @memset(bin.items[bin.items.len - (4 - rem) ..], 0);
+            }
+            img_extra[i] = .{
+                .index = @intCast(keep.views.count() + extra_views),
+                .off = bin.items.len,
+                .len = bytes.len,
+                .mime = mime,
+            };
+            extra_views += 1;
+            try bin.appendSlice(a, bytes);
+            continue;
+        }
+        // No payload and no local reference: an absolute URL can ship as a
+        // uri, anything else would dangle relative to the new output file.
+        const uri = cstr(im.uri) orelse return error.InvalidData;
+        if (std.mem.indexOf(u8, uri, "://") == null and !std.mem.startsWith(u8, uri, "data:")) {
+            return error.InvalidData;
+        }
     }
 
     // --- byteStride: emit only when it differs from an accessor's natural stride ---
@@ -1737,6 +1835,8 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         .ph_total = ph_total,
         .placeholder_idx = @intCast(data.buffers_count),
         .has_mc = has_mc,
+        .img_extra = img_extra,
+        .images = aligned_images,
     };
 
     // --- JSON chunk ---
@@ -1800,7 +1900,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         }
         try o.endArr();
     }
-    if (keep.views.count() > 0) {
+    if (keep.views.count() > 0 or extra_views > 0) {
         try o.key("bufferViews");
         try o.beginArr();
         for (geom.sl(c.cgltf_buffer_view, data.buffer_views, data.buffer_views_count), 0..) |*v, i| {
@@ -1808,12 +1908,32 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
             try o.item();
             try writeBufferView(&o, &ctx, i, v);
         }
+        // Image payloads inlined above: plain appends, no accessor points here.
+        for (img_extra) |maybe| {
+            const ex = maybe orelse continue;
+            try o.item();
+            try o.beginObj();
+            try o.key("buffer");
+            try o.int(0);
+            try o.key("byteOffset");
+            try o.int(ex.off);
+            try o.key("byteLength");
+            try o.int(ex.len);
+            try o.endObj();
+        }
         try o.endArr();
     }
-    if (data.buffers_count > 0) {
+    if (data.buffers_count > 0 or bin.items.len > 0) {
         try o.key("buffers");
         try o.beginArr();
-        if (ctx.has_mc) {
+        if (data.buffers_count == 0) {
+            // Image-only asset: the inlined payload still needs an owner.
+            try o.item();
+            try o.beginObj();
+            try o.key("byteLength");
+            try o.int(ctx.bin_len);
+            try o.endObj();
+        } else if (ctx.has_mc) {
             for (geom.sl(c.cgltf_buffer, data.buffers, data.buffers_count)) |*b| {
                 try o.item();
                 try writeBuffer(&o, &ctx, b);
@@ -1850,7 +1970,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
         for (geom.sl(c.cgltf_image, data.images, data.images_count), 0..) |*im, i| {
             if (!keep.images.keep[i]) continue;
             try o.item();
-            try writeImage(&o, &ctx, im);
+            try writeImage(&o, &ctx, im, i);
         }
         try o.endArr();
     }
@@ -1979,7 +2099,7 @@ pub fn serialize(a: std.mem.Allocator, data: *c.cgltf_data, file_bytes: []const 
     const json = o.buf.items;
     const json_pad = (4 - (json.len % 4)) % 4;
     const bin_pad = (4 - (bin.items.len % 4)) % 4;
-    const has_bin = data.buffers_count > 0;
+    const has_bin = data.buffers_count > 0 or bin.items.len > 0;
     const total = 12 + 8 + json.len + json_pad + (if (has_bin) 8 + bin.items.len + bin_pad else 0);
 
     const out = try a.alignedAlloc(u8, .@"8", total);
@@ -2304,8 +2424,38 @@ test "glb writer: real fixtures round-trip" {
     }
 }
 
-test "glb writer: rejects external buffers" {
-    // minimal synthetic cgltf_data with an external uri
+test "glb writer: gltf external buffer and image are inlined" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var loaded = try parse_mod.loadFile(io, std.testing.allocator, "test/fixtures/gltf/box/box.gltf");
+    defer loaded.deinit();
+
+    const out = try serializeWithImages(aa, loaded.cdata, loaded.map, loaded.asset.images);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"uri\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "image/png") != null);
+
+    var p = try parseBytes(std.testing.allocator, out);
+    defer p.deinit();
+    try std.testing.expectEqual(@as(usize, 1), p.data.images_count);
+    const im = &geom.sl(c.cgltf_image, p.data.images, p.data.images_count)[0];
+    try std.testing.expect(im.buffer_view != null);
+    try std.testing.expect(@intFromPtr(im.uri) == 0);
+
+    // Re-serializing the produced GLB is byte-identical.
+    const out2 = try serialize(aa, p.data, out);
+    try std.testing.expectEqualSlices(u8, out, out2);
+}
+
+test "glb writer: external buffers are inlined, missing payload is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // A .gltf-style buffer: the uri is dropped from the output, and a view
+    // that cannot be resolved fails instead of producing a dangling file.
     var buf = c.cgltf_buffer{ .uri = @constCast("buffer.bin") };
     var views: [0]c.cgltf_buffer_view = .{};
     var data = std.mem.zeroes(c.cgltf_data);
@@ -2313,7 +2463,54 @@ test "glb writer: rejects external buffers" {
     data.buffers_count = 1;
     data.buffer_views = @ptrCast(&views);
     data.buffer_views_count = 0;
-    try std.testing.expectError(error.Unsupported, serialize(std.testing.allocator, &data, ""));
+    const out = try serialize(aa, &data, "");
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"uri\"") == null);
+
+    var payload = [4]u8{ 1, 2, 3, 4 };
+    buf.size = payload.len;
+    var bv = std.mem.zeroes(c.cgltf_buffer_view);
+    bv.buffer = &buf;
+    bv.size = payload.len;
+    var acc = std.mem.zeroes(c.cgltf_accessor);
+    acc.component_type = 6; // FLOAT
+    acc.type = 1; // SCALAR
+    acc.count = 1;
+    acc.buffer_view = &bv;
+    var attr = std.mem.zeroes(c.cgltf_attribute);
+    attr.name = @constCast("POSITION");
+    attr.type = 1;
+    attr.data = &acc;
+    var prim = std.mem.zeroes(c.cgltf_primitive);
+    prim.type = 5;
+    prim.attributes = &attr;
+    prim.attributes_count = 1;
+    var mesh = std.mem.zeroes(c.cgltf_mesh);
+    mesh.primitives = &prim;
+    mesh.primitives_count = 1;
+    var node = std.mem.zeroes(c.cgltf_node);
+    node.mesh = &mesh;
+    var node_ptr: [*c]c.cgltf_node = &node;
+    var scene = std.mem.zeroes(c.cgltf_scene);
+    scene.nodes = @ptrCast(&node_ptr);
+    scene.nodes_count = 1;
+    data.scene = &scene;
+    data.scenes = &scene;
+    data.scenes_count = 1;
+    data.nodes = &node;
+    data.nodes_count = 1;
+    data.buffer_views = @ptrCast(&bv);
+    data.buffer_views_count = 1;
+    data.accessors = &acc;
+    data.accessors_count = 1;
+    data.meshes = &mesh;
+    data.meshes_count = 1;
+    try std.testing.expectError(error.InvalidData, serialize(aa, &data, ""));
+
+    // Loaded payload: the same graph serializes, with the bytes in the BIN.
+    buf.data = @ptrCast(&payload);
+    const out2 = try serialize(aa, &data, "");
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"uri\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"bufferViews\"") != null);
 }
 
 test {

@@ -321,7 +321,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, in_path: []const u8, opts: Options)
     // every path, including a failing write (a leaked arena leaks the tens
     // of MiB it holds).
     defer ser_arena.deinit();
-    const bytes = try write.serialize(ser_arena.allocator(), loaded.cdata, loaded.map);
+    const bytes = try write.serializeWithImages(ser_arena.allocator(), loaded.cdata, loaded.map, loaded.asset.images);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = opts.out_path, .data = bytes });
     // A cancel that landed mid-run must not leave a half-adopted output
     // behind — unless the file predates this run (see above).
@@ -610,6 +610,21 @@ fn embeddedImageBytes(data: *c.cgltf_data, im: *const c.cgltf_image) ?[]const u8
     return (base + bv.*.offset)[0..bv.*.size];
 }
 
+/// Bytes the encoder should read for image `idx`. Parse already materialized
+/// external and data: uris into `asset_images[idx].data`; embedded views are
+/// the fallback (asset.mime carries no payload for them).
+fn sourceImageBytes(
+    data: *c.cgltf_data,
+    asset_images: []const model.Image,
+    idx: usize,
+    im: *const c.cgltf_image,
+) ?[]const u8 {
+    if (idx < asset_images.len) {
+        if (asset_images[idx].data) |bytes| return bytes;
+    }
+    return embeddedImageBytes(data, im);
+}
+
 /// Rule context for image `idx` from the model-level asset (slots/cutout
 /// from `parse`, min side from the probed dims; 0 = unknown).
 fn ruleCtxFor(asset_images: []const model.Image, idx: usize) RuleCtx {
@@ -654,6 +669,15 @@ fn setMimeKtx2(d: *c.cgltf_data, im: *c.cgltf_image) void {
     @memcpy(dstu[0..s.len], s);
     dstu[s.len] = 0;
     im.*.mime_type = @ptrCast(dstu);
+}
+
+/// Frees a cgltf-owned C string (uri, mimeType) and nulls the field.
+fn clearCStr(d: *c.cgltf_data, p: anytype) void {
+    const old = p.*;
+    if (@intFromPtr(old) != 0) {
+        if (d.memory.free_func) |ff| ff(d.memory.user_data, old);
+    }
+    p.* = null;
 }
 
 /// An image that got a KTX2 buffer view; applied to the cgltf graph on the
@@ -902,6 +926,7 @@ fn encodeTexturesWith(
     const views = geom.sl(c.cgltf_buffer_view, loaded.cdata.buffer_views, loaded.cdata.buffer_views_count);
     for (pending.items) |pd| {
         pd.img.*.buffer_view = @ptrCast(&views[pd.view_idx]);
+        clearCStr(loaded.cdata, &pd.img.*.uri); // bufferView replaces the uri
         setMimeKtx2(loaded.cdata, pd.img);
     }
     _ = formats; // format label comes from the written file's header via stats
@@ -979,7 +1004,7 @@ fn encodeImagesSequential(
         }
         if (eff.format != p.format) res.mixed = true;
         if (p.apply_rules and matchRuleIndex(p, ctx, cStr(im.name), cStr(im.uri)) != null) res.mixed = true;
-        const bytes = embeddedImageBytes(cd, im) orelse {
+        const bytes = sourceImageBytes(cd, asset_images, idx, im) orelse {
             res.skipped += 1;
             try appendDetail(a, details, index, im.name, true, "as-is");
             done += 1;
@@ -1065,7 +1090,7 @@ fn encodeImagesParallel(
             res.mixed = true;
             continue; // slot stays .skip; counted in the join loop below
         }
-        const bytes = embeddedImageBytes(cd, im) orelse continue;
+        const bytes = sourceImageBytes(cd, asset_images, i, im) orelse continue;
         if (eff.format != p.format) res.mixed = true;
         if (p.apply_rules and matchRuleIndex(p, ctx, cStr(im.name), cStr(im.uri)) != null) res.mixed = true;
         const is_ktx2 = assetIsKtx2(asset_images, i);

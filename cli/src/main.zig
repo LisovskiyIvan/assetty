@@ -8,11 +8,11 @@ const usage =
     \\Usage:
     \\  assetty                    (no args) — open the desktop app
     \\  assetty app | --app        — open the desktop app
-    \\  assetty info <file.glb> [--json]
-    \\  assetty textures <file.glb> [--encode N] [--json]
+    \\  assetty info <file.glb|gltf> [--json]
+    \\  assetty textures <file.glb|gltf> [--encode N] [--json]
     \\  assetty presets
-    \\  assetty optimize <file.glb> --preset <name|path.zon|path.json> [-o <out.glb>] [--report <r.json>] [--strip-animations]
-    \\  assetty optimize <a.glb> <b.glb> ... --preset <name|path.zon|path.json> [--out-dir <dir>] [--report <r.json>] [--strip-animations]
+    \\  assetty optimize <file.glb|gltf> --preset <name|path.zon|path.json> [-o <out.glb>] [--report <r.json>] [--strip-animations]
+    \\  assetty optimize <a.glb|gltf> <b.glb|gltf> ... --preset <name|path.zon|path.json> [--out-dir <dir>] [--report <r.json>] [--strip-animations]
     \\
     \\Batch: multiple inputs are processed one by one from their sources into
     \\--out-dir (default: each input's own directory) as <stem>.opt.glb; an
@@ -83,6 +83,8 @@ fn reportLoadErr(cmd: []const u8, path: []const u8, err: anyerror) void {
         error.FileNotFound => std.debug.print("{s}: no such file: {s}\n", .{ cmd, path }),
         error.AccessDenied, error.PermissionDenied => std.debug.print("{s}: permission denied: {s}\n", .{ cmd, path }),
         error.NotGltf, error.InvalidGlb => std.debug.print("{s}: not a glTF/GLB file: {s}\n", .{ cmd, path }),
+        error.InvalidData => std.debug.print("{s}: external resource missing or unreadable (is the .bin/image next to the .gltf?): {s}\n", .{ cmd, path }),
+        error.ResourceTooLarge => std.debug.print("{s}: resource too large: {s}\n", .{ cmd, path }),
         else => std.debug.print("{s}: {s}: {s}\n", .{ cmd, path, @errorName(err) }),
     }
 }
@@ -115,7 +117,7 @@ fn cmdInfo(init: std.process.Init, args: []const []const u8) !u8 {
         }
     }
     const file_path = path orelse {
-        std.debug.print("info: missing <file>\n", .{});
+        std.debug.print("info: missing <file.glb|gltf>\n", .{});
         return 2;
     };
     const as_json = hasFlag(args, "--json");
@@ -296,7 +298,7 @@ fn cmdTextures(init: std.process.Init, args: []const []const u8) !u8 {
     }
 
     const file_path = path orelse {
-        std.debug.print("textures: missing <file.glb>\n", .{});
+        std.debug.print("textures: missing <file.glb|gltf>\n", .{});
         return 2;
     };
 
@@ -853,7 +855,7 @@ fn cmdOptimize(init: std.process.Init, args: []const []const u8) !u8 {
     }
 
     if (inputs.items.len == 0) {
-        std.debug.print("optimize: missing <file.glb>\n", .{});
+        std.debug.print("optimize: missing <file.glb|gltf>\n", .{});
         return 2;
     }
     if (inputs.items.len > 1 and out_arg != null) {
